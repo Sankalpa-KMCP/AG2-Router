@@ -20,6 +20,8 @@ import { IAG2Adapter } from '../ag2/adapter.js';
 import { AppConfig } from '../config/config.js';
 import { QuotaRouter } from '../router/router.js';
 import { SessionVault } from '../vault/session-vault.js';
+import { SwitchPlanner } from '../switching/planner.js';
+import { SwitchTransactionCoordinator } from '../switching/transaction.js';
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -38,6 +40,8 @@ export class AppServer {
   private router: QuotaRouter;
   private enrollmentService?: AccountEnrollmentService;
   private sessionVault?: SessionVault;
+  private switchPlanner?: SwitchPlanner;
+  private switchCoordinator?: SwitchTransactionCoordinator;
 
   constructor(
     config: AppConfig,
@@ -45,7 +49,9 @@ export class AppServer {
     adapter: IAG2Adapter,
     router: QuotaRouter,
     enrollmentService?: AccountEnrollmentService,
-    sessionVault?: SessionVault
+    sessionVault?: SessionVault,
+    switchPlanner?: SwitchPlanner,
+    switchCoordinator?: SwitchTransactionCoordinator
   ) {
     this.config = config;
     this.accountStore = accountStore;
@@ -53,6 +59,8 @@ export class AppServer {
     this.router = router;
     this.enrollmentService = enrollmentService;
     this.sessionVault = sessionVault;
+    this.switchPlanner = switchPlanner;
+    this.switchCoordinator = switchCoordinator;
   }
 
   public async start(): Promise<{ host: string; port: number }> {
@@ -308,10 +316,48 @@ export class AppServer {
       return;
     }
 
+    // GET /api/switching/status
+    if (pathname === '/api/switching/status' && method === 'GET') {
+      const status = this.switchCoordinator
+        ? this.switchCoordinator.getStatus()
+        : { activeTransactionId: null, currentState: 'IDLE', lastResult: null };
+      this.sendJson(res, 200, { status });
+      return;
+    }
+
+    // POST /api/accounts/:id/switch-plan (Dry-Run / Readiness Evaluation)
+    if (pathname.startsWith('/api/accounts/') && pathname.endsWith('/switch-plan') && method === 'POST') {
+      const id = pathname.slice('/api/accounts/'.length, -'/switch-plan'.length).trim();
+      if (!id) {
+        this.sendJson(res, 400, { error: 'Account ID is required' });
+        return;
+      }
+      if (!this.switchPlanner) {
+        this.sendJson(res, 501, { error: 'Switch planner service is not configured' });
+        return;
+      }
+      try {
+        const plan = await this.switchPlanner.planSwitch(id);
+        this.sendJson(res, 200, { plan });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to generate switch plan';
+        this.sendJson(res, 500, { error: message });
+      }
+      return;
+    }
+
+    // POST /api/accounts/:id/switch (Hard Boundary: Live mutation prohibited in this phase)
+    if (pathname.startsWith('/api/accounts/') && pathname.endsWith('/switch') && method === 'POST') {
+      this.sendJson(res, 403, {
+        error: 'Live account switching execution is not authorized in this runtime mode. Use switch-plan for dry-run evaluation.'
+      });
+      return;
+    }
+
     // DELETE /api/accounts/:id
     if (pathname.startsWith('/api/accounts/') && method === 'DELETE') {
       const id = pathname.slice('/api/accounts/'.length).trim();
-      if (!id) {
+      if (!id || id.includes('/')) {
         this.sendJson(res, 400, { error: 'Account ID required' });
         return;
       }
@@ -320,10 +366,11 @@ export class AppServer {
         this.sendJson(res, 404, { error: 'Account not found' });
         return;
       }
+      let vaultRecordDeleted = false;
       if (this.sessionVault) {
-        await this.sessionVault.removeSession(id);
+        vaultRecordDeleted = await this.sessionVault.removeSession(id);
       }
-      this.sendJson(res, 200, { success: true, removedId: id });
+      this.sendJson(res, 200, { success: true, removedId: id, vaultRecordDeleted });
       return;
     }
 

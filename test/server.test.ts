@@ -383,11 +383,109 @@ describe('AppServer (Loopback HTTP & API)', () => {
         assert.equal(listData.accounts[0].email, 'enrolled@example.com');
         assert.equal(listData.accounts[0].hasVaultedSession, true);
         assert.equal(listData.accounts[0].isActive, true);
+
+        // 3. Test DELETE /api/accounts/:id reports vaultRecordDeleted: true
+        const delRes = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = http.request(
+            {
+              hostname: '127.0.0.1',
+              port: testPort + 2,
+              path: `/api/accounts/${enrollData.account.id}`,
+              method: 'DELETE'
+            },
+            (r) => {
+              let b = '';
+              r.on('data', (c) => (b += c));
+              r.on('end', () => resolve({ status: r.statusCode || 0, body: b }));
+            }
+          );
+          req.on('error', reject);
+          req.end();
+        });
+
+        assert.equal(delRes.status, 200);
+        const delData = JSON.parse(delRes.body);
+        assert.equal(delData.success, true);
+        assert.equal(delData.vaultRecordDeleted, true);
       } finally {
         await enrollServer.stop();
       }
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('should serve GET /api/switching/status with default idle status', async () => {
+    const res = await request('/api/switching/status');
+    assert.equal(res.status, 200);
+    const json = JSON.parse(res.body);
+    assert.equal(json.status.currentState, 'IDLE');
+    assert.equal(json.status.activeTransactionId, null);
+  });
+
+  it('should reject POST /api/accounts/:id/switch with 403 Forbidden', async () => {
+    const res = await request('/api/accounts/acc_test/switch', { method: 'POST' });
+    assert.equal(res.status, 403);
+    const json = JSON.parse(res.body);
+    assert.match(json.error, /Live account switching execution is not authorized/);
+  });
+
+  it('should evaluate switch plan via POST /api/accounts/:id/switch-plan when planner is configured', async () => {
+    // 1. Unconfigured planner returns 501
+    const unconfRes = await request('/api/accounts/acc_test/switch-plan', { method: 'POST' });
+    assert.equal(unconfRes.status, 501);
+
+    // 2. Configured planner
+    const plannerServer = new AppServer(
+      { ...testConfig, port: testPort + 3 },
+      accountStore,
+      adapter,
+      router,
+      undefined,
+      undefined,
+      {
+        planSwitch: async (id: string) => ({
+          ready: false,
+          targetAccountId: id,
+          targetEmail: 'test@example.com',
+          currentAccountId: null,
+          currentEmail: null,
+          checks: [
+            { code: 'TARGET_ACCOUNT_EXISTS' as const, passed: true, message: 'OK' }
+          ],
+          blockers: ['Antigravity 2 is offline'],
+          plannedAt: new Date().toISOString()
+        })
+      } as any
+    );
+
+    await plannerServer.start();
+    try {
+      const planRes = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: testPort + 3,
+            path: '/api/accounts/acc_plan_test/switch-plan',
+            method: 'POST'
+          },
+          (r) => {
+            let b = '';
+            r.on('data', (c) => (b += c));
+            r.on('end', () => resolve({ status: r.statusCode || 0, body: b }));
+          }
+        );
+        req.on('error', reject);
+        req.end();
+      });
+
+      assert.equal(planRes.status, 200);
+      const json = JSON.parse(planRes.body);
+      assert.equal(json.plan.ready, false);
+      assert.equal(json.plan.targetAccountId, 'acc_plan_test');
+      assert.equal(json.plan.blockers.length, 1);
+    } finally {
+      await plannerServer.stop();
     }
   });
 });

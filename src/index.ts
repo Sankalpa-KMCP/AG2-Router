@@ -8,11 +8,14 @@
 import { LocalMetadataAccountStore } from './accounts/account-store.js';
 import { AccountEnrollmentService } from './accounts/enrollment.js';
 import { AG2LiveAdapter } from './ag2/adapter.js';
-import { AG2WinCredReader } from './ag2/wincred.js';
+import { AG2WinCredReader, AG2WinCredWriter } from './ag2/wincred.js';
+import { WindowsProcessController } from './ag2/process-control.js';
 import { loadConfig } from './config/config.js';
 import { QuotaRouter } from './router/router.js';
 import { AppServer } from './server/server.js';
 import { SessionVault } from './vault/session-vault.js';
+import { SwitchPlanner } from './switching/planner.js';
+import { SwitchTransactionCoordinator } from './switching/transaction.js';
 
 async function bootstrap() {
   const config = loadConfig();
@@ -20,6 +23,8 @@ async function bootstrap() {
   const accountStore = new LocalMetadataAccountStore();
   const adapter = new AG2LiveAdapter();
   const wincredReader = new AG2WinCredReader();
+  const wincredWriter = new AG2WinCredWriter();
+  const processController = new WindowsProcessController();
   const sessionVault = new SessionVault();
   const enrollmentService = new AccountEnrollmentService({
     adapter,
@@ -27,8 +32,35 @@ async function bootstrap() {
     sessionVault,
     accountStore
   });
+  const switchPlanner = new SwitchPlanner({
+    accountStore,
+    sessionVault,
+    winCredReader: wincredReader,
+    processController,
+    ag2Adapter: adapter
+  });
+  const switchCoordinator = new SwitchTransactionCoordinator(
+    {
+      accountStore,
+      sessionVault,
+      winCredReader: wincredReader,
+      winCredWriter,
+      processController,
+      ag2Adapter: adapter
+    },
+    { executionAuthorized: false } // HARD GATE: live execution disabled in production runtime
+  );
   const router = new QuotaRouter(accountStore, adapter, config.router);
-  const server = new AppServer(config, accountStore, adapter, router, enrollmentService, sessionVault);
+  const server = new AppServer(
+    config,
+    accountStore,
+    adapter,
+    router,
+    enrollmentService,
+    sessionVault,
+    switchPlanner,
+    switchCoordinator
+  );
 
   // Start server
   const bound = await server.start();
