@@ -5,8 +5,8 @@ node_modules/
 dist/
 
 # Local runtime data & persistence (contains no secrets, but machine-specific)
-data/
-vault/
+/data/
+/vault/
 *.dat
 *.tmp
 
