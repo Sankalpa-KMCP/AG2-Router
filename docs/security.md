@@ -39,13 +39,15 @@ Static asset handling enforces multi-layer directory traversal protection:
 * Contents: Strictly non-sensitive metadata (email address, priority rating, reserve flag, validation status).
 * Git Hygiene: The `data/` directory is gitignored to ensure local configuration and metadata are never pushed to version control.
 
-### 3.2 Planned Credential Vault Architecture (Staged Phase)
-In subsequent implementation phases, sensitive session management will adhere to proven Windows DPAPI patterns:
-* **Target Credential:** Antigravity 2.0 credentials reside in Windows Credential Manager (`WinCred`) under target `gemini:antigravity` (username: `antigravity`).
-* **Encryption Scope:** Multi-account session blobs will be encrypted using Windows Data Protection API (`DPAPI`) with `DataProtectionScope.CurrentUser`.
-* **Zero CLI Leaks:** Sensitive payloads must be piped over standard I/O (`stdin`/`stdout`), never passed via process command-line arguments or environment variables.
-* **In-Memory Hygiene:** Plaintext credential buffers in memory must be explicitly zeroed after use.
-* **Integrity Validation:** Vault files will employ SHA-256 checksums to detect file tampering before attempting DPAPI decryption.
+### 3.2 Implemented Credential Vault Architecture
+The multi-account session vault adheres to proven Windows DPAPI patterns:
+* **Target Credential:** Antigravity 2 credentials reside in Windows Credential Manager (`WinCred`) under target `gemini:antigravity` (username: `antigravity`). Access is strictly read-only via `AG2WinCredReader`.
+* **Single-Layer DPAPI Encryption:** Multi-account session blobs are individually encrypted using Windows Data Protection API (`DPAPI`) with `DataProtectionScope.CurrentUser`.
+* **Zero CLI Leaks:** Sensitive payloads are piped over standard I/O (`stdin`/`stdout`), never passed via process command-line arguments or environment variables.
+* **Internal Identity Framing:** Payloads embed accountId and target framing before encryption, failing closed upon record key alteration or identity mismatch.
+* **In-Memory Hygiene:** Plaintext credential buffers in memory are wiped with zeros (`buffer.fill(0)`) on a best-effort basis.
+* **Fail-Closed Persistence:** Corrupted vault files are never overwritten or wiped. Operations fail closed with `VaultCorruptionError` to preserve data for recovery.
+* For full architectural details, see [security-model.md](security-model.md).
 
 ---
 
