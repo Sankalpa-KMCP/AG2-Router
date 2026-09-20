@@ -55,6 +55,8 @@ export function redactSensitiveText(text?: string | null): string {
   // Redact header occurrences: x-codeium-csrf-token, authorization, etc.
   sanitized = sanitized.replace(/(x-codeium-csrf-token:\s*)([^\r\n]+)/gi, '$1[REDACTED]');
   sanitized = sanitized.replace(/(authorization:\s*Bearer\s*)([^\r\n]+)/gi, '$1[REDACTED]');
+  // Redact generic token/secret/password key-value pairs in logs/errors
+  sanitized = sanitized.replace(/(\b(?:token|password|secret|key|bearer)\b\s*[:=]\s*)([^\s"',;]+)/gi, '$1[REDACTED]');
 
   return sanitized;
 }
