@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AG2Router.AG2/AG2Router.AG2.csproj" />
+    <Project Path="src/AG2Router.App/AG2Router.App.csproj" />
+    <Project Path="src/AG2Router.Core/AG2Router.Core.csproj" />
+    <Project Path="src/AG2Router.Windows/AG2Router.Windows.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AG2Router.Tests/AG2Router.Tests.csproj" />
+  </Folder>
+</Solution>

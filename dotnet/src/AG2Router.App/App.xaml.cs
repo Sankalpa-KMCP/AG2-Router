@@ -1,0 +1,220 @@
+using System.Windows;
+using AG2Router.App.Lifecycle;
+using AG2Router.App.Server;
+using AG2Router.App.Tray;
+using AG2Router.App.Views;
+using AG2Router.Windows.Lifecycle;
+
+namespace AG2Router.App;
+
+public partial class App : System.Windows.Application
+{
+    private SingleInstanceGuard? _singleInstanceGuard;
+    private LoopbackServer? _loopbackServer;
+    private TrayIconManager? _trayIconManager;
+    private DashboardLifecycleManager? _dashboardManager;
+    private QuickStatusWindow? _quickStatusWindow;
+    private bool _isShuttingDown;
+
+    private static void Log(string msg)
+    {
+        try
+        {
+            var logPath = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AG2-Router",
+                "app.log"
+            );
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(logPath)!);
+            System.IO.File.AppendAllText(logPath, $"[{DateTime.UtcNow:O}] [PID {Environment.ProcessId}] {msg}\n");
+        }
+        catch { }
+    }
+
+    public App()
+    {
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        AppDomain.CurrentDomain.ProcessExit += (s, ev) =>
+        {
+            Log("AppDomain.ProcessExit triggered. Environment.StackTrace:\n" + Environment.StackTrace);
+        };
+    }
+
+    protected override async void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+
+        AppDomain.CurrentDomain.UnhandledException += (s, ev) =>
+        {
+            Log($"UnhandledException: {ev.ExceptionObject}");
+        };
+        DispatcherUnhandledException += (s, ev) =>
+        {
+            Log($"DispatcherUnhandledException: {ev.Exception}");
+        };
+
+        // 1. Handle explicit command-line controls for secondary instances
+        if (e.Args.Contains("--close"))
+        {
+            Log("Command line: --close requested. Forwarding to primary instance.");
+            SingleInstanceGuard.SendCommand("CLOSE");
+            Shutdown();
+            return;
+        }
+
+        if (e.Args.Contains("--exit"))
+        {
+            Log("Command line: --exit requested. Forwarding to primary instance.");
+            SingleInstanceGuard.SendCommand("EXIT");
+            Shutdown();
+            return;
+        }
+
+        // 2. Enforce per-user session single-instance execution
+        _singleInstanceGuard = new SingleInstanceGuard();
+        if (!_singleInstanceGuard.TryAcquire(
+            onActivateRequested: OnSecondaryInstanceActivated,
+            onCloseRequested: () => Dispatcher.Invoke(() =>
+            {
+                Log("Named pipe command CLOSE received.");
+                _dashboardManager?.CloseDashboard();
+            }),
+            onExitRequested: () => Dispatcher.Invoke(ExitApplication)))
+        {
+            Log("Duplicate instance detected; activation signal sent to primary instance. Terminating secondary instance.");
+            Shutdown();
+            return;
+        }
+
+        Log("Primary instance acquired single-instance guard.");
+
+        // 3. Prevent WPF from shutting down when windows are hidden to tray
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+        try
+        {
+            Log("Starting loopback server...");
+            _loopbackServer = new LoopbackServer();
+            await _loopbackServer.StartAsync(0);
+
+            var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
+            Log($"Loopback server bound to: {dashboardUrl}");
+
+            // 4. Initialize dashboard lifecycle manager (lazy window creation)
+            Log("Initializing DashboardLifecycleManager...");
+            _dashboardManager = new DashboardLifecycleManager(dashboardUrl);
+
+            Log("Initializing QuickStatusWindow...");
+            _quickStatusWindow = new QuickStatusWindow(OpenDashboard);
+
+            // 5. Initialize notification area tray icon
+            Log("Initializing TrayIconManager...");
+            _trayIconManager = new TrayIconManager(
+                onToggleQuickStatus: ToggleQuickStatus,
+                onOpenDashboard: OpenDashboard,
+                onExitRequested: ExitApplication
+            );
+
+            Log("Tray-first startup completed. Application active in system tray.");
+
+            if (e.Args.Contains("--open"))
+            {
+                OpenDashboard();
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Startup failed with exception: {ex}");
+            System.Windows.MessageBox.Show(
+                $"An error occurred while starting AG2 Router: {ex.Message}",
+                "AG2 Router Startup Error",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error
+            );
+            ExitApplication();
+        }
+    }
+
+    private void OnSecondaryInstanceActivated()
+    {
+        Log("OnSecondaryInstanceActivated invoked by named pipe listener.");
+        Dispatcher.Invoke(() =>
+        {
+            OpenDashboard();
+        });
+    }
+
+    private void ToggleQuickStatus()
+    {
+        Dispatcher.Invoke(() =>
+        {
+            if (_quickStatusWindow == null) return;
+
+            if (_quickStatusWindow.IsVisible)
+            {
+                _quickStatusWindow.Hide();
+            }
+            else
+            {
+                _quickStatusWindow.ShowNearTray();
+            }
+        });
+    }
+
+    private void OpenDashboard()
+    {
+        Log("OpenDashboard requested.");
+        Dispatcher.Invoke(() =>
+        {
+            if (_quickStatusWindow != null && _quickStatusWindow.IsVisible)
+            {
+                _quickStatusWindow.Hide();
+            }
+
+            Log("Calling _dashboardManager.OpenDashboard()");
+            _dashboardManager?.OpenDashboard();
+            Log("Called _dashboardManager.OpenDashboard() completed.");
+        });
+    }
+
+    private async void ExitApplication()
+    {
+        Log("ExitApplication requested.");
+        if (_isShuttingDown) return;
+        _isShuttingDown = true;
+
+        // Clean up UI & Tray icon immediately to eliminate ghost icons
+        _trayIconManager?.Dispose();
+        _trayIconManager = null;
+
+        _quickStatusWindow?.Close();
+        _quickStatusWindow = null;
+
+        _dashboardManager?.CloseDashboard();
+        _dashboardManager = null;
+
+        // Stop in-process loopback host gracefully
+        if (_loopbackServer != null)
+        {
+            await _loopbackServer.StopAsync();
+            await _loopbackServer.DisposeAsync();
+            _loopbackServer = null;
+        }
+
+        // Release mutex and pipe
+        if (_singleInstanceGuard != null)
+        {
+            await _singleInstanceGuard.DisposeAsync();
+            _singleInstanceGuard = null;
+        }
+
+        Shutdown();
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        Log($"App.OnExit called with exit code {e.ApplicationExitCode}");
+        _trayIconManager?.Dispose();
+        base.OnExit(e);
+    }
+}

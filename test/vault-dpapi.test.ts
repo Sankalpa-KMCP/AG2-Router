@@ -31,7 +31,7 @@ describe('WindowsDpapiProvider (CurrentUser DPAPI Encryption)', () => {
     );
   });
 
-  it('should successfully encrypt and decrypt a payload (round-trip)', async () => {
+  it('should successfully encrypt and decrypt a payload (round-trip)', { skip: process.platform !== 'win32' ? 'Windows DPAPI is only supported on Windows' : false }, async () => {
     const dpapi = new WindowsDpapiProvider();
     const originalText = JSON.stringify({ accountId: 'acc-123', secret: 'sample-secret-payload' });
     const plaintext = Buffer.from(originalText, 'utf8');
@@ -48,7 +48,7 @@ describe('WindowsDpapiProvider (CurrentUser DPAPI Encryption)', () => {
     assert.strictEqual(decrypted.toString('utf8'), originalText);
   });
 
-  it('should fail closed when ciphertext is corrupted or tampered with', async () => {
+  it('should fail closed when ciphertext is corrupted or tampered with', { skip: process.platform !== 'win32' ? 'Windows DPAPI is only supported on Windows' : false }, async () => {
     const dpapi = new WindowsDpapiProvider();
     const original = Buffer.from('uncompromised-secret-data', 'utf8');
     const ciphertext = await dpapi.encrypt(original);
