@@ -16,10 +16,12 @@ public class SingleInstanceGuard : IAsyncDisposable
     private Mutex? _mutex;
     private bool _isPrimaryInstance;
     private CancellationTokenSource? _pipeCts;
+    private Task? _listenerTask;
 
     /// <summary>
     /// Attempt to acquire the session-scoped mutex.
-    /// If primary, starts a background pipe listener to receive activation signals.
+    /// If primary, starts a background pipe listener and waits deterministically for its IPC endpoint
+    /// to be ready before returning true.
     /// If secondary, sends an activation signal to the primary instance and returns false.
     /// </summary>
     public bool TryAcquire(Action onActivateRequested, Action? onCloseRequested = null, Action? onExitRequested = null)
@@ -34,14 +36,51 @@ public class SingleInstanceGuard : IAsyncDisposable
         }
 
         // Primary instance: listen for duplicate instance launches
-        StartPipeListener(onActivateRequested, onCloseRequested, onExitRequested);
+        var readyTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        StartPipeListener(onActivateRequested, onCloseRequested, onExitRequested, readyTcs);
+
+        try
+        {
+            // Bounded deterministic wait for the pipe server to instantiate and begin listening
+            if (!readyTcs.Task.Wait(TimeSpan.FromSeconds(5)))
+            {
+                CleanupFailedAcquisition();
+                return false;
+            }
+        }
+        catch (Exception)
+        {
+            CleanupFailedAcquisition();
+            return false;
+        }
+
         return true;
+    }
+
+    private void CleanupFailedAcquisition()
+    {
+        if (_pipeCts != null)
+        {
+            try { _pipeCts.Cancel(); } catch { }
+            _pipeCts.Dispose();
+            _pipeCts = null;
+        }
+        if (_mutex != null)
+        {
+            if (_isPrimaryInstance)
+            {
+                try { _mutex.ReleaseMutex(); } catch { }
+            }
+            _mutex.Dispose();
+            _mutex = null;
+        }
+        _isPrimaryInstance = false;
     }
 
     /// <summary>
     /// Sends a command to the primary running instance over the session named pipe.
     /// </summary>
-    public static bool SendCommand(string command, int timeoutMs = 1000)
+    public static bool SendCommand(string command, int timeoutMs = 3000)
     {
         try
         {
@@ -63,13 +102,18 @@ public class SingleInstanceGuard : IAsyncDisposable
         SendCommand("ACTIVATE");
     }
 
-    private void StartPipeListener(Action onActivateRequested, Action? onCloseRequested, Action? onExitRequested)
+    private void StartPipeListener(
+        Action onActivateRequested,
+        Action? onCloseRequested,
+        Action? onExitRequested,
+        TaskCompletionSource<bool> readyTcs)
     {
         _pipeCts = new CancellationTokenSource();
         var token = _pipeCts.Token;
 
-        Task.Run(async () =>
+        _listenerTask = Task.Run(async () =>
         {
+            bool isFirstLoop = true;
             while (!token.IsCancellationRequested)
             {
                 try
@@ -82,20 +126,30 @@ public class SingleInstanceGuard : IAsyncDisposable
                         PipeOptions.Asynchronous
                     );
 
-                    await server.WaitForConnectionAsync(token);
+                    var waitTask = server.WaitForConnectionAsync(token);
+
+                    if (isFirstLoop)
+                    {
+                        isFirstLoop = false;
+                        readyTcs.TrySetResult(true);
+                    }
+
+                    await waitTask.ConfigureAwait(false);
 
                     using var reader = new StreamReader(server);
-                    var message = await reader.ReadLineAsync(token);
+                    var message = await reader.ReadLineAsync(token).ConfigureAwait(false);
                     switch (message)
                     {
                         case "ACTIVATE":
-                            onActivateRequested();
+                            _ = Task.Run(() => { try { onActivateRequested(); } catch { } });
                             break;
                         case "CLOSE":
-                            onCloseRequested?.Invoke();
+                            if (onCloseRequested != null)
+                                _ = Task.Run(() => { try { onCloseRequested(); } catch { } });
                             break;
                         case "EXIT":
-                            onExitRequested?.Invoke();
+                            if (onExitRequested != null)
+                                _ = Task.Run(() => { try { onExitRequested(); } catch { } });
                             break;
                     }
                 }
@@ -103,9 +157,16 @@ public class SingleInstanceGuard : IAsyncDisposable
                 {
                     break;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Delay before re-listening to avoid tight loops on error
+                    if (isFirstLoop)
+                    {
+                        isFirstLoop = false;
+                        readyTcs.TrySetException(ex);
+                        break;
+                    }
+
+                    // Delay before re-listening to avoid tight loops on unexpected transient error
                     await Task.Delay(250, token).ConfigureAwait(false);
                 }
             }
@@ -117,6 +178,16 @@ public class SingleInstanceGuard : IAsyncDisposable
         if (_pipeCts != null)
         {
             await _pipeCts.CancelAsync();
+            if (_listenerTask != null)
+            {
+                try
+                {
+                    await _listenerTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { }
+                catch { }
+                _listenerTask = null;
+            }
             _pipeCts.Dispose();
             _pipeCts = null;
         }

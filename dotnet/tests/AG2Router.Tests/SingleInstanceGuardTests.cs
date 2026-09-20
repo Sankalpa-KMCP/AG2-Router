@@ -3,6 +3,10 @@ using Xunit;
 
 namespace AG2Router.Tests;
 
+[CollectionDefinition("SingleInstanceGuard", DisableParallelization = true)]
+public class SingleInstanceGuardTestCollection { }
+
+[Collection("SingleInstanceGuard")]
 public class SingleInstanceGuardTests
 {
     [Fact]
@@ -18,7 +22,7 @@ public class SingleInstanceGuardTests
 
         Assert.True(primaryAcquired, "First instance must successfully acquire the session guard");
 
-        // Attempt secondary instance acquisition in the same user session
+        // Attempt secondary instance acquisition immediately in the same user session (no artificial sleep)
         await using var secondary = new SingleInstanceGuard();
         bool secondaryAcquired = secondary.TryAcquire(() => { });
 
@@ -62,5 +66,87 @@ public class SingleInstanceGuardTests
         using var exitTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         var exitResult = await Task.WhenAny(exitReceivedTcs.Task, Task.Delay(Timeout.Infinite, exitTimeoutCts.Token));
         Assert.True(exitResult == exitReceivedTcs.Task, "Primary instance should have received EXIT command within bounded timeout");
+    }
+
+    [Fact]
+    public async Task SingleInstanceGuard_RecyclesListener_ForMultipleSequentialCommands()
+    {
+        await using var primary = new SingleInstanceGuard();
+        var activateCount = 0;
+        var closeCount = 0;
+        var exitCount = 0;
+        var allDoneTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        bool primaryAcquired = primary.TryAcquire(
+            onActivateRequested: () =>
+            {
+                Interlocked.Increment(ref activateCount);
+                if (Volatile.Read(ref activateCount) == 2 && Volatile.Read(ref closeCount) == 1 && Volatile.Read(ref exitCount) == 1)
+                {
+                    allDoneTcs.TrySetResult(true);
+                }
+            },
+            onCloseRequested: () =>
+            {
+                Interlocked.Increment(ref closeCount);
+                if (Volatile.Read(ref activateCount) == 2 && Volatile.Read(ref closeCount) == 1 && Volatile.Read(ref exitCount) == 1)
+                {
+                    allDoneTcs.TrySetResult(true);
+                }
+            },
+            onExitRequested: () =>
+            {
+                Interlocked.Increment(ref exitCount);
+                if (Volatile.Read(ref activateCount) == 2 && Volatile.Read(ref closeCount) == 1 && Volatile.Read(ref exitCount) == 1)
+                {
+                    allDoneTcs.TrySetResult(true);
+                }
+            }
+        );
+
+        Assert.True(primaryAcquired, "First instance must successfully acquire the session guard");
+
+        // Send sequential commands back-to-back: ACTIVATE, CLOSE, EXIT, ACTIVATE
+        Assert.True(SingleInstanceGuard.SendCommand("ACTIVATE"), "First ACTIVATE should succeed");
+        Assert.True(SingleInstanceGuard.SendCommand("CLOSE"), "CLOSE should succeed");
+        Assert.True(SingleInstanceGuard.SendCommand("EXIT"), "EXIT should succeed");
+        Assert.True(SingleInstanceGuard.SendCommand("ACTIVATE"), "Second ACTIVATE should succeed");
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var result = await Task.WhenAny(allDoneTcs.Task, Task.Delay(Timeout.Infinite, timeoutCts.Token));
+
+        Assert.True(result == allDoneTcs.Task, "All 4 sequential commands must be delivered and processed within bounded timeout");
+        Assert.Equal(2, Volatile.Read(ref activateCount));
+        Assert.Equal(1, Volatile.Read(ref closeCount));
+        Assert.Equal(1, Volatile.Read(ref exitCount));
+    }
+
+    [Fact]
+    public async Task SingleInstanceGuard_DisposesCleanly_AndAllowsNewPrimaryToAcquire()
+    {
+        var primary1 = new SingleInstanceGuard();
+        bool acquired1 = primary1.TryAcquire(() => { });
+        Assert.True(acquired1, "Primary 1 must acquire");
+
+        // Secondary should fail while Primary 1 is active
+        var secondary1 = new SingleInstanceGuard();
+        bool secondaryAcquired = secondary1.TryAcquire(() => { });
+        Assert.False(secondaryAcquired, "Secondary must fail while Primary 1 active");
+        await secondary1.DisposeAsync();
+
+        // Dispose Primary 1
+        await primary1.DisposeAsync();
+
+        // Now a new Primary 2 should be able to acquire cleanly without collisions
+        await using var primary2 = new SingleInstanceGuard();
+        var activate2Tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        bool acquired2 = primary2.TryAcquire(() => activate2Tcs.TrySetResult(true));
+        Assert.True(acquired2, "Primary 2 must successfully acquire after Primary 1 disposed");
+
+        // Verify IPC still works on the new instance
+        Assert.True(SingleInstanceGuard.SendCommand("ACTIVATE"), "ACTIVATE on Primary 2 should succeed");
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var result = await Task.WhenAny(activate2Tcs.Task, Task.Delay(Timeout.Infinite, timeoutCts.Token));
+        Assert.True(result == activate2Tcs.Task, "Primary 2 should receive activation signal");
     }
 }
