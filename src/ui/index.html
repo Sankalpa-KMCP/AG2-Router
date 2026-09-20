@@ -264,6 +264,74 @@
     </div>
   </div>
 
+  <!-- Switch Readiness (Dry-Run Plan) Modal Dialog -->
+  <div class="modal-backdrop hidden" id="switch-plan-modal" role="dialog" aria-modal="true" aria-labelledby="switch-plan-title">
+    <div class="modal-card" style="max-width: 560px;">
+      <div class="modal-header">
+        <h3 class="modal-title" id="switch-plan-title">Account Switch Readiness (Dry-Run)</h3>
+        <button type="button" class="btn-close" id="btn-close-switch-modal" aria-label="Close dialog">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="plan-header-summary">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <div>
+              <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); font-weight: 600;">Target Candidate</span>
+              <div id="plan-target-email" style="font-size: 15px; font-weight: 600;">--</div>
+            </div>
+            <div id="plan-overall-badge" class="metric-badge badge-neutral">Checking...</div>
+          </div>
+        </div>
+
+        <div class="preflight-section">
+          <h4 style="font-size: 12px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;">Preflight Safety Checklist (6 Points)</h4>
+          <div id="plan-checklist" class="plan-checklist-container"></div>
+        </div>
+
+        <div class="pipeline-section" style="margin-top: 8px;">
+          <h4 style="font-size: 12px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 6px;">Execution Pipeline Stages (Preview)</h4>
+          <ol class="pipeline-stages-list" style="font-size: 12px; color: var(--text-secondary); padding-left: 20px; line-height: 1.6;">
+            <li>Validate target account &amp; decrypt session</li>
+            <li>Verify Antigravity 2 is idle (0 running tasks)</li>
+            <li>Take rollback snapshot (WinCred + launch spec)</li>
+            <li>Apply candidate credentials to Windows Credential Manager</li>
+            <li>Terminate and restart Antigravity 2 process safely</li>
+            <li>Verify post-switch identity &amp; quota telemetry</li>
+          </ol>
+        </div>
+
+        <div class="modal-security-note" style="border-left-color: var(--warning); margin-top: 8px;">
+          <strong>🛡️ Safety Gate Enforced:</strong> This is a read-only readiness evaluation.
+          No Windows Credentials have been modified, and Antigravity 2 was not restarted.
+          Live account switching is not authorized in this phase.
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" id="btn-close-switch-plan">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Account Deletion Confirmation Modal Dialog -->
+  <div class="modal-backdrop hidden" id="delete-account-modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="delete-modal-title">Delete Account</h3>
+        <button type="button" class="btn-close" id="btn-close-delete-modal" aria-label="Close dialog">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p id="delete-modal-prompt">Are you sure you want to delete this account?</p>
+        <div id="delete-vault-warning" class="modal-security-note hidden" style="border-left-color: var(--danger); background-color: var(--danger-subtle); margin-top: 8px;">
+          <strong style="color: var(--danger);">⚠️ Permanent Vault Deletion:</strong>
+          This account has an encrypted session vault record. Deleting it will permanently remove its encrypted credentials from local storage (<code>sessions.dat</code>).
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" id="btn-cancel-delete">Cancel</button>
+        <button type="button" class="btn btn-danger" id="btn-confirm-delete">Confirm Delete</button>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

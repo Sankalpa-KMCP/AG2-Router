@@ -306,6 +306,17 @@
           quotaDisplay = `<span style="color: var(--success); font-weight: 500;">${healthy}/${mList.length} models</span>`;
         }
 
+        let switchAction = '';
+        if (acc.isActive) {
+          switchAction = '<span class="account-active-badge" style="font-size: 11px; padding: 3px 8px;">ACTIVE</span>';
+        } else if (acc.hasVaultedSession) {
+          switchAction = `<button type="button" class="btn btn-secondary btn-plan-switch" data-id="${escapeHtml(acc.id)}" data-email="${escapeHtml(acc.email)}" style="font-size: 11px; padding: 3px 8px;">Plan Switch</button>`;
+        } else {
+          switchAction = `<button type="button" class="btn btn-secondary btn-plan-switch" data-id="${escapeHtml(acc.id)}" data-email="${escapeHtml(acc.email)}" style="font-size: 11px; padding: 3px 8px; opacity: 0.8;" title="Evaluate switch readiness">Check</button>`;
+        }
+
+        const deleteAction = `<button type="button" class="btn btn-danger btn-remove-acc" data-id="${escapeHtml(acc.id)}" data-email="${escapeHtml(acc.email)}" data-vaulted="${Boolean(acc.hasVaultedSession)}" style="font-size: 11px; padding: 3px 8px;">Delete</button>`;
+
         return `
           <tr>
             <td>
@@ -319,29 +330,36 @@
             <td>${vaultBadge}</td>
             <td>${escapeHtml(acc.validationStatus || 'UNVALIDATED')}</td>
             <td>${quotaDisplay}</td>
-            <td class="actions-col">
-              <button type="button" class="btn btn-danger btn-remove-acc" data-id="${escapeHtml(acc.id)}">Remove</button>
+            <td class="actions-col" style="white-space: nowrap;">
+              <div style="display: flex; gap: 6px; align-items: center; justify-content: flex-end;">
+                ${switchAction}
+                ${deleteAction}
+              </div>
             </td>
           </tr>
         `;
       })
       .join('');
 
-    // Bind remove buttons
+    // Bind Plan Switch buttons
+    document.querySelectorAll('.btn-plan-switch').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.getAttribute('data-id');
+        const email = e.currentTarget.getAttribute('data-email');
+        if (id && email) {
+          openSwitchPlanModal(id, email);
+        }
+      });
+    });
+
+    // Bind Delete buttons
     document.querySelectorAll('.btn-remove-acc').forEach((btn) => {
-      btn.addEventListener('click', async (e) => {
-        const id = e.target.getAttribute('data-id');
-        if (!id) return;
-        if (confirm('Are you sure you want to remove this account metadata?')) {
-          try {
-            const res = await fetch(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
-            if (res.ok) {
-              logActivity(`Removed account metadata (${id}).`);
-              await refreshAll();
-            }
-          } catch (err) {
-            alert('Failed to remove account: ' + err.message);
-          }
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.getAttribute('data-id');
+        const email = e.currentTarget.getAttribute('data-email');
+        const isVaulted = e.currentTarget.getAttribute('data-vaulted') === 'true';
+        if (id && email) {
+          openDeleteModal(id, email, isVaulted);
         }
       });
     });
@@ -448,6 +466,177 @@
   if (btnSaveCurrentAccount) btnSaveCurrentAccount.addEventListener('click', handleSaveCurrentAccount);
   if (btnEmptySaveCurrent) btnEmptySaveCurrent.addEventListener('click', handleSaveCurrentAccount);
 
+  // Switch Readiness Modal
+  const switchPlanModal = document.getElementById('switch-plan-modal');
+  const planTargetEmail = document.getElementById('plan-target-email');
+  const planOverallBadge = document.getElementById('plan-overall-badge');
+  const planChecklist = document.getElementById('plan-checklist');
+  const btnCloseSwitchModal = document.getElementById('btn-close-switch-modal');
+  const btnCloseSwitchPlan = document.getElementById('btn-close-switch-plan');
+
+  async function openSwitchPlanModal(id, email) {
+    if (!switchPlanModal) return;
+    switchPlanModal.classList.remove('hidden');
+    if (planTargetEmail) planTargetEmail.textContent = email;
+    if (planOverallBadge) {
+      planOverallBadge.className = 'metric-badge badge-neutral';
+      planOverallBadge.textContent = 'Evaluating Preflight...';
+      planOverallBadge.style.color = '';
+    }
+    if (planChecklist) {
+      planChecklist.innerHTML = '<div style="padding: 12px; color: var(--text-muted); font-size: 12px;">Evaluating live readiness checks against Antigravity 2...</div>';
+    }
+
+    try {
+      const res = await fetch(`/api/accounts/${encodeURIComponent(id)}/switch-plan`, { method: 'POST' });
+      const data = await res.json();
+
+      if (!res.ok || !data.plan) {
+        throw new Error(data.error || 'Failed to generate switch plan');
+      }
+
+      const plan = data.plan;
+
+      if (planOverallBadge) {
+        if (plan.ready) {
+          planOverallBadge.className = 'metric-badge badge-healthy';
+          planOverallBadge.textContent = 'READY FOR SWITCH';
+          planOverallBadge.style.color = 'var(--success)';
+        } else {
+          planOverallBadge.className = 'metric-badge badge-exhausted';
+          planOverallBadge.style.color = 'var(--danger)';
+          planOverallBadge.textContent = `BLOCKED (${plan.blockers.length} issue${plan.blockers.length === 1 ? '' : 's'})`;
+        }
+      }
+
+      const checkLabels = {
+        TARGET_ACCOUNT_EXISTS: 'Target Account Storage',
+        TARGET_HAS_VAULTED_SESSION: 'Encrypted Session Vault',
+        TARGET_NOT_ALREADY_ACTIVE: 'Active Account Exclusivity',
+        AG2_ACTIVITY_IS_IDLE: 'Antigravity 2 Activity & Idle State',
+        ROLLBACK_SNAPSHOT_READABLE: 'Rollback Snapshot Integrity',
+        LAUNCH_SPEC_CAPTURABLE: 'Process Launch Specification'
+      };
+
+      if (planChecklist) {
+        planChecklist.innerHTML = (plan.checks || [])
+          .map((c) => {
+            const icon = c.passed
+              ? '<span class="check-icon-pass">✓</span>'
+              : '<span class="check-icon-fail">✕</span>';
+            const title = checkLabels[c.code] || c.code;
+            return `
+              <div class="plan-check-item">
+                <div style="width: 20px; text-align: center;">${icon}</div>
+                <div class="plan-check-text">
+                  <strong>${escapeHtml(title)}</strong>
+                  <div>${escapeHtml(c.message)}</div>
+                </div>
+              </div>
+            `;
+          })
+          .join('');
+      }
+
+      logActivity(`Evaluated switch readiness for ${email}: ${plan.ready ? 'READY' : 'BLOCKED'}`);
+    } catch (err) {
+      if (planOverallBadge) {
+        planOverallBadge.className = 'metric-badge badge-exhausted';
+        planOverallBadge.style.color = 'var(--danger)';
+        planOverallBadge.textContent = 'EVALUATION ERROR';
+      }
+      if (planChecklist) {
+        planChecklist.innerHTML = `<div style="padding: 12px; color: var(--danger); font-size: 12px;">Error: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+  }
+
+  function closeSwitchPlanModal() {
+    if (switchPlanModal) switchPlanModal.classList.add('hidden');
+  }
+
+  if (btnCloseSwitchModal) btnCloseSwitchModal.addEventListener('click', closeSwitchPlanModal);
+  if (btnCloseSwitchPlan) btnCloseSwitchPlan.addEventListener('click', closeSwitchPlanModal);
+  if (switchPlanModal) {
+    switchPlanModal.addEventListener('click', (e) => {
+      if (e.target === switchPlanModal) closeSwitchPlanModal();
+    });
+  }
+
+  // Account Deletion Modal
+  const deleteAccountModal = document.getElementById('delete-account-modal');
+  const deleteModalPrompt = document.getElementById('delete-modal-prompt');
+  const deleteVaultWarning = document.getElementById('delete-vault-warning');
+  const btnCancelDelete = document.getElementById('btn-cancel-delete');
+  const btnConfirmDelete = document.getElementById('btn-confirm-delete');
+  const btnCloseDeleteModal = document.getElementById('btn-close-delete-modal');
+
+  let pendingDelete = null;
+
+  function openDeleteModal(id, email, isVaulted) {
+    if (!deleteAccountModal) return;
+    pendingDelete = { id, email, isVaulted };
+    if (deleteModalPrompt) {
+      deleteModalPrompt.innerHTML = `Are you sure you want to remove account <strong>${escapeHtml(email)}</strong>?`;
+    }
+    if (deleteVaultWarning) {
+      if (isVaulted) {
+        deleteVaultWarning.classList.remove('hidden');
+      } else {
+        deleteVaultWarning.classList.add('hidden');
+      }
+    }
+    deleteAccountModal.classList.remove('hidden');
+  }
+
+  function closeDeleteModal() {
+    pendingDelete = null;
+    if (deleteAccountModal) deleteAccountModal.classList.add('hidden');
+  }
+
+  async function handleConfirmDelete() {
+    if (!pendingDelete) return;
+    const { id, email } = pendingDelete;
+    const btn = btnConfirmDelete;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Deleting...';
+    }
+
+    try {
+      const res = await fetch(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Delete failed');
+      }
+
+      if (data.vaultRecordDeleted) {
+        logActivity(`Deleted account and permanently destroyed vaulted credentials (${email}).`);
+      } else {
+        logActivity(`Deleted account metadata (${email}).`);
+      }
+
+      closeDeleteModal();
+      await refreshAll();
+    } catch (err) {
+      alert('Failed to delete account: ' + err.message);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Confirm Delete';
+      }
+    }
+  }
+
+  if (btnCloseDeleteModal) btnCloseDeleteModal.addEventListener('click', closeDeleteModal);
+  if (btnCancelDelete) btnCancelDelete.addEventListener('click', closeDeleteModal);
+  if (btnConfirmDelete) btnConfirmDelete.addEventListener('click', handleConfirmDelete);
+  if (deleteAccountModal) {
+    deleteAccountModal.addEventListener('click', (e) => {
+      if (e.target === deleteAccountModal) closeDeleteModal();
+    });
+  }
+
   if (addAccountModal) {
     addAccountModal.addEventListener('click', (e) => {
       if (e.target === addAccountModal) closeModal();
@@ -455,8 +644,10 @@
   }
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !addAccountModal.classList.contains('hidden')) {
-      closeModal();
+    if (e.key === 'Escape') {
+      if (addAccountModal && !addAccountModal.classList.contains('hidden')) closeModal();
+      if (switchPlanModal && !switchPlanModal.classList.contains('hidden')) closeSwitchPlanModal();
+      if (deleteAccountModal && !deleteAccountModal.classList.contains('hidden')) closeDeleteModal();
     }
   });
 
