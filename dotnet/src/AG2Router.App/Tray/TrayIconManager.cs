@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace AG2Router.App.Tray;
@@ -78,6 +79,10 @@ public class TrayIconManager : IDisposable
         _notifyIcon.Text = text;
     }
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
     private static Icon CreateModernTrayIcon()
     {
         // Generate a crisp, modern vector-drawn tray icon (32x32) with dark background and blue accent ring
@@ -105,7 +110,18 @@ public class TrayIconManager : IDisposable
         g.DrawString("A", font, textBrush, new RectangleF(0, 0, 32, 32), sf);
 
         var hIcon = bitmap.GetHicon();
-        return Icon.FromHandle(hIcon);
+        try
+        {
+            using var tempIcon = Icon.FromHandle(hIcon);
+            return (Icon)tempIcon.Clone();
+        }
+        finally
+        {
+            if (hIcon != IntPtr.Zero)
+            {
+                DestroyIcon(hIcon);
+            }
+        }
     }
 
     public void Dispose()

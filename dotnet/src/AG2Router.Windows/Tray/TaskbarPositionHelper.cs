@@ -1,13 +1,53 @@
 using System.Drawing;
+using System.Runtime.InteropServices;
 
 namespace AG2Router.Windows.Tray;
 
 /// <summary>
 /// Calculates optimal positioning for quick-status popup windows relative to cursor, taskbar,
 /// and display working area, clamped cleanly inside the active monitor bounds.
+/// Supports high-DPI scaling across single and multi-monitor setups.
 /// </summary>
 public static class TaskbarPositionHelper
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    /// <summary>
+    /// Resolves the DPI scale factor (e.g. 1.0, 1.25, 1.5, 2.0) of the monitor containing the specified point.
+    /// Safely falls back to (1.0, 1.0) if native Win32 APIs are unavailable.
+    /// </summary>
+    public static (double scaleX, double scaleY) GetMonitorDpiScale(Point physicalPoint)
+    {
+        try
+        {
+            var pt = new POINT { X = physicalPoint.X, Y = physicalPoint.Y };
+            var hMon = MonitorFromPoint(pt, 2 /* MONITOR_DEFAULTTONEAREST */);
+            if (hMon != IntPtr.Zero && GetDpiForMonitor(hMon, 0 /* MDT_EFFECTIVE_DPI */, out uint dpiX, out uint dpiY) == 0)
+            {
+                if (dpiX > 0 && dpiY > 0)
+                {
+                    return (dpiX / 96.0, dpiY / 96.0);
+                }
+            }
+        }
+        catch
+        {
+            // Fallback for headless environments or non-Windows execution
+        }
+        return (1.0, 1.0);
+    }
+
     public static Point CalculateFlyoutPosition(double flyoutWidth, double flyoutHeight)
     {
         // 1. Get current mouse position (where user clicked tray icon)
