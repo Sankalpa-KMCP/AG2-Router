@@ -6,8 +6,7 @@
         Width="1100" Height="780"
         MinWidth="800" MinHeight="600"
         WindowStartupLocation="CenterScreen"
-        Background="#0F1115"
-        Closing="Window_Closing">
+        Background="#0F1115">
     <Grid Background="#0F1115">
         <wv2:WebView2 x:Name="DashboardWebView" />
     </Grid>

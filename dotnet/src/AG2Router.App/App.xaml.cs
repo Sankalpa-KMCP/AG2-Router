@@ -1,4 +1,5 @@
 using System.Windows;
+using AG2Router.App.Lifecycle;
 using AG2Router.App.Server;
 using AG2Router.App.Tray;
 using AG2Router.App.Views;
@@ -11,51 +12,119 @@ public partial class App : System.Windows.Application
     private SingleInstanceGuard? _singleInstanceGuard;
     private LoopbackServer? _loopbackServer;
     private TrayIconManager? _trayIconManager;
-    private MainWindow? _mainWindow;
+    private DashboardLifecycleManager? _dashboardManager;
     private QuickStatusWindow? _quickStatusWindow;
     private bool _isShuttingDown;
+
+    private static void Log(string msg)
+    {
+        try
+        {
+            var logPath = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AG2-Router",
+                "app.log"
+            );
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(logPath)!);
+            System.IO.File.AppendAllText(logPath, $"[{DateTime.UtcNow:O}] [PID {Environment.ProcessId}] {msg}\n");
+        }
+        catch { }
+    }
+
+    public App()
+    {
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        AppDomain.CurrentDomain.ProcessExit += (s, ev) =>
+        {
+            Log("AppDomain.ProcessExit triggered. Environment.StackTrace:\n" + Environment.StackTrace);
+        };
+    }
 
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
 
-        // 1. Enforce per-user session single-instance execution
-        _singleInstanceGuard = new SingleInstanceGuard();
-        if (!_singleInstanceGuard.TryAcquire(OnSecondaryInstanceActivated))
+        AppDomain.CurrentDomain.UnhandledException += (s, ev) =>
         {
-            // Another instance is already active in this session.
-            // It has been signaled to activate its window. We exit immediately.
+            Log($"UnhandledException: {ev.ExceptionObject}");
+        };
+        DispatcherUnhandledException += (s, ev) =>
+        {
+            Log($"DispatcherUnhandledException: {ev.Exception}");
+        };
+
+        // 1. Handle explicit command-line controls for secondary instances
+        if (e.Args.Contains("--close"))
+        {
+            Log("Command line: --close requested. Forwarding to primary instance.");
+            SingleInstanceGuard.SendCommand("CLOSE");
             Shutdown();
             return;
         }
 
-        // 2. Prevent WPF from shutting down when windows are hidden to tray
+        if (e.Args.Contains("--exit"))
+        {
+            Log("Command line: --exit requested. Forwarding to primary instance.");
+            SingleInstanceGuard.SendCommand("EXIT");
+            Shutdown();
+            return;
+        }
+
+        // 2. Enforce per-user session single-instance execution
+        _singleInstanceGuard = new SingleInstanceGuard();
+        if (!_singleInstanceGuard.TryAcquire(
+            onActivateRequested: OnSecondaryInstanceActivated,
+            onCloseRequested: () => Dispatcher.Invoke(() =>
+            {
+                Log("Named pipe command CLOSE received.");
+                _dashboardManager?.CloseDashboard();
+            }),
+            onExitRequested: () => Dispatcher.Invoke(ExitApplication)))
+        {
+            Log("Duplicate instance detected; activation signal sent to primary instance. Terminating secondary instance.");
+            Shutdown();
+            return;
+        }
+
+        Log("Primary instance acquired single-instance guard.");
+
+        // 3. Prevent WPF from shutting down when windows are hidden to tray
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
         try
         {
-            // 3. Start embedded loopback server on ephemeral port (127.0.0.1:0)
+            Log("Starting loopback server...");
             _loopbackServer = new LoopbackServer();
             await _loopbackServer.StartAsync(0);
 
             var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
+            Log($"Loopback server bound to: {dashboardUrl}");
 
-            // 4. Initialize windows
-            _mainWindow = new MainWindow(dashboardUrl);
+            // 4. Initialize dashboard lifecycle manager (lazy window creation)
+            Log("Initializing DashboardLifecycleManager...");
+            _dashboardManager = new DashboardLifecycleManager(dashboardUrl);
+
+            Log("Initializing QuickStatusWindow...");
             _quickStatusWindow = new QuickStatusWindow(OpenDashboard);
 
             // 5. Initialize notification area tray icon
+            Log("Initializing TrayIconManager...");
             _trayIconManager = new TrayIconManager(
                 onToggleQuickStatus: ToggleQuickStatus,
                 onOpenDashboard: OpenDashboard,
                 onExitRequested: ExitApplication
             );
 
-            // 6. Show dashboard window on initial startup
-            _mainWindow.ShowDashboard();
+            Log("Tray-first startup completed. Application active in system tray.");
+
+            if (e.Args.Contains("--open"))
+            {
+                OpenDashboard();
+            }
         }
         catch (Exception ex)
         {
+            Log($"Startup failed with exception: {ex}");
             System.Windows.MessageBox.Show(
                 $"An error occurred while starting AG2 Router: {ex.Message}",
                 "AG2 Router Startup Error",
@@ -68,6 +137,7 @@ public partial class App : System.Windows.Application
 
     private void OnSecondaryInstanceActivated()
     {
+        Log("OnSecondaryInstanceActivated invoked by named pipe listener.");
         Dispatcher.Invoke(() =>
         {
             OpenDashboard();
@@ -93,6 +163,7 @@ public partial class App : System.Windows.Application
 
     private void OpenDashboard()
     {
+        Log("OpenDashboard requested.");
         Dispatcher.Invoke(() =>
         {
             if (_quickStatusWindow != null && _quickStatusWindow.IsVisible)
@@ -100,12 +171,15 @@ public partial class App : System.Windows.Application
                 _quickStatusWindow.Hide();
             }
 
-            _mainWindow?.ShowDashboard();
+            Log("Calling _dashboardManager.OpenDashboard()");
+            _dashboardManager?.OpenDashboard();
+            Log("Called _dashboardManager.OpenDashboard() completed.");
         });
     }
 
     private async void ExitApplication()
     {
+        Log("ExitApplication requested.");
         if (_isShuttingDown) return;
         _isShuttingDown = true;
 
@@ -116,8 +190,8 @@ public partial class App : System.Windows.Application
         _quickStatusWindow?.Close();
         _quickStatusWindow = null;
 
-        _mainWindow?.RequestExplicitExit();
-        _mainWindow = null;
+        _dashboardManager?.CloseDashboard();
+        _dashboardManager = null;
 
         // Stop in-process loopback host gracefully
         if (_loopbackServer != null)
@@ -139,6 +213,7 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        Log($"App.OnExit called with exit code {e.ApplicationExitCode}");
         _trayIconManager?.Dispose();
         base.OnExit(e);
     }

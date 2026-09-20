@@ -22,7 +22,7 @@ public class SingleInstanceGuard : IAsyncDisposable
     /// If primary, starts a background pipe listener to receive activation signals.
     /// If secondary, sends an activation signal to the primary instance and returns false.
     /// </summary>
-    public bool TryAcquire(Action onActivateRequested)
+    public bool TryAcquire(Action onActivateRequested, Action? onCloseRequested = null, Action? onExitRequested = null)
     {
         _mutex = new Mutex(true, MutexName, out _isPrimaryInstance);
 
@@ -34,27 +34,36 @@ public class SingleInstanceGuard : IAsyncDisposable
         }
 
         // Primary instance: listen for duplicate instance launches
-        StartPipeListener(onActivateRequested);
+        StartPipeListener(onActivateRequested, onCloseRequested, onExitRequested);
         return true;
     }
 
-    private static void SendActivationSignal()
+    /// <summary>
+    /// Sends a command to the primary running instance over the session named pipe.
+    /// </summary>
+    public static bool SendCommand(string command, int timeoutMs = 1000)
     {
         try
         {
             using var client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
-            client.Connect(1000); // 1-second timeout
+            client.Connect(timeoutMs);
             using var writer = new StreamWriter(client);
-            writer.WriteLine("ACTIVATE");
+            writer.WriteLine(command);
             writer.Flush();
+            return true;
         }
         catch
         {
-            // Primary instance might be closing or pipe busy
+            return false;
         }
     }
 
-    private void StartPipeListener(Action onActivateRequested)
+    private static void SendActivationSignal()
+    {
+        SendCommand("ACTIVATE");
+    }
+
+    private void StartPipeListener(Action onActivateRequested, Action? onCloseRequested, Action? onExitRequested)
     {
         _pipeCts = new CancellationTokenSource();
         var token = _pipeCts.Token;
@@ -77,9 +86,17 @@ public class SingleInstanceGuard : IAsyncDisposable
 
                     using var reader = new StreamReader(server);
                     var message = await reader.ReadLineAsync(token);
-                    if (message == "ACTIVATE")
+                    switch (message)
                     {
-                        onActivateRequested();
+                        case "ACTIVATE":
+                            onActivateRequested();
+                            break;
+                        case "CLOSE":
+                            onCloseRequested?.Invoke();
+                            break;
+                        case "EXIT":
+                            onExitRequested?.Invoke();
+                            break;
                     }
                 }
                 catch (OperationCanceledException)
