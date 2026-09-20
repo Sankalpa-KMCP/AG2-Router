@@ -171,7 +171,7 @@ describe('SessionVault (Encrypted Multi-Account Session Persistence)', () => {
     }
   });
 
-  it('should work with real WindowsDpapiProvider in an isolated directory', async () => {
+  it('should work with real WindowsDpapiProvider in an isolated directory', { skip: process.platform !== 'win32' ? 'Windows DPAPI is only supported on Windows' : false }, async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-vault-real-test-'));
     try {
       const vault = new SessionVault({ vaultDir: tempDir });
