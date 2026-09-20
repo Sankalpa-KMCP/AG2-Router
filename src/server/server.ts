@@ -15,9 +15,11 @@ import * as http from 'node:http';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { IAccountStore } from '../accounts/types.js';
+import { AccountEnrollmentService } from '../accounts/enrollment.js';
 import { IAG2Adapter } from '../ag2/adapter.js';
 import { AppConfig } from '../config/config.js';
 import { QuotaRouter } from '../router/router.js';
+import { SessionVault } from '../vault/session-vault.js';
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -34,17 +36,23 @@ export class AppServer {
   private accountStore: IAccountStore;
   private adapter: IAG2Adapter;
   private router: QuotaRouter;
+  private enrollmentService?: AccountEnrollmentService;
+  private sessionVault?: SessionVault;
 
   constructor(
     config: AppConfig,
     accountStore: IAccountStore,
     adapter: IAG2Adapter,
-    router: QuotaRouter
+    router: QuotaRouter,
+    enrollmentService?: AccountEnrollmentService,
+    sessionVault?: SessionVault
   ) {
     this.config = config;
     this.accountStore = accountStore;
     this.adapter = adapter;
     this.router = router;
+    this.enrollmentService = enrollmentService;
+    this.sessionVault = sessionVault;
   }
 
   public async start(): Promise<{ host: string; port: number }> {
@@ -224,14 +232,52 @@ export class AppServer {
       return;
     }
 
+    // POST /api/accounts/enroll-current
+    if (pathname === '/api/accounts/enroll-current' && method === 'POST') {
+      if (!this.enrollmentService) {
+        this.sendJson(res, 501, { error: 'Account enrollment service is not configured' });
+        return;
+      }
+      try {
+        const body = ((await this.readBodyJson(req)) || {}) as Record<string, unknown>;
+        const options = {
+          name: typeof body.name === 'string' ? body.name : undefined,
+          priority: typeof body.priority === 'number' ? body.priority : undefined,
+          isReserve: typeof body.isReserve === 'boolean' ? body.isReserve : undefined,
+          notes: typeof body.notes === 'string' ? body.notes : undefined
+        };
+
+        const result = await this.enrollmentService.enrollCurrentAccount(options);
+        this.sendJson(res, 200, {
+          success: true,
+          account: result.account,
+          isNew: result.isNew,
+          message: result.message
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Enrollment failed';
+        this.sendJson(res, 400, { error: message });
+      }
+      return;
+    }
+
     // GET /api/accounts
     if (pathname === '/api/accounts' && method === 'GET') {
       const accounts = await this.accountStore.listAccounts();
       const activeId = await this.accountStore.getActiveAccountId();
-      const enriched = accounts.map((acc) => ({
-        ...acc,
-        isActive: acc.id === activeId
-      }));
+      const enriched = await Promise.all(
+        accounts.map(async (acc) => {
+          let hasVaulted = acc.hasVaultedSession;
+          if (hasVaulted === undefined && this.sessionVault) {
+            hasVaulted = await this.sessionVault.hasSession(acc.id);
+          }
+          return {
+            ...acc,
+            hasVaultedSession: Boolean(hasVaulted),
+            isActive: acc.id === activeId
+          };
+        })
+      );
       this.sendJson(res, 200, { accounts: enriched });
       return;
     }
@@ -250,6 +296,7 @@ export class AppServer {
           name: typeof body.name === 'string' ? body.name : undefined,
           priority: typeof body.priority === 'number' ? body.priority : undefined,
           isReserve: Boolean(body.isReserve),
+          hasVaultedSession: Boolean(body.hasVaultedSession),
           notes: typeof body.notes === 'string' ? body.notes : undefined
         });
 
@@ -272,6 +319,9 @@ export class AppServer {
       if (!removed) {
         this.sendJson(res, 404, { error: 'Account not found' });
         return;
+      }
+      if (this.sessionVault) {
+        await this.sessionVault.removeSession(id);
       }
       this.sendJson(res, 200, { success: true, removedId: id });
       return;

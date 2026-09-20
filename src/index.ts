@@ -6,18 +6,29 @@
  */
 
 import { LocalMetadataAccountStore } from './accounts/account-store.js';
+import { AccountEnrollmentService } from './accounts/enrollment.js';
 import { AG2LiveAdapter } from './ag2/adapter.js';
+import { AG2WinCredReader } from './ag2/wincred.js';
 import { loadConfig } from './config/config.js';
 import { QuotaRouter } from './router/router.js';
 import { AppServer } from './server/server.js';
+import { SessionVault } from './vault/session-vault.js';
 
 async function bootstrap() {
   const config = loadConfig();
 
   const accountStore = new LocalMetadataAccountStore();
   const adapter = new AG2LiveAdapter();
+  const wincredReader = new AG2WinCredReader();
+  const sessionVault = new SessionVault();
+  const enrollmentService = new AccountEnrollmentService({
+    adapter,
+    wincredReader,
+    sessionVault,
+    accountStore
+  });
   const router = new QuotaRouter(accountStore, adapter, config.router);
-  const server = new AppServer(config, accountStore, adapter, router);
+  const server = new AppServer(config, accountStore, adapter, router, enrollmentService, sessionVault);
 
   // Start server
   const bound = await server.start();
@@ -29,7 +40,8 @@ async function bootstrap() {
   console.log(`  Dashboard:   ${serverUrl}`);
   console.log(`  Interface:   Loopback Only (${bound.host})`);
   console.log(`  Auto-Switch: ${config.router.autoSwitchEnabled ? 'ENABLED' : 'DISABLED (Default)'}`);
-  console.log(`  Stage:       Live Discovery & Telemetry`);
+  console.log(`  Vault:       ${sessionVault.getVaultPath()}`);
+  console.log(`  Stage:       Encrypted Multi-Account Vault`);
   console.log('====================================================');
 
   // Start router evaluation loop

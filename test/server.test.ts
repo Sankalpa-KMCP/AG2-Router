@@ -124,7 +124,15 @@ describe('AppServer (Loopback HTTP & API)', () => {
     assert.equal(list2.accounts.length, 1);
     assert.equal(list2.accounts[0].id, created.id);
 
-    // 4. Delete account
+    // 4. Test POST /api/accounts/enroll-current without enrollment service configured -> 501
+    const enrollNoServiceRes = await request('/api/accounts/enroll-current', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    } as http.RequestOptions & { body: string });
+    assert.equal(enrollNoServiceRes.status, 501);
+
+    // 5. Delete account
     const deleteRes = await request(`/api/accounts/${created.id}`, { method: 'DELETE' });
     assert.equal(deleteRes.status, 200);
     assert.equal(JSON.parse(deleteRes.body).success, true);
@@ -263,6 +271,123 @@ describe('AppServer (Loopback HTTP & API)', () => {
       assert.doesNotMatch(res.body, /authorization/i);
     } finally {
       await liveServer.stop();
+    }
+  });
+
+  it('should successfully enroll current account via POST /api/accounts/enroll-current and report hasVaultedSession: true in GET /api/accounts', async () => {
+    const mockAdapter = {
+      discover: async () => ({ isRunning: true, status: 'HEALTHY' as const, processInfo: null }),
+      getCurrentAccount: async () => ({ email: 'enrolled@example.com', name: 'Enrolled User' }),
+      getQuota: async () => null,
+      getActivityState: async () => ({ state: 'IDLE' as const, totalTrajectories: 0, runningTrajectories: 0, timestamp: '' }),
+      switchAccount: async () => { throw new Error('Not implemented'); },
+      verifyAccount: async () => true
+    };
+
+    const mockWincred = {
+      readCredential: async () => ({
+        target: 'gemini:antigravity',
+        type: 1,
+        userName: 'antigravity',
+        persistence: 2,
+        blob: Buffer.from(JSON.stringify({ token: 'mock-auth-token-xyz' }), 'utf8')
+      })
+    };
+
+    const mockDpapi = {
+      encrypt: async (b: Buffer) => Buffer.concat([Buffer.from('ENC:'), b]),
+      decrypt: async (b: Buffer) => Buffer.from(b.subarray(4))
+    };
+
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-server-vault-'));
+
+    try {
+      const { SessionVault } = await import('../src/vault/session-vault.js');
+      const { AccountEnrollmentService } = await import('../src/accounts/enrollment.js');
+
+      const testVault = new SessionVault({ vaultDir: tempDir, dpapiProvider: mockDpapi });
+      const testStore = new InMemoryAccountStore();
+      const testEnrollService = new AccountEnrollmentService({
+        adapter: mockAdapter,
+        wincredReader: mockWincred,
+        sessionVault: testVault,
+        accountStore: testStore
+      });
+
+      const enrollServer = new AppServer(
+        { ...testConfig, port: testPort + 2 },
+        testStore,
+        mockAdapter,
+        router,
+        testEnrollService,
+        testVault
+      );
+
+      await enrollServer.start();
+      try {
+        // 1. Trigger enrollment
+        const enrollRes = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const postData = JSON.stringify({ priority: 1, notes: 'Enrolled via API test' });
+          const req = http.request(
+            {
+              hostname: '127.0.0.1',
+              port: testPort + 2,
+              path: '/api/accounts/enroll-current',
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData)
+              }
+            },
+            (r) => {
+              let b = '';
+              r.on('data', (c) => (b += c));
+              r.on('end', () => resolve({ status: r.statusCode || 0, body: b }));
+            }
+          );
+          req.on('error', reject);
+          req.write(postData);
+          req.end();
+        });
+
+        assert.equal(enrollRes.status, 200);
+        const enrollData = JSON.parse(enrollRes.body);
+        assert.equal(enrollData.success, true);
+        assert.equal(enrollData.account.email, 'enrolled@example.com');
+        assert.equal(enrollData.account.hasVaultedSession, true);
+
+        // 2. Fetch /api/accounts and verify hasVaultedSession is true and isActive is true
+        const listRes = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = http.request(
+            {
+              hostname: '127.0.0.1',
+              port: testPort + 2,
+              path: '/api/accounts',
+              method: 'GET'
+            },
+            (r) => {
+              let b = '';
+              r.on('data', (c) => (b += c));
+              r.on('end', () => resolve({ status: r.statusCode || 0, body: b }));
+            }
+          );
+          req.on('error', reject);
+          req.end();
+        });
+
+        assert.equal(listRes.status, 200);
+        const listData = JSON.parse(listRes.body);
+        assert.equal(listData.accounts.length, 1);
+        assert.equal(listData.accounts[0].email, 'enrolled@example.com');
+        assert.equal(listData.accounts[0].hasVaultedSession, true);
+        assert.equal(listData.accounts[0].isActive, true);
+      } finally {
+        await enrollServer.stop();
+      }
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });
