@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AG2 Router</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="header-brand">
+        <h1 class="app-title">AG2 Router</h1>
+        <span class="app-version">v0.1.0 (Foundation)</span>
+      </div>
+      <div class="header-status" id="header-status">
+        <span class="status-dot status-offline" id="status-dot"></span>
+        <span class="status-label" id="status-text">Waiting for Antigravity 2</span>
+      </div>
+    </header>
+
+    <!-- Main Content Container -->
+    <main class="main-content">
+      <!-- Top Metrics Row -->
+      <section class="metrics-row" aria-label="Key Metrics">
+        <div class="metric-block">
+          <span class="metric-label">Total Available</span>
+          <div class="metric-value-row">
+            <span class="metric-value" id="metric-total-quota">--%</span>
+            <span class="metric-badge badge-neutral" id="quota-badge">Telemetry Offline</span>
+          </div>
+          <p class="metric-hint" id="quota-hint">Multi-account telemetry inactive in foundation stage</p>
+        </div>
+
+        <div class="metric-block">
+          <span class="metric-label">Active Account</span>
+          <div class="metric-value-row">
+            <span class="metric-value-text" id="metric-active-account">No account connected</span>
+          </div>
+          <p class="metric-hint" id="account-hint">No active Antigravity 2 session detected</p>
+        </div>
+
+        <div class="metric-block">
+          <span class="metric-label">Auto Switch</span>
+          <div class="metric-value-row">
+            <span class="metric-switch-state" id="metric-switch-state">OFF</span>
+            <span class="metric-threshold" id="metric-threshold">Switch below 15%</span>
+          </div>
+          <p class="metric-hint" id="gate-state-hint">Safety gate: IDLE</p>
+        </div>
+      </section>
+
+      <!-- Dashboard View Navigation -->
+      <nav class="view-nav" aria-label="Dashboard Views">
+        <button type="button" class="nav-btn active" data-view="accounts">Accounts</button>
+        <button type="button" class="nav-btn" data-view="activity">Activity</button>
+        <button type="button" class="nav-btn" data-view="telemetry">Live Telemetry</button>
+        <button type="button" class="nav-btn" data-view="settings">Settings</button>
+      </nav>
+
+      <!-- View: Accounts -->
+      <section class="view-panel" id="view-accounts">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Connected Accounts</h2>
+            <p class="panel-subtitle">Accounts configured for automated quota-based routing</p>
+          </div>
+          <button type="button" class="btn btn-primary" id="btn-open-add-account">+ Connect Account</button>
+        </div>
+
+        <div class="accounts-container" id="accounts-container">
+          <div class="empty-state" id="accounts-empty">
+            <div class="empty-icon" aria-hidden="true">👤</div>
+            <h3 class="empty-title">No accounts connected</h3>
+            <p class="empty-desc">Register non-secret account metadata to participate in automated routing.</p>
+            <button type="button" class="btn btn-secondary" id="btn-empty-add-account">Connect account</button>
+          </div>
+          <table class="data-table hidden" id="accounts-table" aria-label="Accounts List">
+            <thead>
+              <tr>
+                <th>Account</th>
+                <th>Priority</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Usable Quota</th>
+                <th class="actions-col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="accounts-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- View: Activity -->
+      <section class="view-panel hidden" id="view-activity">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Activity & Safety Gate</h2>
+            <p class="panel-subtitle">Real-time decisions, safety checks, and transition log</p>
+          </div>
+          <button type="button" class="btn btn-secondary" id="btn-clear-activity">Clear Log</button>
+        </div>
+
+        <div class="activity-status-card">
+          <div class="activity-gate-indicator">
+            <span class="gate-label">Gate State:</span>
+            <span class="gate-state-badge" id="gate-state-badge">IDLE</span>
+          </div>
+          <div class="activity-decision-text" id="gate-decision-text">Router initialized in foundation mode.</div>
+        </div>
+
+        <div class="activity-log-container">
+          <ul class="activity-log" id="activity-log-list"></ul>
+        </div>
+      </section>
+
+      <!-- View: Live Telemetry -->
+      <section class="view-panel hidden" id="view-telemetry">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Antigravity 2 Telemetry</h2>
+            <p class="panel-subtitle">Live model quotas, credit balances, and session identity</p>
+          </div>
+          <span class="telemetry-sync-time" id="telemetry-sync-time" style="font-size: 12px; color: var(--text-muted);">Last sync: Never</span>
+        </div>
+
+        <div id="telemetry-offline-notice" class="empty-state">
+          <div class="empty-icon" aria-hidden="true">📡</div>
+          <h3 class="empty-title">Telemetry Unavailable</h3>
+          <p class="empty-desc">Antigravity 2 language server is not detected or offline. Start Antigravity to stream live telemetry.</p>
+        </div>
+
+        <div id="telemetry-content" class="hidden">
+          <div class="activity-status-card" style="margin-bottom: var(--spacing-md);">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+              <div>
+                <strong id="telemetry-email" style="font-size: 15px;">--</strong>
+                <span class="metric-badge badge-neutral" id="telemetry-tier" style="margin-left: 8px;">Tier: --</span>
+              </div>
+              <div id="telemetry-credits-row" style="font-size: 13px; color: var(--text-secondary);">
+                <!-- Credit pools rendered dynamically -->
+              </div>
+            </div>
+          </div>
+
+          <h3 style="font-size: 13px; font-weight: 600; margin-bottom: var(--spacing-sm); color: var(--text-secondary); letter-spacing: 0.03em;">MODEL QUOTA POOLS (SEGREGATED)</h3>
+          <table class="data-table" aria-label="Model Quotas">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Remaining Quota</th>
+                <th>Reset Time</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="telemetry-models-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- View: Settings -->
+      <section class="view-panel hidden" id="view-settings">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Router Configuration</h2>
+            <p class="panel-subtitle">Thresholds and safety parameters for quota-based routing</p>
+          </div>
+        </div>
+
+        <form id="settings-form" class="settings-form">
+          <div class="form-group-toggle">
+            <div>
+              <label for="cfg-auto-switch" class="form-label-bold">Auto Switch</label>
+              <p class="form-desc">Automatically queue an account switch when the active account quota falls below threshold.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="cfg-auto-switch">
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="cfg-low-threshold">Low Quota Threshold (%)</label>
+              <input type="number" id="cfg-low-threshold" min="5" max="50" step="1" value="15">
+              <span class="form-hint">Switch triggers when quota is at or below this percentage.</span>
+            </div>
+
+            <div class="form-group">
+              <label for="cfg-min-candidate">Minimum Candidate Quota (%)</label>
+              <input type="number" id="cfg-min-candidate" min="10" max="90" step="1" value="30">
+              <span class="form-hint">A candidate account must have at least this quota to be selected.</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="cfg-polling-interval">Polling Interval (seconds)</label>
+              <input type="number" id="cfg-polling-interval" min="2" max="60" step="1" value="10">
+              <span class="form-hint">Frequency of Antigravity 2 telemetry refresh cycles.</span>
+            </div>
+          </div>
+
+          <div class="form-actions">
+            <button type="submit" class="btn btn-primary" id="btn-save-settings">Save Settings</button>
+            <span class="save-status" id="save-settings-status" aria-live="polite"></span>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <span>AG2 Router &bull; Loopback only (127.0.0.1) &bull; Zero external network telemetry</span>
+      <span id="footer-last-poll">Last poll: Never</span>
+    </footer>
+  </div>
+
+  <!-- Connect Account Modal Dialog -->
+  <div class="modal-backdrop hidden" id="add-account-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="modal-title">Connect Account</h3>
+        <button type="button" class="btn-close" id="btn-close-modal" aria-label="Close dialog">&times;</button>
+      </div>
+      <form id="add-account-form">
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="acc-email">Account Email <span class="required">*</span></label>
+            <input type="email" id="acc-email" required placeholder="developer@example.com">
+          </div>
+          <div class="form-group">
+            <label for="acc-name">Account Label (Optional)</label>
+            <input type="text" id="acc-name" placeholder="Work / Personal / Secondary">
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="acc-priority">Priority (1 = highest)</label>
+              <input type="number" id="acc-priority" min="1" max="100" value="1">
+            </div>
+            <div class="form-group-checkbox">
+              <input type="checkbox" id="acc-reserve">
+              <label for="acc-reserve">Reserve account (use only if standard accounts exhausted)</label>
+            </div>
+          </div>
+          <p class="modal-security-note">
+            <strong>Security Notice:</strong> In foundation stage, only non-secret metadata is registered.
+            Encrypted session token capture and WinCred vaulting are staged for subsequent implementation.
+          </p>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-modal">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-account">Save Account</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
