@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>AG2Router.App</RootNamespace>
+    <AssemblyName>AG2Router.App</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AG2Router.Core\AG2Router.Core.csproj" />
+    <ProjectReference Include="..\AG2Router.AG2\AG2Router.AG2.csproj" />
+    <ProjectReference Include="..\AG2Router.Windows\AG2Router.Windows.csproj" />
+  </ItemGroup>
+
+  <!-- Link and stage canonical UI assets into wwwroot without duplicating files in git -->
+  <ItemGroup>
+    <Content Include="$(RepoRoot)src\ui\**\*.*">
+      <Link>wwwroot\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+</Project>

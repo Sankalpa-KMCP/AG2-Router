@@ -3,6 +3,11 @@ node_modules/
 
 # Build outputs
 dist/
+bin/
+obj/
+*.user
+*.suo
+.vs/
 
 # Local runtime data & persistence (contains no secrets, but machine-specific)
 /data/
