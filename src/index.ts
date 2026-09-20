@@ -22,20 +22,20 @@ async function bootstrap() {
 
   const accountStore = new LocalMetadataAccountStore();
   const adapter = new AG2LiveAdapter();
-  const wincredReader = new AG2WinCredReader();
-  const wincredWriter = new AG2WinCredWriter();
+  const winCredReader = new AG2WinCredReader();
+  const winCredWriter = new AG2WinCredWriter();
   const processController = new WindowsProcessController();
   const sessionVault = new SessionVault();
   const enrollmentService = new AccountEnrollmentService({
     adapter,
-    wincredReader,
+    wincredReader: winCredReader,
     sessionVault,
     accountStore
   });
   const switchPlanner = new SwitchPlanner({
     accountStore,
     sessionVault,
-    winCredReader: wincredReader,
+    winCredReader,
     processController,
     ag2Adapter: adapter
   });
@@ -43,7 +43,7 @@ async function bootstrap() {
     {
       accountStore,
       sessionVault,
-      winCredReader: wincredReader,
+      winCredReader,
       winCredWriter,
       processController,
       ag2Adapter: adapter

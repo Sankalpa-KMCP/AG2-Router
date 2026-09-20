@@ -38,6 +38,8 @@ test('AG2WinCredWriter - Parameter validation rejects invalid inputs', async () 
     () => writer.writeCredential({
       target: '',
       type: 1,
+      userName: 'user@example.com',
+      persistence: 2,
       blob: Buffer.from('data')
     }),
     (err: WinCredError) => {
@@ -51,6 +53,8 @@ test('AG2WinCredWriter - Parameter validation rejects invalid inputs', async () 
     () => writer.writeCredential({
       target: '   ',
       type: 1,
+      userName: 'user@example.com',
+      persistence: 2,
       blob: Buffer.from('data')
     }),
     (err: WinCredError) => {
@@ -64,6 +68,8 @@ test('AG2WinCredWriter - Parameter validation rejects invalid inputs', async () 
     () => writer.writeCredential({
       target: 'gemini:antigravity',
       type: 2, // Domain Password
+      userName: 'user@example.com',
+      persistence: 2,
       blob: Buffer.from('data')
     }),
     (err: WinCredError) => {
@@ -77,6 +83,8 @@ test('AG2WinCredWriter - Parameter validation rejects invalid inputs', async () 
     () => writer.writeCredential({
       target: 'gemini:antigravity',
       type: 1,
+      userName: 'user@example.com',
+      persistence: 2,
       blob: Buffer.alloc(0)
     }),
     (err: WinCredError) => {
@@ -124,6 +132,8 @@ test('AG2WinCredWriter - Error handling redacts sensitive information in excepti
     () => writer.writeCredential({
       target: 'gemini:antigravity',
       type: 1,
+      userName: 'user@example.com',
+      persistence: 2,
       blob: secretBuf
     }),
     (err: WinCredError) => {

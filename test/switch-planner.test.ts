@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SwitchPlanner } from '../src/switching/planner.js';
 import { IAccountStore, AccountMetadata } from '../src/accounts/types.js';
-import { SessionVault } from '../vault/session-vault.js';
-import { IWinCredReader, WinCredEntry } from '../ag2/wincred.js';
-import { IProcessController, AG2ProcessLaunchSpec } from '../ag2/process-control.js';
-import { IAG2Adapter, AG2DiscoveryResult, AG2AccountIdentity, ActivitySnapshot, QuotaSnapshot, SwitchRequest, SwitchResult } from '../ag2/types.js';
+import { SessionVault } from '../src/vault/session-vault.js';
+import { IWinCredReader, WinCredEntry } from '../src/ag2/wincred.js';
+import { IProcessController, AG2ProcessLaunchSpec } from '../src/ag2/process-control.js';
+import { IAG2Adapter, AG2DiscoveryResult, AG2AccountIdentity, ActivitySnapshot, QuotaSnapshot, SwitchRequest, SwitchResult } from '../src/ag2/types.js';
 
 class MockAccountStore implements IAccountStore {
   public accounts = new Map<string, AccountMetadata>();
@@ -40,7 +40,8 @@ class MockWinCredReader implements IWinCredReader {
   };
 
   public async readCredential(target = 'gemini:antigravity'): Promise<WinCredEntry | null> {
-    return this.cred;
+    if (target) return this.cred;
+    return null;
   }
 }
 
@@ -68,8 +69,7 @@ class MockAG2Adapter implements IAG2Adapter {
   public status: 'HEALTHY' | 'OFFLINE' | 'DEGRADED' = 'HEALTHY';
   public currentAccount: AG2AccountIdentity | null = {
     email: 'active@example.com',
-    name: 'Active User',
-    status: 'ACTIVE'
+    name: 'Active User'
   };
   public activity: ActivitySnapshot = {
     state: 'IDLE',
@@ -85,8 +85,10 @@ class MockAG2Adapter implements IAG2Adapter {
       processInfo: this.isRunning ? {
         pid: 22440,
         port: 51768,
+        protocol: 'https',
         csrfToken: 'mock-csrf',
-        executablePath: 'C:\\Users\\user\\language_server.exe'
+        binaryPath: 'C:\\Users\\user\\language_server.exe',
+        discoveredAt: new Date().toISOString()
       } : null,
       message: 'Mock discovery'
     };
@@ -97,25 +99,33 @@ class MockAG2Adapter implements IAG2Adapter {
   public async getQuota(): Promise<QuotaSnapshot | null> { return null; }
   public async getActivityState(): Promise<ActivitySnapshot> { return this.activity; }
   public async switchAccount(_request: SwitchRequest): Promise<SwitchResult> { throw new Error(); }
-  public async verifyAccount(_expected: AG2AccountIdentity): Promise<any> { throw new Error(); }
+  public async verifyAccount(expectedEmail: string): Promise<boolean> {
+    return this.currentAccount?.email === expectedEmail;
+  }
+}
+
+class MockSessionVault {
+  public sessions = new Set<string>();
+
+  public async hasSession(id: string): Promise<boolean> {
+    return this.sessions.has(id);
+  }
+
+  public async getSession(_id: string): Promise<Buffer | null> {
+    return null;
+  }
 }
 
 function createPlannerHarness() {
   const accountStore = new MockAccountStore();
-  const sessionVault = {
-    sessions: new Set<string>(),
-    async hasSession(id: string): Promise<boolean> {
-      return this.sessions.has(id);
-    }
-  } as unknown as SessionVault;
-
+  const sessionVault = new MockSessionVault();
   const winCredReader = new MockWinCredReader();
   const processController = new MockProcessController();
   const ag2Adapter = new MockAG2Adapter();
 
   const planner = new SwitchPlanner({
     accountStore,
-    sessionVault,
+    sessionVault: sessionVault as unknown as SessionVault,
     winCredReader,
     processController,
     ag2Adapter
@@ -138,7 +148,7 @@ test('SwitchPlanner - Returns ready: true when all 6 checks pass', async () => {
     lastActiveAt: null
   };
   accountStore.accounts.set(targetAcc.id, targetAcc);
-  (sessionVault as any).sessions.add(targetAcc.id);
+  sessionVault.sessions.add(targetAcc.id);
 
   const plan = await planner.planSwitch('acc_candidate');
   assert.strictEqual(plan.ready, true);
@@ -177,13 +187,12 @@ test('SwitchPlanner - Identifies blockers when preflight conditions are not met'
   assert.strictEqual(plan2.ready, false);
   assert.ok(plan2.blockers.some((b) => b.includes('does not have an encrypted session in the vault')));
 
-  (sessionVault as any).sessions.add('acc_target');
+  sessionVault.sessions.add('acc_target');
 
   // 3. Target is already active (by live identity)
   ag2Adapter.currentAccount = {
     email: 'target@example.com',
-    name: 'Target User',
-    status: 'ACTIVE'
+    name: 'Target User'
   };
   const plan3 = await planner.planSwitch('acc_target');
   assert.strictEqual(plan3.ready, false);
@@ -192,8 +201,7 @@ test('SwitchPlanner - Identifies blockers when preflight conditions are not met'
   // Reset live account
   ag2Adapter.currentAccount = {
     email: 'other@example.com',
-    name: 'Other',
-    status: 'ACTIVE'
+    name: 'Other'
   };
 
   // 4. AG2 is busy

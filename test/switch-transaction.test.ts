@@ -6,10 +6,10 @@ import {
   SwitchCoordinatorDependencies
 } from '../src/switching/transaction.js';
 import { IAccountStore, AccountMetadata } from '../src/accounts/types.js';
-import { SessionVault } from '../vault/session-vault.js';
-import { IWinCredReader, IWinCredWriter, WinCredEntry } from '../ag2/wincred.js';
-import { IProcessController, AG2ProcessLaunchSpec } from '../ag2/process-control.js';
-import { IAG2Adapter, AG2DiscoveryResult, AG2AccountIdentity, ActivitySnapshot, QuotaSnapshot, SwitchRequest, SwitchResult } from '../ag2/types.js';
+import { SessionVault } from '../src/vault/session-vault.js';
+import { IWinCredReader, IWinCredWriter, WinCredEntry } from '../src/ag2/wincred.js';
+import { IProcessController, AG2ProcessLaunchSpec } from '../src/ag2/process-control.js';
+import { IAG2Adapter, AG2DiscoveryResult, AG2AccountIdentity, ActivitySnapshot, QuotaSnapshot, SwitchRequest, SwitchResult } from '../src/ag2/types.js';
 
 class MockAccountStore implements IAccountStore {
   public accounts: Map<string, AccountMetadata> = new Map();
@@ -78,7 +78,8 @@ class MockWinCredReader implements IWinCredReader {
   };
 
   public async readCredential(target = 'gemini:antigravity'): Promise<WinCredEntry | null> {
-    return this.cred;
+    if (target) return this.cred;
+    return null;
   }
 }
 
@@ -140,8 +141,7 @@ class MockAG2Adapter implements IAG2Adapter {
   public status: 'HEALTHY' | 'OFFLINE' | 'DEGRADED' = 'HEALTHY';
   public currentAccount: AG2AccountIdentity | null = {
     email: 'user1@example.com',
-    name: 'User One',
-    status: 'ACTIVE'
+    name: 'User One'
   };
   public activity: ActivitySnapshot = {
     state: 'IDLE',
@@ -157,8 +157,10 @@ class MockAG2Adapter implements IAG2Adapter {
       processInfo: this.isRunning ? {
         pid: 22440,
         port: 51768,
+        protocol: 'https',
         csrfToken: 'mock-csrf',
-        executablePath: 'C:\\Users\\user\\AppData\\Local\\Programs\\Antigravity\\language_server.exe'
+        binaryPath: 'C:\\Users\\user\\AppData\\Local\\Programs\\Antigravity\\language_server.exe',
+        discoveredAt: new Date().toISOString()
       } : null,
       message: 'Mock discovery'
     };
@@ -180,23 +182,26 @@ class MockAG2Adapter implements IAG2Adapter {
     throw new Error('Not implemented');
   }
 
-  public async verifyAccount(_expected: AG2AccountIdentity): Promise<any> {
-    throw new Error('Not implemented');
+  public async verifyAccount(expectedEmail: string): Promise<boolean> {
+    return this.currentAccount?.email === expectedEmail;
+  }
+}
+
+class MockSessionVault {
+  public sessions = new Map<string, Buffer>();
+
+  public async hasSession(id: string): Promise<boolean> {
+    return this.sessions.has(id);
+  }
+
+  public async getSession(id: string): Promise<Buffer | null> {
+    return this.sessions.get(id) || null;
   }
 }
 
 function createTestHarness() {
   const accountStore = new MockAccountStore();
-  const sessionVault = {
-    sessions: new Map<string, Buffer>(),
-    async hasSession(id: string): Promise<boolean> {
-      return this.sessions.has(id);
-    },
-    async getSession(id: string): Promise<Buffer | null> {
-      return this.sessions.get(id) || null;
-    }
-  } as unknown as SessionVault;
-
+  const sessionVault = new MockSessionVault();
   const winCredReader = new MockWinCredReader();
   const winCredWriter = new MockWinCredWriter();
   const processController = new MockProcessController();
@@ -204,7 +209,7 @@ function createTestHarness() {
 
   const deps: SwitchCoordinatorDependencies = {
     accountStore,
-    sessionVault,
+    sessionVault: sessionVault as unknown as SessionVault,
     winCredReader,
     winCredWriter,
     processController,
@@ -236,7 +241,7 @@ test('SwitchTransactionCoordinator - Hard execution gate prevents unauthorized e
 });
 
 test('SwitchTransactionCoordinator - Preflight checks fail before any mutation', async () => {
-  const { deps, accountStore, winCredWriter } = createTestHarness();
+  const { deps, accountStore, sessionVault, winCredWriter, ag2Adapter } = createTestHarness();
   const coordinator = new SwitchTransactionCoordinator(deps, { executionAuthorized: true });
 
   // 1. Target account does not exist
@@ -267,7 +272,7 @@ test('SwitchTransactionCoordinator - Preflight checks fail before any mutation',
   assert.strictEqual(winCredWriter.writtenEntries.length, 0);
 
   // Add session to vault
-  (deps.sessionVault as any).sessions.set('acc_target', Buffer.from('target-token-blob'));
+  sessionVault.sessions.set('acc_target', Buffer.from('target-token-blob'));
 
   // 3. Target is already active
   accountStore.activeAccountId = 'acc_target';
@@ -279,7 +284,7 @@ test('SwitchTransactionCoordinator - Preflight checks fail before any mutation',
 
   // 4. AG2 is busy
   accountStore.activeAccountId = 'acc_source';
-  (deps.ag2Adapter as MockAG2Adapter).activity = {
+  ag2Adapter.activity = {
     state: 'BUSY',
     totalTrajectories: 1,
     runningTrajectories: 1,
@@ -293,7 +298,7 @@ test('SwitchTransactionCoordinator - Preflight checks fail before any mutation',
 });
 
 test('SwitchTransactionCoordinator - Happy path executes all stages and completes successfully', async () => {
-  const { deps, accountStore, winCredWriter, processController, ag2Adapter } = createTestHarness();
+  const { deps, accountStore, sessionVault, winCredWriter, processController, ag2Adapter } = createTestHarness();
   const coordinator = new SwitchTransactionCoordinator(deps, {
     executionAuthorized: true,
     pollIntervalMs: 10,
@@ -325,7 +330,7 @@ test('SwitchTransactionCoordinator - Happy path executes all stages and complete
   accountStore.accounts.set(targetAcc.id, targetAcc);
   accountStore.activeAccountId = sourceAcc.id;
 
-  (deps.sessionVault as any).sessions.set(targetAcc.id, Buffer.from('target-token-blob'));
+  sessionVault.sessions.set(targetAcc.id, Buffer.from('target-token-blob'));
 
   // During restart, simulate account update in AG2 adapter
   const originalLaunchProcess = processController.launchProcess.bind(processController);
@@ -334,8 +339,7 @@ test('SwitchTransactionCoordinator - Happy path executes all stages and complete
     // Switch adapter identity to target
     ag2Adapter.currentAccount = {
       email: 'target@example.com',
-      name: 'Target User',
-      status: 'ACTIVE'
+      name: 'Target User'
     };
     return pid;
   };
@@ -363,7 +367,7 @@ test('SwitchTransactionCoordinator - Happy path executes all stages and complete
 });
 
 test('SwitchTransactionCoordinator - Post-write verification failure triggers verified rollback', async () => {
-  const { deps, accountStore, winCredWriter, processController, ag2Adapter } = createTestHarness();
+  const { deps, accountStore, sessionVault, winCredWriter, processController, ag2Adapter } = createTestHarness();
   const coordinator = new SwitchTransactionCoordinator(deps, {
     executionAuthorized: true,
     pollIntervalMs: 10,
@@ -395,26 +399,24 @@ test('SwitchTransactionCoordinator - Post-write verification failure triggers ve
   accountStore.accounts.set(targetAcc.id, targetAcc);
   accountStore.activeAccountId = sourceAcc.id;
 
-  (deps.sessionVault as any).sessions.set(targetAcc.id, Buffer.from('target-token-blob'));
+  sessionVault.sessions.set(targetAcc.id, Buffer.from('target-token-blob'));
 
   // In this test, target relaunch fails to verify (remains user1 or mismatch)
   // When rollback relaunches, adapter recovers as original user1
   let launchCount = 0;
-  processController.launchProcess = async (spec) => {
+  processController.launchProcess = async (_spec) => {
     launchCount++;
     if (launchCount === 1) {
       // First launch (switch attempt): returns unexpected account or stays wrong
       ag2Adapter.currentAccount = {
         email: 'unexpected@example.com',
-        name: 'Unexpected',
-        status: 'ACTIVE'
+        name: 'Unexpected'
       };
     } else {
       // Second launch (rollback attempt): restores user1
       ag2Adapter.currentAccount = {
         email: 'user1@example.com',
-        name: 'User One',
-        status: 'ACTIVE'
+        name: 'User One'
       };
     }
     return 31000 + launchCount;
@@ -439,7 +441,7 @@ test('SwitchTransactionCoordinator - Post-write verification failure triggers ve
 });
 
 test('SwitchTransactionCoordinator - Rollback failure transitions to FAILED for operator visibility', async () => {
-  const { deps, accountStore, winCredWriter, processController, ag2Adapter } = createTestHarness();
+  const { deps, accountStore, sessionVault, winCredWriter, ag2Adapter } = createTestHarness();
   const coordinator = new SwitchTransactionCoordinator(deps, {
     executionAuthorized: true,
     pollIntervalMs: 10,
@@ -471,7 +473,7 @@ test('SwitchTransactionCoordinator - Rollback failure transitions to FAILED for 
   accountStore.accounts.set(targetAcc.id, targetAcc);
   accountStore.activeAccountId = sourceAcc.id;
 
-  (deps.sessionVault as any).sessions.set(targetAcc.id, Buffer.from('target-token-blob'));
+  sessionVault.sessions.set(targetAcc.id, Buffer.from('target-token-blob'));
 
   // First write succeeds. Verification fails. Then rollback write fails!
   let writes = 0;
@@ -488,8 +490,7 @@ test('SwitchTransactionCoordinator - Rollback failure transitions to FAILED for 
   // Switch attempt: identity mismatch
   ag2Adapter.currentAccount = {
     email: 'mismatch@example.com',
-    name: 'Mismatch',
-    status: 'ACTIVE'
+    name: 'Mismatch'
   };
 
   const result = await coordinator.executeSwitch(targetAcc.id);

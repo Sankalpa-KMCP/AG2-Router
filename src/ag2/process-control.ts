@@ -16,7 +16,7 @@
 import { execFile, spawn } from 'node:child_process';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
-import { DiscoveredProcessRaw, IProcessInspector, WindowsProcessInspector } from './discovery.js';
+import { IProcessInspector, WindowsProcessInspector } from './discovery.js';
 import { redactSensitiveText, sanitizeCommandLine } from './security.js';
 
 const execFileAsync = promisify(execFile);

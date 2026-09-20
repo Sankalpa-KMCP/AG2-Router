@@ -20,6 +20,10 @@ class MockProcessInspector implements IProcessInspector {
   public isPidAlive(pid: number): boolean {
     return this.alivePids.has(pid);
   }
+
+  public async getListeningPorts(pid: number): Promise<number[]> {
+    return this.isPidAlive(pid) ? [51768] : [];
+  }
 }
 
 test('parseCommandLineArguments - Tokenizes Windows command line strings correctly', () => {

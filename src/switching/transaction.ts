@@ -350,7 +350,7 @@ export class SwitchTransactionCoordinator {
       if (credentialMutated && rollbackSnapshot) {
         // We have mutated OS credential state. We MUST initiate automatic rollback.
         try {
-          await this.executeRollback(rollbackSnapshot, stagesCompleted, errMsg);
+          await this.executeRollback(rollbackSnapshot, stagesCompleted);
           const finishedAt = new Date().toISOString();
           const rollbackResult: SwitchTransactionResult = {
             transactionId,
@@ -419,8 +419,7 @@ export class SwitchTransactionCoordinator {
    */
   private async executeRollback(
     snapshot: RollbackSnapshot,
-    stagesCompleted: string[],
-    originalError: string
+    stagesCompleted: string[]
   ): Promise<void> {
     this.currentState = 'ROLLING_BACK';
     stagesCompleted.push('ROLLBACK_INITIATED');
