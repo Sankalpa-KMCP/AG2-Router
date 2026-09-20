@@ -26,7 +26,7 @@ public class LoopbackServer : IAsyncDisposable
     public int BoundPort => _boundPort;
     public string BoundUrl => _boundUrl;
 
-    public async Task StartAsync(int requestedPort = 0, CancellationToken cancellationToken = default)
+    public async Task StartAsync(int requestedPort = 0, Func<SystemStatusDto>? statusProvider = null, CancellationToken cancellationToken = default)
     {
         var builder = WebApplication.CreateSlimBuilder();
 
@@ -71,9 +71,14 @@ public class LoopbackServer : IAsyncDisposable
         }
 
         // 5. Minimal API Routes for Dashboard Compatibility
-        // GET /api/status - Truthful un-migrated foundation status
+        // GET /api/status - Live or fallback telemetry status
         _app.MapGet("/api/status", () =>
         {
+            if (statusProvider != null)
+            {
+                return Results.Ok(statusProvider());
+            }
+
             var status = new SystemStatusDto(
                 Status: "ok",
                 Ag2: new Ag2StatusDto(

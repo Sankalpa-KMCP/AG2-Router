@@ -1,6 +1,8 @@
 using System.Windows;
+using AG2Router.AG2.Adapter;
 using AG2Router.App.Lifecycle;
 using AG2Router.App.Server;
+using AG2Router.App.Services;
 using AG2Router.App.Tray;
 using AG2Router.App.Views;
 using AG2Router.Windows.Lifecycle;
@@ -14,6 +16,8 @@ public partial class App : System.Windows.Application
     private TrayIconManager? _trayIconManager;
     private DashboardLifecycleManager? _dashboardManager;
     private QuickStatusWindow? _quickStatusWindow;
+    private AG2LiveAdapter? _ag2Adapter;
+    private TelemetryPollingCoordinator? _telemetryCoordinator;
     private bool _isShuttingDown;
 
     private static void Log(string msg)
@@ -93,9 +97,14 @@ public partial class App : System.Windows.Application
 
         try
         {
+            Log("Initializing AG2LiveAdapter and TelemetryPollingCoordinator...");
+            _ag2Adapter = new AG2LiveAdapter();
+            _telemetryCoordinator = new TelemetryPollingCoordinator(_ag2Adapter);
+            _telemetryCoordinator.Start();
+
             Log("Starting loopback server...");
             _loopbackServer = new LoopbackServer();
-            await _loopbackServer.StartAsync(0);
+            await _loopbackServer.StartAsync(0, statusProvider: () => _telemetryCoordinator.CurrentStatus);
 
             var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
             Log($"Loopback server bound to: {dashboardUrl}");
@@ -105,7 +114,18 @@ public partial class App : System.Windows.Application
             _dashboardManager = new DashboardLifecycleManager(dashboardUrl);
 
             Log("Initializing QuickStatusWindow...");
-            _quickStatusWindow = new QuickStatusWindow(OpenDashboard);
+            _quickStatusWindow = new QuickStatusWindow(OpenDashboard, statusProvider: () => _telemetryCoordinator.CurrentStatus);
+
+            _telemetryCoordinator.StatusUpdated += status =>
+            {
+                Dispatcher.InvokeAsync(() =>
+                {
+                    if (_quickStatusWindow?.IsVisible == true)
+                    {
+                        _quickStatusWindow.UpdateStatus(status);
+                    }
+                });
+            };
 
             // 5. Initialize notification area tray icon
             Log("Initializing TrayIconManager...");
@@ -186,6 +206,19 @@ public partial class App : System.Windows.Application
         // Clean up UI & Tray icon immediately to eliminate ghost icons
         _trayIconManager?.Dispose();
         _trayIconManager = null;
+
+        // Stop telemetry polling coordinator before destroying UI subscribers
+        if (_telemetryCoordinator != null)
+        {
+            try
+            {
+                using var shutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await _telemetryCoordinator.StopAsync(shutdownCts.Token);
+                await _telemetryCoordinator.DisposeAsync();
+            }
+            catch { }
+            _telemetryCoordinator = null;
+        }
 
         _quickStatusWindow?.Close();
         _quickStatusWindow = null;
