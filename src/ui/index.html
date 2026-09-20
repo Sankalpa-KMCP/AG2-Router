@@ -66,15 +66,21 @@
             <h2 class="panel-title">Connected Accounts</h2>
             <p class="panel-subtitle">Accounts configured for automated quota-based routing</p>
           </div>
-          <button type="button" class="btn btn-primary" id="btn-open-add-account">+ Connect Account</button>
+          <div style="display: flex; gap: var(--spacing-sm); align-items: center;">
+            <button type="button" class="btn btn-secondary" id="btn-save-current-account" title="Capture active session from Antigravity 2 into local encrypted vault">🔒 Save Current AG2 Account</button>
+            <button type="button" class="btn btn-primary" id="btn-open-add-account">+ Connect Account</button>
+          </div>
         </div>
 
         <div class="accounts-container" id="accounts-container">
           <div class="empty-state" id="accounts-empty">
             <div class="empty-icon" aria-hidden="true">👤</div>
             <h3 class="empty-title">No accounts connected</h3>
-            <p class="empty-desc">Register non-secret account metadata to participate in automated routing.</p>
-            <button type="button" class="btn btn-secondary" id="btn-empty-add-account">Connect account</button>
+            <p class="empty-desc">Save the active Antigravity 2 session into the encrypted vault or register account metadata.</p>
+            <div style="display: flex; gap: var(--spacing-sm); margin-top: var(--spacing-xs);">
+              <button type="button" class="btn btn-primary" id="btn-empty-save-current">🔒 Save Current AG2 Account</button>
+              <button type="button" class="btn btn-secondary" id="btn-empty-add-account">Connect account</button>
+            </div>
           </div>
           <table class="data-table hidden" id="accounts-table" aria-label="Accounts List">
             <thead>
@@ -82,6 +88,7 @@
                 <th>Account</th>
                 <th>Priority</th>
                 <th>Role</th>
+                <th>Vault Storage</th>
                 <th>Status</th>
                 <th>Usable Quota</th>
                 <th class="actions-col">Actions</th>

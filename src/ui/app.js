@@ -295,6 +295,16 @@
         const roleBadge = acc.isReserve
           ? '<span class="reserve-badge">Reserve</span>'
           : '<span class="metric-badge badge-neutral">Standard</span>';
+        const vaultBadge = acc.hasVaultedSession
+          ? '<span class="metric-badge badge-healthy" style="color: var(--success); font-weight: 600; font-size: 11px;">🔒 Vaulted</span>'
+          : '<span class="metric-badge badge-neutral" style="color: var(--text-muted); font-size: 11px;">Metadata Only</span>';
+
+        let quotaDisplay = '<span style="color: var(--text-muted);" title="Inactive: Quota is inspected live when active in Antigravity 2">--% (Inactive)</span>';
+        if (acc.isActive && currentStatus && currentStatus.telemetry && currentStatus.telemetry.quota) {
+          const mList = currentStatus.telemetry.quota.models || [];
+          const healthy = mList.filter((m) => !m.isExhausted).length;
+          quotaDisplay = `<span style="color: var(--success); font-weight: 500;">${healthy}/${mList.length} models</span>`;
+        }
 
         return `
           <tr>
@@ -306,8 +316,9 @@
             </td>
             <td>Priority ${escapeHtml(String(acc.priority))}</td>
             <td>${roleBadge}</td>
+            <td>${vaultBadge}</td>
             <td>${escapeHtml(acc.validationStatus || 'UNVALIDATED')}</td>
-            <td>--%</td>
+            <td>${quotaDisplay}</td>
             <td class="actions-col">
               <button type="button" class="btn btn-danger btn-remove-acc" data-id="${escapeHtml(acc.id)}">Remove</button>
             </td>
@@ -390,6 +401,52 @@
   if (btnEmptyAddAccount) btnEmptyAddAccount.addEventListener('click', openModal);
   if (btnCloseModal) btnCloseModal.addEventListener('click', closeModal);
   if (btnCancelModal) btnCancelModal.addEventListener('click', closeModal);
+
+  // Save current active Antigravity account into local vault
+  async function handleSaveCurrentAccount() {
+    const btn = document.getElementById('btn-save-current-account');
+    const emptyBtn = document.getElementById('btn-empty-save-current');
+    const originalText = btn ? btn.textContent : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Saving session...';
+    }
+    if (emptyBtn) {
+      emptyBtn.disabled = true;
+      emptyBtn.textContent = 'Saving session...';
+    }
+
+    try {
+      const res = await fetch('/api/accounts/enroll-current', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to save current account');
+      }
+      logActivity(data.message || `Saved account ${data.account?.email} into encrypted session vault.`);
+      await refreshAll();
+    } catch (err) {
+      alert('Failed to save current account: ' + err.message);
+      logActivity(`Enrollment failed: ${err.message}`);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+      if (emptyBtn) {
+        emptyBtn.disabled = false;
+        emptyBtn.textContent = '🔒 Save Current AG2 Account';
+      }
+    }
+  }
+
+  const btnSaveCurrentAccount = document.getElementById('btn-save-current-account');
+  const btnEmptySaveCurrent = document.getElementById('btn-empty-save-current');
+  if (btnSaveCurrentAccount) btnSaveCurrentAccount.addEventListener('click', handleSaveCurrentAccount);
+  if (btnEmptySaveCurrent) btnEmptySaveCurrent.addEventListener('click', handleSaveCurrentAccount);
 
   if (addAccountModal) {
     addAccountModal.addEventListener('click', (e) => {
