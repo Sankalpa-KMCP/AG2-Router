@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "start": "node dist/src/index.js",
     "dev": "node scripts/dev.mjs",
-    "test": "node --test dist/test/*.test.js"
+    "test": "node scripts/run-tests.mjs"
   },
   "engines": {
     "node": ">=20.0.0"
