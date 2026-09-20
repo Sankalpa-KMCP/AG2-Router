@@ -63,6 +63,7 @@ export class InMemoryAccountStore implements IAccountStore {
       priority: input.priority ?? (this.accounts.size + 1),
       isReserve: Boolean(input.isReserve),
       validationStatus: 'UNVALIDATED',
+      hasVaultedSession: Boolean(input.hasVaultedSession),
       createdAt: now,
       updatedAt: now,
       lastActiveAt: null,
@@ -85,6 +86,7 @@ export class InMemoryAccountStore implements IAccountStore {
       priority: updates.priority !== undefined ? updates.priority : existing.priority,
       isReserve: updates.isReserve !== undefined ? updates.isReserve : existing.isReserve,
       validationStatus: updates.validationStatus ?? existing.validationStatus,
+      hasVaultedSession: updates.hasVaultedSession !== undefined ? updates.hasVaultedSession : existing.hasVaultedSession,
       lastActiveAt: updates.lastActiveAt !== undefined ? updates.lastActiveAt : existing.lastActiveAt,
       notes: updates.notes !== undefined ? updates.notes : existing.notes,
       updatedAt: new Date().toISOString()

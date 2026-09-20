@@ -30,6 +30,7 @@ export interface AccountMetadata {
    */
   readonly isReserve: boolean;
   readonly validationStatus: AccountValidationStatus;
+  readonly hasVaultedSession?: boolean;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly lastActiveAt: string | null;
@@ -44,6 +45,7 @@ export interface CreateAccountInput {
   readonly name?: string;
   readonly priority?: number;
   readonly isReserve?: boolean;
+  readonly hasVaultedSession?: boolean;
   readonly notes?: string;
 }
 
@@ -55,6 +57,7 @@ export interface UpdateAccountInput {
   readonly priority?: number;
   readonly isReserve?: boolean;
   readonly validationStatus?: AccountValidationStatus;
+  readonly hasVaultedSession?: boolean;
   readonly lastActiveAt?: string | null;
   readonly notes?: string;
 }
@@ -75,6 +78,7 @@ export interface AccountQuotaSummary {
 export interface AccountSummary {
   readonly metadata: AccountMetadata;
   readonly isActive: boolean;
+  readonly hasVaultedSession: boolean;
   readonly quota: AccountQuotaSummary | null;
 }
 
