@@ -78,6 +78,28 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         }
 
         var process = validation.SelectedProcess;
+        var snapshot = await CreateSnapshotAsync(process, _detector.CurrentGeneration, cancellationToken)
+            .ConfigureAwait(false);
+        var session = _detector.GetCachedSession();
+        long currentGeneration = _detector.CurrentGeneration;
+        if (session == null || session.Generation != currentGeneration ||
+            session.Generation != snapshot.DetectorGeneration ||
+            session.Pid != snapshot.ProcessId || session.StartTime == null ||
+            session.StartTime.Value.ToUniversalTime() != snapshot.StartTimeUtc ||
+            !PathEquals(session.BinaryPath, snapshot.ExecutablePath))
+        {
+            throw new AG2ProcessLifecycleException(
+                "Verified process discovery does not match the live telemetry process generation.");
+        }
+
+        return snapshot;
+    }
+
+    private static async Task<AG2ProcessSnapshot> CreateSnapshotAsync(
+        DiscoveredProcessRaw process,
+        long detectorGeneration,
+        CancellationToken cancellationToken)
+    {
         if (process.StartTime == null || string.IsNullOrWhiteSpace(process.ExecutablePath) ||
             string.IsNullOrWhiteSpace(process.CommandLine))
         {
@@ -102,7 +124,7 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
             executableIdentity.Length,
             executableIdentity.LastWriteUtc,
             executableIdentity.Sha256,
-            _detector.CurrentGeneration);
+            detectorGeneration);
     }
 
     public async Task RevalidateAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default)
@@ -119,6 +141,16 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         TimeSpan timeout,
         CancellationToken cancellationToken = default)
     {
+        await StopExactAsync(snapshot, timeout, requireTelemetryBinding: true, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task StopExactAsync(
+        AG2ProcessSnapshot snapshot,
+        TimeSpan timeout,
+        bool requireTelemetryBinding,
+        CancellationToken cancellationToken)
+    {
         try
         {
             using var process = Process.GetProcessById(snapshot.ProcessId);
@@ -133,7 +165,10 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
                     "Verified Antigravity process identity changed before termination.");
             }
 
-            await RevalidateAsync(snapshot, cancellationToken).ConfigureAwait(false);
+            if (requireTelemetryBinding)
+            {
+                await RevalidateAsync(snapshot, cancellationToken).ConfigureAwait(false);
+            }
             process.Refresh();
             if (process.HasExited || process.StartTime.ToUniversalTime() != snapshot.StartTimeUtc)
             {
@@ -255,7 +290,10 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
             throw new AG2ProcessLifecycleException($"Rollback process discovery is unsafe: {validation.Message}");
         }
 
-        var current = await CaptureVerifiedAsync(cancellationToken).ConfigureAwait(false);
+        var current = await CreateSnapshotAsync(
+            validation.SelectedProcess,
+            detectorGeneration: 0,
+            cancellationToken).ConfigureAwait(false);
         bool isOriginal = SameOsIdentity(current, original);
         bool isOwnedReplacement = transactionOwnedReplacement != null &&
             SameOsIdentity(current, transactionOwnedReplacement);
@@ -265,7 +303,8 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
                 "Rollback found a process generation not owned by this switch attempt; refusing to stop it.");
         }
 
-        await StopVerifiedAsync(current, timeout, cancellationToken).ConfigureAwait(false);
+        await StopExactAsync(current, timeout, requireTelemetryBinding: false, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async Task<AG2ProcessGeneration> RestoreAsync(

@@ -28,7 +28,7 @@ public sealed class WindowsAG2ProcessLifecycleTests : IDisposable
         {
             FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>([raw])
         };
-        var detector = new AG2ProcessDetector(inspector: inspector);
+        var detector = await CreatePrimedDetectorAsync(inspector);
         var lifecycle = new WindowsAG2ProcessLifecycle(detector, inspector);
 
         var snapshot = await lifecycle.CaptureVerifiedAsync();
@@ -55,7 +55,7 @@ public sealed class WindowsAG2ProcessLifecycleTests : IDisposable
         {
             FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>([current])
         };
-        var lifecycle = new WindowsAG2ProcessLifecycle(new AG2ProcessDetector(inspector: inspector), inspector);
+        var lifecycle = new WindowsAG2ProcessLifecycle(await CreatePrimedDetectorAsync(inspector), inspector);
         var snapshot = await lifecycle.CaptureVerifiedAsync();
         current = current with { StartTime = firstStart.AddMilliseconds(500) };
 
@@ -76,7 +76,7 @@ public sealed class WindowsAG2ProcessLifecycleTests : IDisposable
         {
             FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>([raw])
         };
-        var lifecycle = new WindowsAG2ProcessLifecycle(new AG2ProcessDetector(inspector: inspector), inspector);
+        var lifecycle = new WindowsAG2ProcessLifecycle(await CreatePrimedDetectorAsync(inspector), inspector);
         var snapshot = await lifecycle.CaptureVerifiedAsync();
 
         await File.WriteAllBytesAsync(executable, [0x4d, 0x5b]);
@@ -98,12 +98,50 @@ public sealed class WindowsAG2ProcessLifecycleTests : IDisposable
         {
             FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>([current])
         };
-        var lifecycle = new WindowsAG2ProcessLifecycle(new AG2ProcessDetector(inspector: inspector), inspector);
+        var lifecycle = new WindowsAG2ProcessLifecycle(await CreatePrimedDetectorAsync(inspector), inspector);
         var original = await lifecycle.CaptureVerifiedAsync();
         current = current with { ProcessId = 708, StartTime = DateTime.UtcNow.AddMinutes(-1) };
 
         var error = await Assert.ThrowsAsync<AG2ProcessLifecycleException>(() =>
             lifecycle.QuiesceForRollbackAsync(original, null, TimeSpan.FromMilliseconds(50)));
         Assert.Contains("not owned", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CaptureRejectsFreshProcessThatDoesNotOwnCachedTelemetryGeneration()
+    {
+        string executable = Path.Combine(_root, "antigravity", "resources", "bin", "language_server.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(executable)!);
+        await File.WriteAllBytesAsync(executable, [0x4d, 0x5a]);
+        var current = new DiscoveredProcessRaw(
+            801, "language_server.exe", $"\"{executable}\" --standalone --csrf_token source-a",
+            executable, DateTime.UtcNow.AddMinutes(-2));
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>([current])
+        };
+        var detector = await CreatePrimedDetectorAsync(inspector);
+        current = current with
+        {
+            ProcessId = 802,
+            CommandLine = $"\"{executable}\" --standalone --csrf_token source-b",
+            StartTime = DateTime.UtcNow.AddMinutes(-1)
+        };
+
+        var lifecycle = new WindowsAG2ProcessLifecycle(detector, inspector);
+        var error = await Assert.ThrowsAsync<AG2ProcessLifecycleException>(
+            () => lifecycle.CaptureVerifiedAsync());
+        Assert.Contains("telemetry process generation", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<AG2ProcessDetector> CreatePrimedDetectorAsync(MockProcessInspector inspector)
+    {
+        inspector.GetListeningPortsFunc ??= _ =>
+            Task.FromResult<IReadOnlyList<int>>([54321]);
+        var detector = new AG2ProcessDetector(inspector, new MockAG2RpcClient());
+        var result = await detector.DiscoverAsync();
+        Assert.True(result.IsRunning);
+        Assert.NotNull(detector.GetCachedSession());
+        return detector;
     }
 }

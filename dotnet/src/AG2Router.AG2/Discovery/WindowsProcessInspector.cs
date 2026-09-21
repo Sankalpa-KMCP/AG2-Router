@@ -42,6 +42,7 @@ public class WindowsProcessInspector : IProcessInspector
         cts.CancelAfter(TimeSpan.FromSeconds(8));
 
         var stdoutTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
+        var stderrTask = proc.StandardError.ReadToEndAsync(cts.Token);
         try
         {
             await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
@@ -53,6 +54,12 @@ public class WindowsProcessInspector : IProcessInspector
         }
 
         var json = (await stdoutTask.ConfigureAwait(false)).Trim();
+        string stderr = (await stderrTask.ConfigureAwait(false)).Trim();
+        if (proc.ExitCode != 0 || !string.IsNullOrWhiteSpace(stderr))
+        {
+            throw new InvalidOperationException(
+                $"Process enumeration failed with exit code {proc.ExitCode}.");
+        }
         if (string.IsNullOrWhiteSpace(json))
         {
             return Array.Empty<DiscoveredProcessRaw>();
@@ -67,19 +74,24 @@ public class WindowsProcessInspector : IProcessInspector
                 foreach (var el in doc.RootElement.EnumerateArray())
                 {
                     var p = ParseProcessElement(el);
-                    if (p != null) results.Add(p);
+                    if (p == null) throw new InvalidDataException("Process enumeration returned an invalid record.");
+                    results.Add(p);
                 }
             }
             else if (doc.RootElement.ValueKind == JsonValueKind.Object)
             {
                 var p = ParseProcessElement(doc.RootElement);
-                if (p != null) results.Add(p);
+                if (p == null) throw new InvalidDataException("Process enumeration returned an invalid record.");
+                results.Add(p);
+            }
+            else
+            {
+                throw new InvalidDataException("Process enumeration returned an unexpected JSON value.");
             }
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
-            // If JSON was malformed or unexpected output, return empty
-            return Array.Empty<DiscoveredProcessRaw>();
+            throw new InvalidDataException("Process enumeration returned malformed JSON.", ex);
         }
 
         return results;
