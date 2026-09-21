@@ -69,6 +69,9 @@ class FailUpdateAccountStore implements IAccountStore {
     throw new Error('injected metadata commit failure');
   }
   public removeAccount(id: string): Promise<boolean> { return this.inner.removeAccount(id); }
+  public removeAccountIfUnchanged(expected: AccountMetadata): Promise<boolean> {
+    return this.inner.removeAccountIfUnchanged(expected);
+  }
   public getActiveAccountId(): Promise<string | null> { return this.inner.getActiveAccountId(); }
   public setActiveAccountId(id: string | null): Promise<void> { return this.inner.setActiveAccountId(id); }
   public compareExchangeActiveAccountId(expectedId: string | null, newId: string | null): Promise<boolean> {
@@ -97,11 +100,32 @@ class BlockingFailUpdateAccountStore implements IAccountStore {
     throw new Error('injected delayed metadata commit failure');
   }
   public removeAccount(id: string): Promise<boolean> { return this.inner.removeAccount(id); }
+  public removeAccountIfUnchanged(expected: AccountMetadata): Promise<boolean> {
+    return this.inner.removeAccountIfUnchanged(expected);
+  }
   public getActiveAccountId(): Promise<string | null> { return this.inner.getActiveAccountId(); }
   public setActiveAccountId(id: string | null): Promise<void> { return this.inner.setActiveAccountId(id); }
   public compareExchangeActiveAccountId(expectedId: string | null, newId: string | null): Promise<boolean> {
     return this.inner.compareExchangeActiveAccountId(expectedId, newId);
   }
+}
+
+class RejectActiveCasAccountStore implements IAccountStore {
+  constructor(private readonly inner: IAccountStore) {}
+  public listAccounts(): Promise<AccountMetadata[]> { return this.inner.listAccounts(); }
+  public getAccount(id: string): Promise<AccountMetadata | null> { return this.inner.getAccount(id); }
+  public getAccountByEmail(email: string): Promise<AccountMetadata | null> { return this.inner.getAccountByEmail(email); }
+  public addAccount(input: CreateAccountInput): Promise<AccountMetadata> { return this.inner.addAccount(input); }
+  public updateAccount(id: string, updates: UpdateAccountInput): Promise<AccountMetadata | null> {
+    return this.inner.updateAccount(id, updates);
+  }
+  public removeAccount(id: string): Promise<boolean> { return this.inner.removeAccount(id); }
+  public removeAccountIfUnchanged(expected: AccountMetadata): Promise<boolean> {
+    return this.inner.removeAccountIfUnchanged(expected);
+  }
+  public getActiveAccountId(): Promise<string | null> { return this.inner.getActiveAccountId(); }
+  public setActiveAccountId(id: string | null): Promise<void> { return this.inner.setActiveAccountId(id); }
+  public async compareExchangeActiveAccountId(): Promise<boolean> { return false; }
 }
 
 describe('AccountEnrollmentService', () => {
@@ -318,6 +342,51 @@ describe('AccountEnrollmentService', () => {
     }
   });
 
+  it('serializes different-account enrollment through one commit lane', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-enroll-different-race-test-'));
+    let currentEncryptions = 0;
+    let maxConcurrentEncryptions = 0;
+    const trackingDpapi: IDpapiProvider = {
+      async encrypt(plaintext: Buffer): Promise<Buffer> {
+        currentEncryptions += 1;
+        maxConcurrentEncryptions = Math.max(maxConcurrentEncryptions, currentEncryptions);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          return Buffer.concat([Buffer.from('TRACK:'), plaintext]);
+        } finally {
+          currentEncryptions -= 1;
+        }
+      },
+      async decrypt(ciphertext: Buffer): Promise<Buffer> {
+        return Buffer.from(ciphertext.subarray(Buffer.byteLength('TRACK:')));
+      }
+    };
+    try {
+      const store = new InMemoryAccountStore();
+      const vault = new SessionVault({ vaultDir: tempDir, dpapiProvider: trackingDpapi });
+      const credential = new MockWinCredReader({
+        target: 'gemini:antigravity', type: 1, userName: 'synthetic', persistence: 2,
+        blob: Buffer.from('{"token":"synthetic"}')
+      });
+      const first = new AccountEnrollmentService({
+        adapter: new MockAG2Adapter({ email: 'first-lane@example.com' }),
+        wincredReader: credential, sessionVault: vault, accountStore: store
+      });
+      const second = new AccountEnrollmentService({
+        adapter: new MockAG2Adapter({ email: 'second-lane@example.com' }),
+        wincredReader: credential, sessionVault: vault, accountStore: store
+      });
+
+      const results = await Promise.all([first.enrollCurrentAccount(), second.enrollCurrentAccount()]);
+      assert.equal(results.length, 2);
+      assert.equal((await store.listAccounts()).length, 2);
+      assert.equal((await vault.listStoredAccountIds()).length, 2);
+      assert.equal(maxConcurrentEncryptions, 1);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not overwrite a newer vault session during compensation', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-enroll-vault-race-test-'));
     try {
@@ -344,6 +413,69 @@ describe('AccountEnrollmentService', () => {
 
       await assert.rejects(() => enrollment);
       assert.deepEqual(await vault.getSession(account.id), newer);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a concurrent active choice without rolling back the core enrollment commit', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-enroll-active-choice-test-'));
+    try {
+      const store = new InMemoryAccountStore();
+      const previous = await store.addAccount({ email: 'active-choice@example.com' });
+      await store.setActiveAccountId(previous.id);
+      const vault = new SessionVault({ vaultDir: tempDir, dpapiProvider: new MockDpapiProvider() });
+      const service = new AccountEnrollmentService({
+        adapter: new MockAG2Adapter({ email: 'committed-enrollment@example.com' }),
+        wincredReader: new MockWinCredReader({
+          target: 'gemini:antigravity', type: 1, userName: 'synthetic', persistence: 2,
+          blob: Buffer.from('{"token":"synthetic"}')
+        }),
+        sessionVault: vault,
+        accountStore: new RejectActiveCasAccountStore(store)
+      });
+
+      const result = await service.enrollCurrentAccount();
+
+      assert.equal(result.success, true);
+      assert.equal(result.account.hasVaultedSession, true);
+      assert.equal(await vault.hasSession(result.account.id), true);
+      assert.equal(await store.getActiveAccountId(), previous.id);
+      assert.match(result.message, /preserved/i);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not delete a placeholder changed by concurrent CRUD during compensation', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-enroll-placeholder-race-test-'));
+    try {
+      const store = new InMemoryAccountStore();
+      const vault = new SessionVault({ vaultDir: tempDir, dpapiProvider: new MockDpapiProvider() });
+      const blockingStore = new BlockingFailUpdateAccountStore(store);
+      const service = new AccountEnrollmentService({
+        adapter: new MockAG2Adapter({ email: 'placeholder-race@example.com' }),
+        wincredReader: new MockWinCredReader({
+          target: 'gemini:antigravity', type: 1, userName: 'synthetic', persistence: 2,
+          blob: Buffer.from('{"token":"synthetic"}')
+        }),
+        sessionVault: vault,
+        accountStore: blockingStore
+      });
+
+      const enrollment = service.enrollCurrentAccount();
+      await blockingStore.updateEntered;
+      const pending = await store.getAccountByEmail('placeholder-race@example.com');
+      assert(pending);
+      await store.updateAccount(pending.id, { notes: 'concurrent-crud' });
+      blockingStore.releaseFailure();
+
+      await assert.rejects(() => enrollment);
+      const preserved = await store.getAccount(pending.id);
+      assert(preserved);
+      assert.equal(preserved.notes, 'concurrent-crud');
+      assert.equal(preserved.hasVaultedSession, false);
+      assert.equal(await vault.hasSession(pending.id), false);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

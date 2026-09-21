@@ -129,20 +129,13 @@ export class AccountEnrollmentService {
 
         let vaultReceipt: VaultMutationReceipt | null = null;
         let vaultCommitted = false;
-        let activeCommitted = false;
+        let account: AccountMetadata;
         try {
           // Vault-first: HasVaultedSession remains unchanged/false until this succeeds.
           vaultReceipt = await this.sessionVault.saveSessionWithReceipt(pending.id, cred.blob, cred.target);
           vaultCommitted = true;
 
-          // Commit active selection before the final truth flag so failures remain compensatable.
-          const activeUpdated = await this.accountStore.compareExchangeActiveAccountId(previousActiveId, pending.id);
-          if (!activeUpdated) {
-            throw new AccountEnrollmentError('Active account changed while enrollment was in progress; retry safely.');
-          }
-          activeCommitted = true;
-
-          const account = await this.accountStore.updateAccount(pending.id, {
+          const committed = await this.accountStore.updateAccount(pending.id, {
             name: options.name,
             priority: options.priority,
             isReserve: options.isReserve,
@@ -151,30 +144,38 @@ export class AccountEnrollmentService {
             lastActiveAt: new Date().toISOString(),
             notes: options.notes
           });
-          if (!account) throw new AccountEnrollmentError(`Failed to update account record for '${email}'.`);
-
-          return {
-            success: true,
-            account,
-            isNew,
-            message: isNew
-              ? `Successfully enrolled new account '${email}' into encrypted vault.`
-              : `Successfully updated session vault for existing account '${email}'.`
-          };
+          if (!committed) throw new AccountEnrollmentError(`Failed to update account record for '${email}'.`);
+          account = committed;
         } catch (error) {
-          if (activeCommitted) {
-            try { await this.accountStore.compareExchangeActiveAccountId(pending.id, previousActiveId); } catch {}
-          }
           if (vaultCommitted) {
             try {
               await this.sessionVault.restoreIfCurrent(vaultReceipt!);
             } catch {}
           }
           if (isNew) {
-            try { await this.accountStore.removeAccount(pending.id); } catch {}
+            try { await this.accountStore.removeAccountIfUnchanged(pending); } catch {}
           }
           throw error;
         }
+
+        // Core enrollment is committed. Preserve a concurrent active-account choice and avoid
+        // compensating a later selection through a value-only CAS rollback.
+        let activeUpdated = false;
+        try {
+          activeUpdated = await this.accountStore.compareExchangeActiveAccountId(previousActiveId, pending.id);
+        } catch {}
+
+        const baseMessage = isNew
+          ? `Successfully enrolled new account '${email}' into encrypted vault.`
+          : `Successfully updated session vault for existing account '${email}'.`;
+        return {
+          success: true,
+          account,
+          isNew,
+          message: activeUpdated
+            ? baseMessage
+            : `${baseMessage} The current active-account selection was preserved.`
+        };
         });
       });
     } catch (err) {

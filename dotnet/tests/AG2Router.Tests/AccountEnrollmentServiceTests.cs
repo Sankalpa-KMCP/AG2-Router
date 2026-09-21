@@ -202,6 +202,36 @@ public class AccountEnrollmentServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task EnrollCurrentAccount_DifferentAccountsShareOneEnrollmentCommitLane()
+    {
+        var trackingDpapi = new TrackingDpapiProvider();
+        var vault = new SessionVault(_tempDir, trackingDpapi);
+        var firstAdapter = new MockAG2Adapter
+        {
+            CurrentAccount = new AccountIdentityDto("first-lane@example.com", "First")
+        };
+        var secondAdapter = new MockAG2Adapter
+        {
+            CurrentAccount = new AccountIdentityDto("second-lane@example.com", "Second")
+        };
+        _winCredStore.Seed(
+            "gemini:antigravity",
+            "synthetic",
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+
+        var results = await Task.WhenAll(
+            new AccountEnrollmentService(firstAdapter, _winCredStore, vault, _accountStore)
+                .EnrollCurrentAccountAsync(),
+            new AccountEnrollmentService(secondAdapter, _winCredStore, vault, _accountStore)
+                .EnrollCurrentAccountAsync());
+
+        Assert.Equal(2, results.Length);
+        Assert.Equal(2, (await _accountStore.ListAccountsAsync()).Count);
+        Assert.Equal(2, (await vault.ListStoredAccountIdsAsync()).Count);
+        Assert.Equal(1, trackingDpapi.MaxConcurrentEncryptions);
+    }
+
+    [Fact]
     public async Task EnrollCurrentAccount_ExistingMetadataFailureRestoresPriorVaultSession()
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("existing-failure@example.com", "Synthetic");
@@ -245,6 +275,31 @@ public class AccountEnrollmentServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task EnrollmentCommit_PreservesConcurrentActiveSelectionWithoutRollingBackCoreCommit()
+    {
+        var previous = await _accountStore.AddAccountAsync(new CreateAccountInput(Email: "active-choice@example.com"));
+        await _accountStore.SetActiveAccountIdAsync(previous.Id);
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("committed-enrollment@example.com", "Synthetic");
+        _winCredStore.Seed(
+            "gemini:antigravity",
+            "synthetic",
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var service = new AccountEnrollmentService(
+            _mockAdapter,
+            _winCredStore,
+            _sessionVault,
+            new RejectActiveCasAccountStore(_accountStore));
+
+        var result = await service.EnrollCurrentAccountAsync();
+
+        Assert.True(result.Success);
+        Assert.True(result.Account.HasVaultedSession);
+        Assert.True(await _sessionVault.HasSessionAsync(result.Account.Id));
+        Assert.Equal(previous.Id, await _accountStore.GetActiveAccountIdAsync());
+        Assert.Contains("preserved", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task EnrollmentCompensation_DoesNotOverwriteNewerVaultSession()
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("vault-race@example.com", "Synthetic");
@@ -268,6 +323,39 @@ public class AccountEnrollmentServiceTests : IDisposable
         Assert.Equal(newer, await _sessionVault.GetSessionAsync(account.Id));
     }
 
+    [Fact]
+    public async Task EnrollmentCompensation_DoesNotDeleteConcurrentlyUpdatedPlaceholder()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("placeholder-race@example.com", "Synthetic");
+        _winCredStore.Seed(
+            "gemini:antigravity",
+            "synthetic",
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var blockingStore = new BlockingFailUpdateAccountStore(_accountStore);
+        var service = new AccountEnrollmentService(
+            _mockAdapter,
+            _winCredStore,
+            _sessionVault,
+            blockingStore);
+
+        Task<EnrollmentResult> enrollment = service.EnrollCurrentAccountAsync();
+        await blockingStore.UpdateEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var pending = await _accountStore.GetAccountByEmailAsync("placeholder-race@example.com");
+        Assert.NotNull(pending);
+        var concurrentlyUpdated = await _accountStore.UpdateAccountAsync(
+            pending.Id,
+            new UpdateAccountInput(Notes: "concurrent-crud"));
+        Assert.NotNull(concurrentlyUpdated);
+        blockingStore.ReleaseFailure();
+
+        await Assert.ThrowsAsync<AccountEnrollmentException>(() => enrollment);
+        var preserved = await _accountStore.GetAccountAsync(pending.Id);
+        Assert.NotNull(preserved);
+        Assert.Equal("concurrent-crud", preserved.Notes);
+        Assert.False(preserved.HasVaultedSession);
+        Assert.False(await _sessionVault.HasSessionAsync(pending.Id));
+    }
+
     private sealed class ThrowingDpapiProvider : IDpapiProvider
     {
         public Task<byte[]> EncryptAsync(byte[] plaintext, CancellationToken cancellationToken = default) =>
@@ -275,6 +363,39 @@ public class AccountEnrollmentServiceTests : IDisposable
 
         public Task<byte[]> DecryptAsync(byte[] ciphertext, CancellationToken cancellationToken = default) =>
             throw new DpapiException("Injected decryption failure.");
+    }
+
+    private sealed class TrackingDpapiProvider : IDpapiProvider
+    {
+        private int _currentEncryptions;
+        private int _maxConcurrentEncryptions;
+
+        public int MaxConcurrentEncryptions => Volatile.Read(ref _maxConcurrentEncryptions);
+
+        public async Task<byte[]> EncryptAsync(byte[] plaintext, CancellationToken cancellationToken = default)
+        {
+            int current = Interlocked.Increment(ref _currentEncryptions);
+            int observed;
+            do
+            {
+                observed = Volatile.Read(ref _maxConcurrentEncryptions);
+            }
+            while (current > observed &&
+                   Interlocked.CompareExchange(ref _maxConcurrentEncryptions, current, observed) != observed);
+
+            try
+            {
+                await Task.Delay(25, cancellationToken);
+                return [.. Encoding.UTF8.GetBytes("TRACK:"), .. plaintext];
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _currentEncryptions);
+            }
+        }
+
+        public Task<byte[]> DecryptAsync(byte[] ciphertext, CancellationToken cancellationToken = default) =>
+            Task.FromResult(ciphertext[Encoding.UTF8.GetByteCount("TRACK:")..]);
     }
 
     private sealed class FailUpdateAccountStore(IAccountStore inner) : IAccountStore
@@ -291,6 +412,10 @@ public class AccountEnrollmentServiceTests : IDisposable
             throw new IOException("Injected metadata commit failure.");
         public Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default) =>
             inner.RemoveAccountAsync(id, cancellationToken);
+        public Task<bool> RemoveAccountIfUnchangedAsync(
+            AccountMetadata expected,
+            CancellationToken cancellationToken = default) =>
+            inner.RemoveAccountIfUnchangedAsync(expected, cancellationToken);
         public Task<string?> GetActiveAccountIdAsync(CancellationToken cancellationToken = default) =>
             inner.GetActiveAccountIdAsync(cancellationToken);
         public Task SetActiveAccountIdAsync(string? id, CancellationToken cancellationToken = default) =>
@@ -331,6 +456,10 @@ public class AccountEnrollmentServiceTests : IDisposable
         }
         public Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default) =>
             inner.RemoveAccountAsync(id, cancellationToken);
+        public Task<bool> RemoveAccountIfUnchangedAsync(
+            AccountMetadata expected,
+            CancellationToken cancellationToken = default) =>
+            inner.RemoveAccountIfUnchangedAsync(expected, cancellationToken);
         public Task<string?> GetActiveAccountIdAsync(CancellationToken cancellationToken = default) =>
             inner.GetActiveAccountIdAsync(cancellationToken);
         public Task SetActiveAccountIdAsync(string? id, CancellationToken cancellationToken = default) =>
@@ -340,5 +469,36 @@ public class AccountEnrollmentServiceTests : IDisposable
             string? newId,
             CancellationToken cancellationToken = default) =>
             inner.CompareExchangeActiveAccountIdAsync(expectedId, newId, cancellationToken);
+    }
+
+    private sealed class RejectActiveCasAccountStore(IAccountStore inner) : IAccountStore
+    {
+        public Task<IReadOnlyList<AccountMetadata>> ListAccountsAsync(CancellationToken cancellationToken = default) =>
+            inner.ListAccountsAsync(cancellationToken);
+        public Task<AccountMetadata?> GetAccountAsync(string id, CancellationToken cancellationToken = default) =>
+            inner.GetAccountAsync(id, cancellationToken);
+        public Task<AccountMetadata?> GetAccountByEmailAsync(string email, CancellationToken cancellationToken = default) =>
+            inner.GetAccountByEmailAsync(email, cancellationToken);
+        public Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default) =>
+            inner.AddAccountAsync(input, cancellationToken);
+        public Task<AccountMetadata?> UpdateAccountAsync(
+            string id,
+            UpdateAccountInput updates,
+            CancellationToken cancellationToken = default) =>
+            inner.UpdateAccountAsync(id, updates, cancellationToken);
+        public Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default) =>
+            inner.RemoveAccountAsync(id, cancellationToken);
+        public Task<bool> RemoveAccountIfUnchangedAsync(
+            AccountMetadata expected,
+            CancellationToken cancellationToken = default) =>
+            inner.RemoveAccountIfUnchangedAsync(expected, cancellationToken);
+        public Task<string?> GetActiveAccountIdAsync(CancellationToken cancellationToken = default) =>
+            inner.GetActiveAccountIdAsync(cancellationToken);
+        public Task SetActiveAccountIdAsync(string? id, CancellationToken cancellationToken = default) =>
+            inner.SetActiveAccountIdAsync(id, cancellationToken);
+        public Task<bool> CompareExchangeActiveAccountIdAsync(
+            string? expectedId,
+            string? newId,
+            CancellationToken cancellationToken = default) => Task.FromResult(false);
     }
 }

@@ -242,6 +242,20 @@ describe('LocalMetadataAccountStore (Filesystem Persistence)', () => {
     assert.equal(await seed.getActiveAccountId(), secondAccount.id);
   });
 
+  it('conditionally removes only an unchanged account snapshot', async () => {
+    const first = new LocalMetadataAccountStore(tmpFile);
+    const expected = await first.addAccount({ email: 'conditional-remove@example.com' });
+    const second = new LocalMetadataAccountStore(tmpFile);
+    await second.updateAccount(expected.id, { notes: 'newer' });
+
+    assert.equal(await first.removeAccountIfUnchanged(expected), false);
+    assert.equal((await first.getAccount(expected.id))?.notes, 'newer');
+    const current = await first.getAccount(expected.id);
+    assert.ok(current);
+    assert.equal(await first.removeAccountIfUnchanged(current), true);
+    assert.equal(await second.getAccount(expected.id), null);
+  });
+
   it('resolves DATA_DIR and cwd defaults identically to the .NET contract', () => {
     const cwd = path.join(tmpDir, 'cwd');
     const localRoot = path.join(tmpDir, 'local-app-data');

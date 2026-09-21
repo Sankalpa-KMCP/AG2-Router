@@ -281,6 +281,22 @@ public class AccountStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task LocalMetadataStore_ConditionalRemovePreservesNewerConcurrentUpdate()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var first = new LocalMetadataAccountStore(filePath);
+        var expected = await first.AddAccountAsync(new CreateAccountInput(Email: "conditional-remove@example.com"));
+        var second = new LocalMetadataAccountStore(filePath);
+        await second.UpdateAccountAsync(expected.Id, new UpdateAccountInput(Notes: "newer"));
+
+        Assert.False(await first.RemoveAccountIfUnchangedAsync(expected));
+        Assert.Equal("newer", (await first.GetAccountAsync(expected.Id))!.Notes);
+        var current = await first.GetAccountAsync(expected.Id);
+        Assert.True(await first.RemoveAccountIfUnchangedAsync(current!));
+        Assert.Null(await second.GetAccountAsync(expected.Id));
+    }
+
+    [Fact]
     public void LocalMetadataStore_DefaultPathMatchesSharedDataDirectoryContract()
     {
         string cwd = Path.Combine(_tempDir, "cwd");

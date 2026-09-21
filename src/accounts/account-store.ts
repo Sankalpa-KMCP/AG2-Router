@@ -46,6 +46,20 @@ function isValidDate(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && !Number.isNaN(Date.parse(value));
 }
 
+function accountsEqual(left: AccountMetadata, right: AccountMetadata): boolean {
+  return left.id === right.id &&
+    left.email === right.email &&
+    left.name === right.name &&
+    left.priority === right.priority &&
+    left.isReserve === right.isReserve &&
+    left.validationStatus === right.validationStatus &&
+    left.hasVaultedSession === right.hasVaultedSession &&
+    left.createdAt === right.createdAt &&
+    left.updatedAt === right.updatedAt &&
+    left.lastActiveAt === right.lastActiveAt &&
+    left.notes === right.notes;
+}
+
 function parseStoredData(raw: string, filePath: string): StoredData {
   if (!raw.trim()) throw new Error(`Account metadata store '${filePath}' is empty or truncated.`);
 
@@ -169,6 +183,14 @@ export class InMemoryAccountStore implements IAccountStore {
     const existed = this.accounts.delete(id);
     if (existed && this.activeAccountId === id) this.activeAccountId = null;
     return existed;
+  }
+
+  public async removeAccountIfUnchanged(expected: AccountMetadata): Promise<boolean> {
+    const current = this.accounts.get(expected.id);
+    if (!current || !accountsEqual(current, expected)) return false;
+    this.accounts.delete(expected.id);
+    if (this.activeAccountId === expected.id) this.activeAccountId = null;
+    return true;
   }
 
   public async getActiveAccountId(): Promise<string | null> { return this.activeAccountId; }
@@ -321,6 +343,24 @@ export class LocalMetadataAccountStore implements IAccountStore {
       if (accounts.length === current.accounts.length) return { next: current, result: false, changed: false };
       return {
         next: { ...current, accounts, activeAccountId: current.activeAccountId === id ? null : current.activeAccountId },
+        result: true,
+        changed: true
+      };
+    });
+  }
+
+  public removeAccountIfUnchanged(expected: AccountMetadata): Promise<boolean> {
+    return this.mutate((current) => {
+      const candidate = current.accounts.find((account) => account.id === expected.id);
+      if (!candidate || !accountsEqual(candidate, expected)) {
+        return { next: current, result: false, changed: false };
+      }
+      return {
+        next: {
+          ...current,
+          accounts: current.accounts.filter((account) => account.id !== expected.id),
+          activeAccountId: current.activeAccountId === expected.id ? null : current.activeAccountId
+        },
         result: true,
         changed: true
       };

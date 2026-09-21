@@ -121,7 +121,7 @@ public class AccountEnrollmentService
 
                 VaultMutationReceipt? vaultReceipt = null;
                 bool vaultCommitted = false;
-                bool activeCommitted = false;
+                AccountMetadata account;
                 try
                 {
                     // The vault commits first. Metadata cannot truthfully advertise a session before this succeeds.
@@ -132,21 +132,8 @@ public class AccountEnrollmentService
                         cancellationToken).ConfigureAwait(false);
                     vaultCommitted = true;
 
-                    // Active selection is committed before the final metadata truth flag so any failure
-                    // can be compensated while HasVaultedSession is still unchanged/false.
-                    bool activeUpdated = await _accountStore.CompareExchangeActiveAccountIdAsync(
-                        previousActiveId,
-                        pending.Id,
-                        cancellationToken).ConfigureAwait(false);
-                    if (!activeUpdated)
-                    {
-                        throw new AccountEnrollmentException(
-                            "Active account changed while enrollment was in progress; retry safely.");
-                    }
-                    activeCommitted = true;
-
                     string now = DateTimeOffset.UtcNow.ToString("O");
-                    var account = await _accountStore.UpdateAccountAsync(pending.Id, new UpdateAccountInput(
+                    var committed = await _accountStore.UpdateAccountAsync(pending.Id, new UpdateAccountInput(
                         Name: options?.Name,
                         Priority: options?.Priority,
                         IsReserve: options?.IsReserve,
@@ -156,35 +143,17 @@ public class AccountEnrollmentService
                         Notes: options?.Notes
                     ), cancellationToken).ConfigureAwait(false);
 
-                    if (account == null)
+                    if (committed == null)
                     {
                         throw new AccountEnrollmentException($"Failed to update account record for '{email}'.");
                     }
-
-                    string message = isNew
-                        ? $"Successfully enrolled new account '{email}' into encrypted vault."
-                        : $"Successfully updated session vault for existing account '{email}'.";
-
-                    return new EnrollmentResult(true, account, isNew, message);
+                    account = committed;
                 }
                 catch
                 {
                     // Compensation is best effort, but its ordering preserves the core invariant:
                     // metadata never became true before the vault commit. A failed cleanup may leave
                     // only a truthful false/orphan state that a retry can reconcile.
-                    if (activeCommitted)
-                    {
-                        try
-                        {
-                            await _accountStore.CompareExchangeActiveAccountIdAsync(
-                                pending.Id,
-                                previousActiveId,
-                                CancellationToken.None)
-                                .ConfigureAwait(false);
-                        }
-                        catch { }
-                    }
-
                     if (vaultCommitted)
                     {
                         try
@@ -200,7 +169,7 @@ public class AccountEnrollmentService
                     {
                         try
                         {
-                            await _accountStore.RemoveAccountAsync(pending.Id, CancellationToken.None)
+                            await _accountStore.RemoveAccountIfUnchangedAsync(pending, CancellationToken.None)
                                 .ConfigureAwait(false);
                         }
                         catch { }
@@ -208,6 +177,32 @@ public class AccountEnrollmentService
 
                     throw;
                 }
+
+                // The vault and its truth-bearing metadata are now committed. Active selection is
+                // ancillary and uses a one-way CAS: a concurrent user choice is preserved, and no
+                // rollback can overwrite a later selection through a value-ABA cycle.
+                bool activeUpdated;
+                try
+                {
+                    activeUpdated = await _accountStore.CompareExchangeActiveAccountIdAsync(
+                        previousActiveId,
+                        pending.Id,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch
+                {
+                    activeUpdated = false;
+                }
+
+                string message = isNew
+                    ? $"Successfully enrolled new account '{email}' into encrypted vault."
+                    : $"Successfully updated session vault for existing account '{email}'.";
+                if (!activeUpdated)
+                {
+                    message += " The current active-account selection was preserved.";
+                }
+
+                return new EnrollmentResult(true, account, isNew, message);
                 }
                 finally
                 {

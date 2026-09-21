@@ -116,6 +116,9 @@ export interface IAccountStore {
    */
   removeAccount(id: string): Promise<boolean>;
 
+  /** Remove an account only when its complete metadata still matches the expected snapshot. */
+  removeAccountIfUnchanged(expected: AccountMetadata): Promise<boolean>;
+
   /**
    * Get the ID of the currently active account session, if known.
    */

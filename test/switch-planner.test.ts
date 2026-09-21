@@ -26,6 +26,7 @@ class MockAccountStore implements IAccountStore {
   public async addAccount(): Promise<any> { throw new Error(); }
   public async updateAccount(): Promise<any> { throw new Error(); }
   public async removeAccount(): Promise<any> { throw new Error(); }
+  public async removeAccountIfUnchanged(): Promise<any> { throw new Error(); }
   public async getActiveAccountId(): Promise<string | null> { return this.activeId; }
   public async setActiveAccountId(id: string | null): Promise<void> { this.activeId = id; }
   public async compareExchangeActiveAccountId(expectedId: string | null, newId: string | null): Promise<boolean> {

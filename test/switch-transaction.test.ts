@@ -59,6 +59,11 @@ class MockAccountStore implements IAccountStore {
     return this.accounts.delete(id);
   }
 
+  public async removeAccountIfUnchanged(expected: AccountMetadata): Promise<boolean> {
+    if (this.accounts.get(expected.id) !== expected) return false;
+    return this.accounts.delete(expected.id);
+  }
+
   public async getActiveAccountId(): Promise<string | null> {
     return this.activeAccountId;
   }

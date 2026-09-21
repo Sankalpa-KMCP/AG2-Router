@@ -143,6 +143,26 @@ public class InMemoryAccountStore : IAccountStore
     }
 
     /// <inheritdoc />
+    public Task<bool> RemoveAccountIfUnchangedAsync(
+        AccountMetadata expected,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+
+        lock (_syncRoot)
+        {
+            if (!_accounts.TryGetValue(expected.Id, out var current) || current != expected)
+            {
+                return Task.FromResult(false);
+            }
+
+            _accounts.Remove(expected.Id);
+            if (_activeAccountId == expected.Id) _activeAccountId = null;
+            return Task.FromResult(true);
+        }
+    }
+
+    /// <inheritdoc />
     public Task<string?> GetActiveAccountIdAsync(CancellationToken cancellationToken = default)
     {
         lock (_syncRoot)
