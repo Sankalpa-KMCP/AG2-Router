@@ -1,5 +1,7 @@
 using System.IO;
+using System.Text.Json;
 using AG2Router.AG2.Accounts;
+using AG2Router.AG2.Persistence;
 using AG2Router.Core.Models;
 using Xunit;
 
@@ -83,6 +85,18 @@ public class AccountStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task InMemoryStore_CompareExchangeActiveIdDoesNotOverwriteNewerSelection()
+    {
+        var store = new InMemoryAccountStore();
+        var first = await store.AddAccountAsync(new CreateAccountInput(Email: "first@example.com"));
+        var second = await store.AddAccountAsync(new CreateAccountInput(Email: "second@example.com"));
+        Assert.True(await store.CompareExchangeActiveAccountIdAsync(null, first.Id));
+        await store.SetActiveAccountIdAsync(second.Id);
+        Assert.False(await store.CompareExchangeActiveAccountIdAsync(first.Id, null));
+        Assert.Equal(second.Id, await store.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
     public async Task LocalMetadataStore_PersistsToDiskAndReloadsAcrossInstances()
     {
         string filePath = Path.Combine(_tempDir, "accounts.json");
@@ -118,5 +132,177 @@ public class AccountStoreTests : IDisposable
         var accounts = await store.ListAccountsAsync();
         Assert.Empty(accounts);
         Assert.Null(await store.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_WritesExactCamelCaseSharedSchema()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var store = new LocalMetadataAccountStore(filePath);
+        var account = await store.AddAccountAsync(new CreateAccountInput(
+            Email: "writer@example.com",
+            Name: "C# Writer",
+            Priority: 0,
+            IsReserve: false,
+            HasVaultedSession: false,
+            Notes: "synthetic"));
+        await store.SetActiveAccountIdAsync(account.Id);
+
+        using var document = JsonDocument.Parse(await File.ReadAllTextAsync(filePath));
+        var root = document.RootElement;
+        Assert.Equal(["version", "activeAccountId", "accounts"],
+            root.EnumerateObject().Select(property => property.Name).ToArray());
+
+        var storedAccount = root.GetProperty("accounts")[0];
+        Assert.Equal(
+            ["id", "email", "name", "priority", "isReserve", "validationStatus",
+             "hasVaultedSession", "createdAt", "updatedAt", "lastActiveAt", "notes"],
+            storedAccount.EnumerateObject().Select(property => property.Name).ToArray());
+        Assert.False(storedAccount.TryGetProperty("IsActive", out _));
+        Assert.False(storedAccount.TryGetProperty("isActive", out _));
+        Assert.Equal(0, storedAccount.GetProperty("priority").GetInt32());
+        Assert.False(storedAccount.GetProperty("hasVaultedSession").GetBoolean());
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_ReadsSharedTypeScriptGoldenFixture()
+    {
+        string fixture = Path.Combine(AppContext.BaseDirectory, "fixtures", "accounts-v1.json");
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        File.Copy(fixture, filePath);
+
+        var store = new LocalMetadataAccountStore(filePath);
+        var accounts = await store.ListAccountsAsync();
+        Assert.Equal(2, accounts.Count);
+        var account = Assert.Single(accounts, candidate => candidate.Id == "acc_shared01");
+        Assert.Equal("acc_shared01", account.Id);
+        Assert.Equal("interop@example.com", account.Email);
+        Assert.Equal("Interoperability ✓", account.Name);
+        Assert.False(account.HasVaultedSession);
+        Assert.Null(account.LastActiveAt);
+        Assert.Equal(account.Id, await store.GetActiveAccountIdAsync());
+        var minimal = Assert.Single(accounts, candidate => candidate.Id == "acc_minimal1");
+        Assert.Null(minimal.Name);
+        Assert.Null(minimal.Notes);
+        Assert.False(minimal.HasVaultedSession);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   \r\n")]
+    [InlineData("{\"version\":1,\"activeAccountId\":null,\"accounts\":[")]
+    [InlineData("null")]
+    [InlineData("{\"version\":2,\"activeAccountId\":null,\"accounts\":[]}")]
+    [InlineData("{\"version\":1,\"activeAccountId\":null,\"accounts\":null}")]
+    public async Task LocalMetadataStore_InvalidExistingFileFailsClosedAndPreservesBytes(string content)
+    {
+        string filePath = Path.Combine(_tempDir, $"invalid-{Guid.NewGuid():N}.json");
+        byte[] original = System.Text.Encoding.UTF8.GetBytes(content);
+        await File.WriteAllBytesAsync(filePath, original);
+        var store = new LocalMetadataAccountStore(filePath);
+
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            store.AddAccountAsync(new CreateAccountInput(Email: "blocked@example.com")));
+
+        Assert.Equal(original, await File.ReadAllBytesAsync(filePath));
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_PersistenceFailureDoesNotPublishMutation()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var seedStore = new LocalMetadataAccountStore(filePath);
+        var account = await seedStore.AddAccountAsync(new CreateAccountInput(Email: "stable@example.com"));
+        byte[] before = await File.ReadAllBytesAsync(filePath);
+
+        var failingStore = new LocalMetadataAccountStore(filePath, new ThrowingFileWriter());
+        await Assert.ThrowsAsync<IOException>(() => failingStore.UpdateAccountAsync(
+            account.Id,
+            new UpdateAccountInput(Name: "must-not-publish")));
+
+        Assert.Equal(before, await File.ReadAllBytesAsync(filePath));
+        var observed = await failingStore.GetAccountAsync(account.Id);
+        Assert.NotNull(observed);
+        Assert.Null(observed.Name);
+        Assert.Empty(Directory.GetFiles(_tempDir, "*.tmp"));
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_TwoInstancesConcurrentAddsDoNotLoseUpdates()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var first = new LocalMetadataAccountStore(filePath);
+        var second = new LocalMetadataAccountStore(filePath);
+
+        var tasks = Enumerable.Range(0, 20).Select(index =>
+            (index % 2 == 0 ? first : second).AddAccountAsync(
+                new CreateAccountInput(Email: $"concurrent-{index}@example.com")));
+        await Task.WhenAll(tasks);
+
+        var reloaded = new LocalMetadataAccountStore(filePath);
+        Assert.Equal(20, (await reloaded.ListAccountsAsync()).Count);
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_ConcurrentUpdateDeleteAndAddRebaseOnLatestSnapshot()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var seed = new LocalMetadataAccountStore(filePath);
+        var updateTarget = await seed.AddAccountAsync(new CreateAccountInput(Email: "update@example.com"));
+        var deleteTarget = await seed.AddAccountAsync(new CreateAccountInput(Email: "delete@example.com"));
+
+        var first = new LocalMetadataAccountStore(filePath);
+        var second = new LocalMetadataAccountStore(filePath);
+        var third = new LocalMetadataAccountStore(filePath);
+        await Task.WhenAll(
+            first.UpdateAccountAsync(updateTarget.Id, new UpdateAccountInput(Name: "updated")),
+            second.RemoveAccountAsync(deleteTarget.Id),
+            third.AddAccountAsync(new CreateAccountInput(Email: "added@example.com")));
+
+        var accounts = await new LocalMetadataAccountStore(filePath).ListAccountsAsync();
+        Assert.Equal("updated", Assert.Single(accounts, account => account.Id == updateTarget.Id).Name);
+        Assert.DoesNotContain(accounts, account => account.Id == deleteTarget.Id);
+        Assert.Single(accounts, account => account.Email == "added@example.com");
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_CompareExchangeActiveIdIsAtomicAcrossInstances()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var seed = new LocalMetadataAccountStore(filePath);
+        var first = await seed.AddAccountAsync(new CreateAccountInput(Email: "first-active@example.com"));
+        var second = await seed.AddAccountAsync(new CreateAccountInput(Email: "second-active@example.com"));
+        Assert.True(await seed.CompareExchangeActiveAccountIdAsync(null, first.Id));
+
+        var other = new LocalMetadataAccountStore(filePath);
+        await other.SetActiveAccountIdAsync(second.Id);
+        Assert.False(await seed.CompareExchangeActiveAccountIdAsync(first.Id, null));
+        Assert.Equal(second.Id, await seed.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public void LocalMetadataStore_DefaultPathMatchesSharedDataDirectoryContract()
+    {
+        string cwd = Path.Combine(_tempDir, "cwd");
+        string localRoot = Path.Combine(_tempDir, "local-app-data");
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(localRoot, "AG2-Router", "data", "accounts.json")),
+            LocalMetadataAccountStore.ResolveDefaultFilePath(
+                dataDirectory: string.Empty,
+                currentDirectory: cwd,
+                localApplicationData: localRoot));
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(cwd, "relative-data", "accounts.json")),
+            LocalMetadataAccountStore.ResolveDefaultFilePath("relative-data", cwd, localRoot));
+        string absoluteData = Path.Combine(_tempDir, "absolute-data");
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(absoluteData, "accounts.json")),
+            LocalMetadataAccountStore.ResolveDefaultFilePath(absoluteData, cwd, localRoot));
+    }
+
+    private sealed class ThrowingFileWriter : IDurableFileWriter
+    {
+        public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken) =>
+            throw new IOException("Injected pre-replacement persistence failure.");
     }
 }

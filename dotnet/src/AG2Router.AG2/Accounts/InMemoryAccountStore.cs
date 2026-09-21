@@ -165,6 +165,26 @@ public class InMemoryAccountStore : IAccountStore
         }
     }
 
+    /// <inheritdoc />
+    public Task<bool> CompareExchangeActiveAccountIdAsync(
+        string? expectedId,
+        string? newId,
+        CancellationToken cancellationToken = default)
+    {
+        lock (_syncRoot)
+        {
+            if (newId != null && !_accounts.ContainsKey(newId))
+            {
+                throw new InvalidOperationException(
+                    $"Cannot set active account: account with id '{newId}' not found.");
+            }
+
+            if (!string.Equals(_activeAccountId, expectedId, StringComparison.Ordinal)) return Task.FromResult(false);
+            _activeAccountId = newId;
+            return Task.FromResult(true);
+        }
+    }
+
     /// <summary>
     /// Restores accounts and active ID from persistent storage.
     /// </summary>

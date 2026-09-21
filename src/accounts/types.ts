@@ -125,4 +125,7 @@ export interface IAccountStore {
    * Set the active account session ID.
    */
   setActiveAccountId(id: string | null): Promise<void>;
+
+  /** Atomically update the active id only when it still equals expectedId. */
+  compareExchangeActiveAccountId(expectedId: string | null, newId: string | null): Promise<boolean>;
 }

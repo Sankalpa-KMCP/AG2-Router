@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Vault;
 using AG2Router.Core.Models;
 using AG2Router.Windows.Security;
@@ -252,5 +253,60 @@ public class SessionVaultTests : IDisposable
         );
         File.WriteAllText(vault.GetVaultPath(), JsonSerializer.Serialize(wrongVersion));
         await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.ListStoredAccountIdsAsync());
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   \r\n")]
+    [InlineData("{\"magic\":\"AG2_ROUTER_SESSION_VAULT\"")]
+    public async Task EmptyWhitespaceOrTruncatedVaultFailsClosedAndPreservesBytes(string content)
+    {
+        var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider());
+        byte[] original = Encoding.UTF8.GetBytes(content);
+        await File.WriteAllBytesAsync(vault.GetVaultPath(), original);
+
+        await Assert.ThrowsAsync<VaultCorruptionException>(() =>
+            vault.SaveSessionAsync("acc_blocked", "synthetic"u8.ToArray()));
+
+        Assert.Equal(original, await File.ReadAllBytesAsync(vault.GetVaultPath()));
+    }
+
+    [Fact]
+    public async Task PersistenceFailurePreservesPreviousVaultSnapshot()
+    {
+        var dpapi = new FakeDpapiProvider();
+        var seed = new SessionVault(_tempVaultDir, dpapi);
+        await seed.SaveSessionAsync("acc_stable", "stable-session"u8.ToArray());
+        byte[] before = await File.ReadAllBytesAsync(seed.GetVaultPath());
+
+        var failing = new SessionVault(_tempVaultDir, dpapi, new ThrowingFileWriter());
+        await Assert.ThrowsAsync<VaultException>(() =>
+            failing.SaveSessionAsync("acc_new", "new-session"u8.ToArray()));
+
+        Assert.Equal(before, await File.ReadAllBytesAsync(seed.GetVaultPath()));
+        Assert.Equal("stable-session"u8.ToArray(), await seed.GetSessionAsync("acc_stable"));
+        Assert.False(await seed.HasSessionAsync("acc_new"));
+    }
+
+    [Fact]
+    public async Task TwoVaultInstancesConcurrentSavesDoNotLoseUpdates()
+    {
+        var dpapi = new FakeDpapiProvider();
+        var first = new SessionVault(_tempVaultDir, dpapi);
+        var second = new SessionVault(_tempVaultDir, dpapi);
+
+        await Task.WhenAll(Enumerable.Range(0, 20).Select(index =>
+            (index % 2 == 0 ? first : second).SaveSessionAsync(
+                $"acc_{index}",
+                Encoding.UTF8.GetBytes($"session-{index}"))));
+
+        var reloaded = new SessionVault(_tempVaultDir, dpapi);
+        Assert.Equal(20, (await reloaded.ListStoredAccountIdsAsync()).Count);
+    }
+
+    private sealed class ThrowingFileWriter : IDurableFileWriter
+    {
+        public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken) =>
+            throw new IOException("Injected pre-replacement persistence failure.");
     }
 }

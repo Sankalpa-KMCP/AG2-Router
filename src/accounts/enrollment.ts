@@ -14,6 +14,7 @@ import { IAG2Adapter } from '../ag2/adapter.js';
 import { redactSensitiveText, sanitizeError } from '../ag2/security.js';
 import { IWinCredReader, DEFAULT_AG2_WINCRED_TARGET } from '../ag2/wincred.js';
 import { SessionVault } from '../vault/session-vault.js';
+import { withCoordinatedFileAccess } from '../persistence/file-coordination.js';
 import { AccountMetadata, IAccountStore } from './types.js';
 
 export interface EnrollmentOptions {
@@ -42,6 +43,24 @@ export interface AccountEnrollmentServiceOptions {
   readonly wincredReader: IWinCredReader;
   readonly sessionVault: SessionVault;
   readonly accountStore: IAccountStore;
+}
+
+const enrollmentLocks = new Map<string, Promise<void>>();
+
+async function withEnrollmentLock<T>(email: string, action: () => Promise<T>): Promise<T> {
+  const key = email.trim().toLowerCase();
+  const previous = enrollmentLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  enrollmentLocks.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await action();
+  } finally {
+    release();
+    if (enrollmentLocks.get(key) === tail) enrollmentLocks.delete(key);
+  }
 }
 
 export class AccountEnrollmentService {
@@ -90,65 +109,81 @@ export class AccountEnrollmentService {
         throw new AccountEnrollmentError('Failed to parse Windows Credential JSON payload.');
       }
 
-      // 4. Check if account already exists in AccountStore
       const email = currentAccount.email.trim();
-      const existing = await this.accountStore.getAccountByEmail(email);
-
-      let account: AccountMetadata;
-      let isNew = false;
-
-      if (existing) {
-        // Update existing account
-        const updated = await this.accountStore.updateAccount(existing.id, {
-          name: options.name ?? existing.name ?? currentAccount.name ?? undefined,
-          priority: options.priority ?? existing.priority,
-          isReserve: options.isReserve ?? existing.isReserve,
-          validationStatus: 'VALID',
-          hasVaultedSession: true,
-          lastActiveAt: new Date().toISOString(),
-          notes: options.notes ?? existing.notes
-        });
-
-        if (!updated) {
-          throw new AccountEnrollmentError(`Failed to update existing account record for '${email}'.`);
-        }
-        account = updated;
-      } else {
-        // Register new account
-        isNew = true;
-        account = await this.accountStore.addAccount({
+      return await withEnrollmentLock(email, async () => {
+        const enrollmentResource = `${this.sessionVault.getVaultPath()}.enrollment`;
+        return withCoordinatedFileAccess(enrollmentResource, async () => {
+        // Recheck inside the identity lock so concurrent duplicate enrollment is idempotent.
+        const existing = await this.accountStore.getAccountByEmail(email);
+        const previousActiveId = await this.accountStore.getActiveAccountId();
+        const isNew = existing === null;
+        const pending = existing ?? await this.accountStore.addAccount({
           email,
           name: options.name ?? currentAccount.name ?? undefined,
           priority: options.priority,
           isReserve: options.isReserve,
-          hasVaultedSession: true,
+          hasVaultedSession: false,
           notes: options.notes
         });
 
-        // Set validationStatus to VALID
-        const validated = await this.accountStore.updateAccount(account.id, {
-          validationStatus: 'VALID',
-          lastActiveAt: new Date().toISOString()
-        });
-        if (validated) {
-          account = validated;
+        let previousSession: Buffer | null = null;
+        let vaultCommitted = false;
+        let activeCommitted = false;
+        try {
+          if (!isNew) previousSession = await this.sessionVault.getSession(pending.id);
+
+          // Vault-first: HasVaultedSession remains unchanged/false until this succeeds.
+          await this.sessionVault.saveSession(pending.id, cred.blob, cred.target);
+          vaultCommitted = true;
+
+          // Commit active selection before the final truth flag so failures remain compensatable.
+          const activeUpdated = await this.accountStore.compareExchangeActiveAccountId(previousActiveId, pending.id);
+          if (!activeUpdated) {
+            throw new AccountEnrollmentError('Active account changed while enrollment was in progress; retry safely.');
+          }
+          activeCommitted = true;
+
+          const account = await this.accountStore.updateAccount(pending.id, {
+            name: options.name,
+            priority: options.priority,
+            isReserve: options.isReserve,
+            validationStatus: 'VALID',
+            hasVaultedSession: true,
+            lastActiveAt: new Date().toISOString(),
+            notes: options.notes
+          });
+          if (!account) throw new AccountEnrollmentError(`Failed to update account record for '${email}'.`);
+
+          return {
+            success: true,
+            account,
+            isNew,
+            message: isNew
+              ? `Successfully enrolled new account '${email}' into encrypted vault.`
+              : `Successfully updated session vault for existing account '${email}'.`
+          };
+        } catch (error) {
+          if (activeCommitted) {
+            try { await this.accountStore.compareExchangeActiveAccountId(pending.id, previousActiveId); } catch {}
+          }
+          if (vaultCommitted) {
+            try {
+              if (previousSession) {
+                await this.sessionVault.saveSession(pending.id, previousSession, cred.target);
+              } else {
+                await this.sessionVault.removeSession(pending.id);
+              }
+            } catch {}
+          }
+          if (isNew) {
+            try { await this.accountStore.removeAccount(pending.id); } catch {}
+          }
+          throw error;
+        } finally {
+          previousSession?.fill(0);
         }
-      }
-
-      // 5. Encrypt and save session into the session vault
-      await this.sessionVault.saveSession(account.id, cred.blob, cred.target);
-
-      // 6. Mark as active account in account store
-      await this.accountStore.setActiveAccountId(account.id);
-
-      return {
-        success: true,
-        account,
-        isNew,
-        message: isNew
-          ? `Successfully enrolled new account '${email}' into encrypted vault.`
-          : `Successfully updated session vault for existing account '${email}'.`
-      };
+        });
+      });
     } catch (err) {
       const sanitized = sanitizeError(err);
       throw new AccountEnrollmentError(redactSensitiveText(sanitized.message));

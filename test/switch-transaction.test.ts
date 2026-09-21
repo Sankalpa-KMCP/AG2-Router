@@ -66,6 +66,12 @@ class MockAccountStore implements IAccountStore {
   public async setActiveAccountId(id: string | null): Promise<void> {
     this.activeAccountId = id;
   }
+
+  public async compareExchangeActiveAccountId(expectedId: string | null, newId: string | null): Promise<boolean> {
+    if (this.activeAccountId !== expectedId) return false;
+    this.activeAccountId = newId;
+    return true;
+  }
 }
 
 class MockWinCredReader implements IWinCredReader {

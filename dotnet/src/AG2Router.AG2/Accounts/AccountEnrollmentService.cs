@@ -1,4 +1,7 @@
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text.Json;
+using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Security;
 using AG2Router.AG2.Vault;
 using AG2Router.Core.Contracts;
@@ -17,6 +20,9 @@ namespace AG2Router.AG2.Accounts;
 /// </summary>
 public class AccountEnrollmentService
 {
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> EnrollmentLocks =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private readonly IAG2Adapter _adapter;
     private readonly IWinCredReader _wincredReader;
     private readonly SessionVault _sessionVault;
@@ -86,71 +92,156 @@ public class AccountEnrollmentService
                 throw new AccountEnrollmentException($"Failed to parse Windows Credential JSON payload: {ex.Message}", ex);
             }
 
-            // 4. Check if account already exists in AccountStore
+            // Serialize same-identity enrollment across service instances and requests.
             string email = currentAccount.Email.Trim();
-            var existing = await _accountStore.GetAccountByEmailAsync(email, cancellationToken).ConfigureAwait(false);
-
-            AccountMetadata account;
-            bool isNew = false;
-            string now = DateTime.UtcNow.ToString("o");
-
-            if (existing != null)
+            var enrollmentLock = EnrollmentLocks.GetOrAdd(email, static _ => new SemaphoreSlim(1, 1));
+            await enrollmentLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                // Update existing account
-                var updated = await _accountStore.UpdateAccountAsync(existing.Id, new UpdateAccountInput(
-                    Name: options?.Name ?? existing.Name ?? currentAccount.Name,
-                    Priority: options?.Priority ?? existing.Priority,
-                    IsReserve: options?.IsReserve ?? existing.IsReserve,
-                    ValidationStatus: AccountValidationStatus.Valid,
-                    HasVaultedSession: true,
-                    LastActiveAt: now,
-                    Notes: options?.Notes ?? existing.Notes
-                ), cancellationToken).ConfigureAwait(false);
-
-                if (updated == null)
+                string enrollmentResource = GetEnrollmentResourcePath();
+                var resourceLock = PathLockRegistry.Get(enrollmentResource);
+                await resourceLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
                 {
-                    throw new AccountEnrollmentException($"Failed to update existing account record for '{email}'.");
-                }
+                    await using var enrollmentLease = await CrossProcessFileLease
+                        .AcquireAsync(enrollmentResource, cancellationToken)
+                        .ConfigureAwait(false);
 
-                account = updated;
-            }
-            else
-            {
-                // Register new account
-                isNew = true;
-                var created = await _accountStore.AddAccountAsync(new CreateAccountInput(
+                // Recheck inside the identity lock so duplicate concurrent enrollment is idempotent.
+                var existing = await _accountStore.GetAccountByEmailAsync(email, cancellationToken).ConfigureAwait(false);
+                string? previousActiveId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+                bool isNew = existing == null;
+                AccountMetadata pending = existing ?? await _accountStore.AddAccountAsync(new CreateAccountInput(
                     Email: email,
                     Name: options?.Name ?? currentAccount.Name,
                     Priority: options?.Priority,
                     IsReserve: options?.IsReserve,
-                    HasVaultedSession: true,
+                    HasVaultedSession: false,
                     Notes: options?.Notes
                 ), cancellationToken).ConfigureAwait(false);
 
-                var validated = await _accountStore.UpdateAccountAsync(created.Id, new UpdateAccountInput(
-                    ValidationStatus: AccountValidationStatus.Valid,
-                    LastActiveAt: now
-                ), cancellationToken).ConfigureAwait(false);
+                byte[]? previousSession = null;
+                bool vaultCommitted = false;
+                bool activeCommitted = false;
+                try
+                {
+                    if (!isNew)
+                    {
+                        previousSession = await _sessionVault.GetSessionAsync(pending.Id, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
 
-                account = validated ?? created;
+                    // The vault commits first. Metadata cannot truthfully advertise a session before this succeeds.
+                    await _sessionVault.SaveSessionAsync(
+                        pending.Id,
+                        cred.Blob,
+                        cred.Target,
+                        cancellationToken).ConfigureAwait(false);
+                    vaultCommitted = true;
+
+                    // Active selection is committed before the final metadata truth flag so any failure
+                    // can be compensated while HasVaultedSession is still unchanged/false.
+                    bool activeUpdated = await _accountStore.CompareExchangeActiveAccountIdAsync(
+                        previousActiveId,
+                        pending.Id,
+                        cancellationToken).ConfigureAwait(false);
+                    if (!activeUpdated)
+                    {
+                        throw new AccountEnrollmentException(
+                            "Active account changed while enrollment was in progress; retry safely.");
+                    }
+                    activeCommitted = true;
+
+                    string now = DateTimeOffset.UtcNow.ToString("O");
+                    var account = await _accountStore.UpdateAccountAsync(pending.Id, new UpdateAccountInput(
+                        Name: options?.Name,
+                        Priority: options?.Priority,
+                        IsReserve: options?.IsReserve,
+                        ValidationStatus: AccountValidationStatus.Valid,
+                        HasVaultedSession: true,
+                        LastActiveAt: now,
+                        Notes: options?.Notes
+                    ), cancellationToken).ConfigureAwait(false);
+
+                    if (account == null)
+                    {
+                        throw new AccountEnrollmentException($"Failed to update account record for '{email}'.");
+                    }
+
+                    string message = isNew
+                        ? $"Successfully enrolled new account '{email}' into encrypted vault."
+                        : $"Successfully updated session vault for existing account '{email}'.";
+
+                    return new EnrollmentResult(true, account, isNew, message);
+                }
+                catch
+                {
+                    // Compensation is best effort, but its ordering preserves the core invariant:
+                    // metadata never became true before the vault commit. A failed cleanup may leave
+                    // only a truthful false/orphan state that a retry can reconcile.
+                    if (activeCommitted)
+                    {
+                        try
+                        {
+                            await _accountStore.CompareExchangeActiveAccountIdAsync(
+                                pending.Id,
+                                previousActiveId,
+                                CancellationToken.None)
+                                .ConfigureAwait(false);
+                        }
+                        catch { }
+                    }
+
+                    if (vaultCommitted)
+                    {
+                        try
+                        {
+                            if (previousSession != null)
+                            {
+                                await _sessionVault.SaveSessionAsync(
+                                    pending.Id,
+                                    previousSession,
+                                    cred.Target,
+                                    CancellationToken.None).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                await _sessionVault.RemoveSessionAsync(pending.Id, CancellationToken.None)
+                                    .ConfigureAwait(false);
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (isNew)
+                    {
+                        try
+                        {
+                            await _accountStore.RemoveAccountAsync(pending.Id, CancellationToken.None)
+                                .ConfigureAwait(false);
+                        }
+                        catch { }
+                    }
+
+                    throw;
+                }
+                finally
+                {
+                    if (previousSession != null)
+                    {
+                        CryptographicOperations.ZeroMemory(previousSession);
+                    }
+                }
+                }
+                finally
+                {
+                    resourceLock.Release();
+                }
             }
-
-            // 5. Encrypt and save session into the session vault
-            await _sessionVault.SaveSessionAsync(account.Id, cred.Blob, cred.Target, cancellationToken).ConfigureAwait(false);
-
-            // 6. Mark as active account in account store
-            await _accountStore.SetActiveAccountIdAsync(account.Id, cancellationToken).ConfigureAwait(false);
-
-            string message = isNew
-                ? $"Successfully enrolled new account '{email}' into encrypted vault."
-                : $"Successfully updated session vault for existing account '{email}'.";
-
-            return new EnrollmentResult(
-                Success: true,
-                Account: account,
-                IsNew: isNew,
-                Message: message
-            );
+            finally
+            {
+                enrollmentLock.Release();
+            }
         }
         catch (AccountEnrollmentException)
         {
@@ -162,4 +253,6 @@ public class AccountEnrollmentService
             throw new AccountEnrollmentException(sanitized, ex);
         }
     }
+
+    private string GetEnrollmentResourcePath() => $"{_sessionVault.GetVaultPath()}.enrollment";
 }

@@ -12,6 +12,10 @@ public interface IAccountStore
     Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default);
     Task<string?> GetActiveAccountIdAsync(CancellationToken cancellationToken = default);
     Task SetActiveAccountIdAsync(string? id, CancellationToken cancellationToken = default);
+    Task<bool> CompareExchangeActiveAccountIdAsync(
+        string? expectedId,
+        string? newId,
+        CancellationToken cancellationToken = default);
 }
 
 public interface IAG2Adapter

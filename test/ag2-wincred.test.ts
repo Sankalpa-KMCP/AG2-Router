@@ -34,7 +34,13 @@ describe('AG2WinCredReader (Read-Only Windows Credential Manager)', () => {
     assert.strictEqual(result, null);
   });
 
-  it('should read live gemini:antigravity if present on system without mutation', { skip: process.platform !== 'win32' ? 'Windows Credential Manager is only supported on Windows' : false }, async () => {
+  it('should read live gemini:antigravity if explicitly authorized', {
+    skip: process.platform !== 'win32'
+      ? 'Windows Credential Manager is only supported on Windows'
+      : process.env.AG2_RUN_LIVE_WINCRED_TESTS !== 'true'
+        ? 'Live WinCred access is opt-in; synthetic tests are the safe default'
+        : false
+  }, async () => {
     const reader = new AG2WinCredReader();
     const result = await reader.readCredential(DEFAULT_AG2_WINCRED_TARGET);
     if (result) {

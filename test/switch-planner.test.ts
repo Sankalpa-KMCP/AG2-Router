@@ -28,6 +28,11 @@ class MockAccountStore implements IAccountStore {
   public async removeAccount(): Promise<any> { throw new Error(); }
   public async getActiveAccountId(): Promise<string | null> { return this.activeId; }
   public async setActiveAccountId(id: string | null): Promise<void> { this.activeId = id; }
+  public async compareExchangeActiveAccountId(expectedId: string | null, newId: string | null): Promise<boolean> {
+    if (this.activeId !== expectedId) return false;
+    this.activeId = newId;
+    return true;
+  }
 }
 
 class MockWinCredReader implements IWinCredReader {

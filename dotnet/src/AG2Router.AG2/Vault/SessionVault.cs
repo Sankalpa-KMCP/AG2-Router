@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using AG2Router.AG2.Persistence;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
 
@@ -26,9 +27,18 @@ public class SessionVault : ISessionVault
     private readonly string _vaultDir;
     private readonly string _vaultFilePath;
     private readonly IDpapiProvider _dpapiProvider;
-    private readonly SemaphoreSlim _fileLock = new(1, 1);
+    private readonly SemaphoreSlim _pathLock;
+    private readonly IDurableFileWriter _fileWriter;
 
     public SessionVault(string? vaultDir = null, IDpapiProvider? dpapiProvider = null)
+        : this(vaultDir, dpapiProvider, new DurableFileWriter())
+    {
+    }
+
+    internal SessionVault(
+        string? vaultDir,
+        IDpapiProvider? dpapiProvider,
+        IDurableFileWriter fileWriter)
     {
         if (!string.IsNullOrWhiteSpace(vaultDir))
         {
@@ -53,6 +63,8 @@ public class SessionVault : ISessionVault
 
         _vaultFilePath = Path.Combine(_vaultDir, "sessions.dat");
         _dpapiProvider = dpapiProvider ?? throw new ArgumentNullException(nameof(dpapiProvider));
+        _pathLock = PathLockRegistry.Get(_vaultFilePath);
+        _fileWriter = fileWriter ?? throw new ArgumentNullException(nameof(fileWriter));
     }
 
     /// <summary>
@@ -110,9 +122,13 @@ public class SessionVault : ISessionVault
 
         string encryptedPayloadBase64 = Convert.ToBase64String(encryptedBytes);
 
-        await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            await using var lease = await CrossProcessFileLease
+                .AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
+
             // 3. Load current vault envelope (fails closed if existing file is corrupted)
             var envelope = ReadEnvelope();
 
@@ -130,11 +146,11 @@ public class SessionVault : ISessionVault
             envelope.Records[accountId] = record;
 
             // 4. Save atomically
-            WriteEnvelope(envelope);
+            await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            _fileLock.Release();
+            _pathLock.Release();
         }
     }
 
@@ -150,9 +166,12 @@ public class SessionVault : ISessionVault
         }
 
         VaultAccountRecord? record;
-        await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            await using var lease = await CrossProcessFileLease
+                .AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
             var envelope = ReadEnvelope();
             if (!envelope.Records.TryGetValue(accountId, out record))
             {
@@ -161,7 +180,7 @@ public class SessionVault : ISessionVault
         }
         finally
         {
-            _fileLock.Release();
+            _pathLock.Release();
         }
 
         byte[] ciphertext = Convert.FromBase64String(record.EncryptedPayloadBase64);
@@ -230,15 +249,18 @@ public class SessionVault : ISessionVault
             return false;
         }
 
-        await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            await using var lease = await CrossProcessFileLease
+                .AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
             var envelope = ReadEnvelope();
             return envelope.Records.ContainsKey(accountId);
         }
         finally
         {
-            _fileLock.Release();
+            _pathLock.Release();
         }
     }
 
@@ -252,21 +274,24 @@ public class SessionVault : ISessionVault
             return false;
         }
 
-        await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            await using var lease = await CrossProcessFileLease
+                .AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
             var envelope = ReadEnvelope();
             if (!envelope.Records.Remove(accountId))
             {
                 return false;
             }
 
-            WriteEnvelope(envelope);
+            await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
             return true;
         }
         finally
         {
-            _fileLock.Release();
+            _pathLock.Release();
         }
     }
 
@@ -275,15 +300,18 @@ public class SessionVault : ISessionVault
     /// </summary>
     public async Task<IReadOnlyList<string>> ListStoredAccountIdsAsync(CancellationToken cancellationToken = default)
     {
-        await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            await using var lease = await CrossProcessFileLease
+                .AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
             var envelope = ReadEnvelope();
             return envelope.Records.Keys.ToList();
         }
         finally
         {
-            _fileLock.Release();
+            _pathLock.Release();
         }
     }
 
@@ -350,30 +378,23 @@ public class SessionVault : ISessionVault
         return envelope;
     }
 
-    private void WriteEnvelope(VaultFileEnvelope envelope)
+    private async Task WriteEnvelopeAsync(
+        VaultFileEnvelope envelope,
+        CancellationToken cancellationToken)
     {
-        Directory.CreateDirectory(_vaultDir);
-
         var updatedEnvelope = envelope with
         {
             UpdatedAt = DateTime.UtcNow.ToString("o")
         };
 
         string serialized = JsonSerializer.Serialize(updatedEnvelope, JsonOptions);
-        string tempPath = $"{_vaultFilePath}.{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}.{Guid.NewGuid().ToString("N")[..6]}.tmp";
-
         try
         {
-            File.WriteAllText(tempPath, serialized, Encoding.UTF8);
-            File.Move(tempPath, _vaultFilePath, overwrite: true);
+            await _fileWriter.WriteAtomicAsync(_vaultFilePath, serialized, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            if (File.Exists(tempPath))
-            {
-                try { File.Delete(tempPath); } catch { /* ignore */ }
-            }
-
             throw new VaultException($"Failed to atomically write vault file: {ex.Message}", ex);
         }
     }

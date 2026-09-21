@@ -21,4 +21,10 @@
     <ProjectReference Include="..\..\src\AG2Router.Windows\AG2Router.Windows.csproj" />
     <ProjectReference Include="..\..\src\AG2Router.App\AG2Router.App.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\..\test\fixtures\accounts-v1.json" Link="fixtures\accounts-v1.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
 </Project>
