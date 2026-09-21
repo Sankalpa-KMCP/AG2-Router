@@ -332,6 +332,21 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task RollbackSnapshotRefreshesAfterSourceProcessIsQuiesced()
+    {
+        await SeedAccountsAsync();
+        _process.OnStop = () =>
+            _credentials.Set(Credential("source@example.com", "source-refreshed-before-stop"));
+        _process.WaitError = new AG2ProcessLifecycleException("synthetic reconnect failure");
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
+        Assert.Equal("source-refreshed-before-stop", Encoding.UTF8.GetString(_credentials.Snapshot().Blob));
+        Assert.Contains("ROLLBACK_SNAPSHOT_REFRESHED_AFTER_QUIESCE", result.StagesCompleted);
+    }
+
+    [Fact]
     public async Task SensitiveDependencyErrorsAreRedactedFromResultAndStatus()
     {
         await SeedAccountsAsync();
@@ -480,6 +495,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         public bool RollbackTokenWasCancelled { get; private set; }
         public Action? OnReplacement { get; set; }
         public Action? OnRestore { get; set; }
+        public Action? OnStop { get; set; }
 
         public Task<AG2ProcessSnapshot> CaptureVerifiedAsync(CancellationToken cancellationToken = default) =>
             CaptureError != null ? Task.FromException<AG2ProcessSnapshot>(CaptureError) : Task.FromResult(_snapshot);
@@ -498,6 +514,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             CancellationToken cancellationToken = default)
         {
             StopCount++;
+            OnStop?.Invoke();
             return StopError != null ? Task.FromException(StopError) : Task.CompletedTask;
         }
 

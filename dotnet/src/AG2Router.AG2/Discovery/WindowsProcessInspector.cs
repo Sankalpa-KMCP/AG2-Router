@@ -173,12 +173,15 @@ public class WindowsProcessInspector : IProcessInspector
                 try
                 {
                     var actualStart = proc.StartTime.ToUniversalTime();
-                    if (Math.Abs((actualStart - expectedStartTime.Value.ToUniversalTime()).TotalSeconds) > 2)
+                    if (actualStart != expectedStartTime.Value.ToUniversalTime())
                     {
                         return false; // PID was recycled
                     }
                 }
-                catch { }
+                catch
+                {
+                    return false;
+                }
             }
 
             return proc.ProcessName.Contains("language_server", StringComparison.OrdinalIgnoreCase);

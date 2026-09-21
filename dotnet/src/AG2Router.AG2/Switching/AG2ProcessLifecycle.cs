@@ -90,17 +90,18 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
             throw new AG2ProcessLifecycleException("Verified Antigravity executable no longer exists.");
         }
 
-        var info = new FileInfo(executable);
         var arguments = ParseWindowsCommandLine(process.CommandLine, executable);
+        var executableIdentity = await CaptureExecutableIdentityAsync(executable, cancellationToken)
+            .ConfigureAwait(false);
         return new AG2ProcessSnapshot(
             process.ProcessId,
             process.StartTime.Value.ToUniversalTime(),
             executable,
             arguments,
             SanitizeArguments(arguments),
-            info.Length,
-            info.LastWriteTimeUtc,
-            await ComputeSha256Async(executable, cancellationToken).ConfigureAwait(false),
+            executableIdentity.Length,
+            executableIdentity.LastWriteUtc,
+            executableIdentity.Sha256,
             _detector.CurrentGeneration);
     }
 
@@ -165,11 +166,14 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        await using var executableHandle = OpenExecutableReadLock(snapshot.ExecutablePath);
         var info = new FileInfo(snapshot.ExecutablePath);
+        info.Refresh();
+        string currentSha256 = await ComputeSha256Async(executableHandle, cancellationToken).ConfigureAwait(false);
         if (!info.Exists || info.Length != snapshot.ExecutableLength ||
             info.LastWriteTimeUtc != snapshot.ExecutableLastWriteUtc ||
             !CryptographicOperations.FixedTimeEquals(
-                Convert.FromHexString(await ComputeSha256Async(snapshot.ExecutablePath, cancellationToken).ConfigureAwait(false)),
+                Convert.FromHexString(currentSha256),
                 Convert.FromHexString(snapshot.ExecutableSha256)))
         {
             throw new AG2ProcessLifecycleException("Captured Antigravity executable changed after process snapshot.");
@@ -316,10 +320,24 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         !string.IsNullOrWhiteSpace(left) && !string.IsNullOrWhiteSpace(right) &&
         string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
 
-    private static async Task<string> ComputeSha256Async(string path, CancellationToken cancellationToken)
+    private static async Task<(long Length, DateTime LastWriteUtc, string Sha256)> CaptureExecutableIdentityAsync(
+        string path,
+        CancellationToken cancellationToken)
     {
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+        await using var stream = OpenExecutableReadLock(path);
+        var info = new FileInfo(path);
+        info.Refresh();
+        string sha256 = await ComputeSha256Async(stream, cancellationToken).ConfigureAwait(false);
+        return (info.Length, info.LastWriteTimeUtc, sha256);
+    }
+
+    private static FileStream OpenExecutableReadLock(string path) =>
+        new(path, FileMode.Open, FileAccess.Read, FileShare.Read,
             64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+    private static async Task<string> ComputeSha256Async(Stream stream, CancellationToken cancellationToken)
+    {
+        stream.Position = 0;
         byte[] digest = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
         return Convert.ToHexString(digest);
     }

@@ -95,11 +95,13 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         AG2ProcessSnapshot? processSnapshot = null;
         AG2ProcessGeneration? replacementGeneration = null;
         bool processTransitionStarted = false;
+        bool credentialWriteAttempted = false;
+        CrossProcessFileLease? switchLease = null;
 
         SetActive(transactionId, NativeSwitchStates.Preflight);
         try
         {
-            await using var lease = await CrossProcessFileLease
+            switchLease = await CrossProcessFileLease
                 .AcquireAsync(_sessionVault.GetVaultPath() + ".switch", cancellationToken)
                 .ConfigureAwait(false);
 
@@ -159,29 +161,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     $"Antigravity process provenance is unsafe: {AG2Security.SanitizeError(ex)}");
             }
 
-            var readCredential = await _winCredReader.ReadCredentialAsync(WinCredTarget, cancellationToken)
+            originalCredential = await CaptureCurrentCredentialAsync(previousEmail, cancellationToken)
                 .ConfigureAwait(false);
-            if (readCredential == null)
-            {
-                throw new SwitchRejectedException(
-                    SwitchResultCodes.TelemetryUnavailable,
-                    "Current credential is unavailable for rollback snapshotting.");
-            }
-            try
-            {
-                ValidateCredential(readCredential, requireConfiguredTarget: true);
-                originalCredential = CloneCredential(readCredential);
-                if (!string.Equals(originalCredential.UserName, previousEmail, StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new SwitchRejectedException(
-                        SwitchResultCodes.TelemetryUnavailable,
-                        "Current credential identity does not match verified telemetry.");
-                }
-            }
-            finally
-            {
-                ZeroCredential(readCredential);
-            }
             stages.Add("ROLLBACK_SNAPSHOT_CAPTURED");
 
             // Re-check both process generation and idle telemetry immediately before mutation.
@@ -223,14 +204,6 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     SwitchResultCodes.TargetNotVaulted,
                     "Target vaulted session is missing, empty, or outside credential bounds.");
             }
-            targetCredential = new WinCredEntry(
-                WinCredTarget,
-                originalCredential.Type,
-                target.Email,
-                originalCredential.Persistence,
-                targetSession);
-            ValidateCredential(targetCredential, requireConfiguredTarget: true);
-
             // Quiesce the verified source before changing its credential. This prevents the
             // old generation from racing the transaction by persisting a newer session.
             SetState(NativeSwitchStates.StoppingProcess);
@@ -239,7 +212,24 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 .ConfigureAwait(false);
             stages.Add("SOURCE_PROCESS_STOPPED");
 
+            // The source may have refreshed WinCred after the provisional preflight read.
+            // Once it is proven stopped, refresh the rollback snapshot before any overwrite.
+            var quiescedCredential = await CaptureCurrentCredentialAsync(previousEmail, cancellationToken)
+                .ConfigureAwait(false);
+            ZeroCredential(originalCredential);
+            originalCredential = quiescedCredential;
+            stages.Add("ROLLBACK_SNAPSHOT_REFRESHED_AFTER_QUIESCE");
+
+            targetCredential = new WinCredEntry(
+                WinCredTarget,
+                originalCredential.Type,
+                target.Email,
+                originalCredential.Persistence,
+                targetSession);
+            ValidateCredential(targetCredential, requireConfiguredTarget: true);
+
             SetState(NativeSwitchStates.ApplyingCredential);
+            credentialWriteAttempted = true;
             bool written = await _winCredWriter.WriteCredentialAsync(targetCredential, cancellationToken)
                 .ConfigureAwait(false);
             if (!written) throw new InvalidOperationException("Credential writer reported failure.");
@@ -294,7 +284,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
         catch (Exception switchError)
         {
-            if (!processTransitionStarted || originalCredential == null || targetCredential == null || processSnapshot == null)
+            if (!processTransitionStarted || originalCredential == null || processSnapshot == null)
             {
                 return Terminal(transactionId, false,
                     switchError is OperationCanceledException ? SwitchResultCodes.Cancelled : SwitchResultCodes.TelemetryUnavailable,
@@ -313,9 +303,18 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     CancellationToken.None).ConfigureAwait(false);
                 stages.Add("SWITCH_PROCESS_QUIESCED");
 
-                await RestoreCredentialConditionallyAsync(originalCredential, targetCredential)
-                    .ConfigureAwait(false);
-                stages.Add("ORIGINAL_CREDENTIAL_RESTORED");
+                if (credentialWriteAttempted)
+                {
+                    if (targetCredential == null)
+                        throw new InvalidOperationException("Applied credential snapshot was unavailable for rollback.");
+                    await RestoreCredentialConditionallyAsync(originalCredential, targetCredential)
+                        .ConfigureAwait(false);
+                    stages.Add("ORIGINAL_CREDENTIAL_RESTORED");
+                }
+                else
+                {
+                    stages.Add("CREDENTIAL_UNCHANGED");
+                }
 
                 var restoredGeneration = await _processLifecycle.RestoreAsync(
                     processSnapshot,
@@ -352,8 +351,41 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 ZeroCredential(targetCredential);
             }
             if (targetSession != null) CryptographicOperations.ZeroMemory(targetSession);
-            lock (_statusLock) { _activeTransactionId = null; }
-            SwitchGate.Release();
+            try
+            {
+                if (switchLease != null) await switchLease.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (_statusLock) { _activeTransactionId = null; }
+                SwitchGate.Release();
+            }
+        }
+    }
+
+    private async Task<WinCredEntry> CaptureCurrentCredentialAsync(
+        string? expectedEmail,
+        CancellationToken cancellationToken)
+    {
+        var readCredential = await _winCredReader.ReadCredentialAsync(WinCredTarget, cancellationToken)
+            .ConfigureAwait(false)
+            ?? throw new SwitchRejectedException(
+                SwitchResultCodes.TelemetryUnavailable,
+                "Current credential is unavailable for rollback snapshotting.");
+        try
+        {
+            ValidateCredential(readCredential, requireConfiguredTarget: true);
+            if (!string.Equals(readCredential.UserName, expectedEmail, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new SwitchRejectedException(
+                    SwitchResultCodes.TelemetryUnavailable,
+                    "Current credential identity does not match verified telemetry.");
+            }
+            return CloneCredential(readCredential);
+        }
+        finally
+        {
+            ZeroCredential(readCredential);
         }
     }
 

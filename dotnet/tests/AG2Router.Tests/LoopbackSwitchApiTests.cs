@@ -82,6 +82,28 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task SwitchEndpointRejectsDnsRebindingHostAndForeignOrigin()
+    {
+        await StartAsync();
+        using var rebound = new HttpRequestMessage(HttpMethod.Get, "/api/switching/status");
+        rebound.Headers.Host = "attacker.example";
+        using var reboundResponse = await _client.SendAsync(rebound);
+        Assert.Equal(HttpStatusCode.Forbidden, reboundResponse.StatusCode);
+
+        using var status = await _client.GetAsync("/api/switching/status");
+        string token = status.Headers.GetValues("X-AG2-Switch-Token").Single();
+        using var foreign = new HttpRequestMessage(HttpMethod.Post, "/api/accounts/acc_target/switch")
+        {
+            Content = JsonContent.Create(new ExplicitSwitchRequest(true))
+        };
+        foreign.Headers.Add("X-AG2-Switch-Token", token);
+        foreign.Headers.Add("Origin", "http://attacker.example");
+        using var foreignResponse = await _client.SendAsync(foreign);
+        Assert.Equal(HttpStatusCode.Forbidden, foreignResponse.StatusCode);
+        Assert.Equal(0, _coordinator.CallCount);
+    }
+
+    [Fact]
     public async Task SwitchingStatusUsesCoordinatorState()
     {
         await StartAsync();

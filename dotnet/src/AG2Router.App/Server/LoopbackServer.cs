@@ -67,6 +67,12 @@ public class LoopbackServer : IAsyncDisposable
                 await context.Response.WriteAsync("Forbidden: Loopback access only.", cancellationToken);
                 return;
             }
+            if (!IsAllowedLoopbackHost(context.Request.Host.Host))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                await context.Response.WriteAsync("Forbidden: Invalid loopback host.", cancellationToken);
+                return;
+            }
 
             context.Response.Headers.Append("X-Content-Type-Options", "nosniff");
             context.Response.Headers.Append("X-Frame-Options", "DENY");
@@ -309,6 +315,11 @@ public class LoopbackServer : IAsyncDisposable
             }
 
             string suppliedToken = context.Request.Headers["X-AG2-Switch-Token"].ToString();
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Explicit switch origin is not authorized." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
             if (!FixedTimeEquals(suppliedToken, switchIntentToken))
             {
                 return Results.Json(new { error = "Explicit switch authorization is required." },
@@ -393,6 +404,20 @@ public class LoopbackServer : IAsyncDisposable
             CryptographicOperations.ZeroMemory(suppliedBytes);
             CryptographicOperations.ZeroMemory(expectedBytes);
         }
+    }
+
+    private static bool IsAllowedLoopbackHost(string? host) =>
+        string.Equals(host, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsAllowedMutationOrigin(HttpContext context)
+    {
+        string origin = context.Request.Headers.Origin.ToString();
+        if (string.IsNullOrWhiteSpace(origin)) return true;
+        return Uri.TryCreate(origin, UriKind.Absolute, out var uri) &&
+            string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+            IsAllowedLoopbackHost(uri.Host) &&
+            uri.Port == context.Connection.LocalPort;
     }
 
     public async Task StopAsync(CancellationToken cancellationToken = default)
