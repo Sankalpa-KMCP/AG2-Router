@@ -8,6 +8,7 @@
 import {
   ActivitySnapshot,
   AG2AccountIdentity,
+  CanonicalModelQuotaInfo,
   CreditPoolInfo,
   ModelQuotaInfo,
   QuotaSnapshot,
@@ -146,11 +147,14 @@ export function normalizeQuotaSnapshot(raw?: RawUserStatusResponse | null): Quot
     };
   }
 
+  const canonicalModels = canonicalizeModelQuotas(models);
+
   return {
     timestamp: new Date().toISOString(),
     models,
     promptCredits,
-    flowCredits
+    flowCredits,
+    canonicalModels
   };
 }
 
@@ -183,4 +187,94 @@ export function normalizeActivitySnapshot(raw?: RawTrajectoriesResponse | null):
     runningTrajectories,
     timestamp: new Date().toISOString()
   };
+}
+
+const VARIANT_ANNOTATION_REGEX = /\s*\((?:thinking|reasoning)\)\s*$/i;
+
+export function cleanModelLabel(label?: string): string {
+  if (!label || !label.trim()) return 'Unknown Model';
+  const cleaned = label.replace(VARIANT_ANNOTATION_REGEX, '').trim();
+  return cleaned || 'Unknown Model';
+}
+
+export function extractMode(label?: string): string {
+  if (!label) return 'Standard';
+  if (/\(thinking\)/i.test(label)) return 'Thinking';
+  if (/\(reasoning\)/i.test(label)) return 'Reasoning';
+  return 'Standard';
+}
+
+export function selectLatestResetTime(resetTimes: Array<string | undefined>): string | undefined {
+  const valid = resetTimes
+    .filter((t): t is string => Boolean(t && t.trim()))
+    .map((t) => t.trim());
+  if (valid.length === 0) return undefined;
+  if (valid.length === 1) return valid[0];
+
+  return valid.reduce((latest, current) => {
+    const latestTime = Date.parse(latest);
+    const currentTime = Date.parse(current);
+    if (!Number.isNaN(latestTime) && !Number.isNaN(currentTime)) {
+      return currentTime > latestTime ? current : latest;
+    }
+    return current.localeCompare(latest) > 0 ? current : latest;
+  });
+}
+
+export function canonicalizeModelQuotas(models?: readonly ModelQuotaInfo[]): readonly CanonicalModelQuotaInfo[] {
+  if (!models || models.length === 0) {
+    return [];
+  }
+
+  const groups: Array<{ key: string; items: ModelQuotaInfo[] }> = [];
+  const keyIndex = new Map<string, number>();
+
+  for (const model of models) {
+    let key: string;
+    if (model.modelOrTier && model.modelOrTier.trim()) {
+      key = `tier:${model.modelOrTier.trim().toLowerCase()}`;
+    } else {
+      const cleaned = cleanModelLabel(model.label).toLowerCase();
+      const reset = model.resetTime && model.resetTime.trim() ? model.resetTime.trim() : 'none';
+      key = `label:${cleaned}:${reset}`;
+    }
+
+    const existingIndex = keyIndex.get(key);
+    if (existingIndex !== undefined) {
+      groups[existingIndex].items.push(model);
+    } else {
+      keyIndex.set(key, groups.length);
+      groups.push({ key, items: [model] });
+    }
+  }
+
+  return groups.map(({ key, items }) => {
+    let displayLabel = cleanModelLabel(items[0].label);
+    if (!displayLabel || displayLabel === 'Unknown Model') {
+      displayLabel = items[0].modelOrTier?.trim() || 'Unknown Model';
+    }
+
+    const modes: string[] = [];
+    for (const item of items) {
+      const mode = extractMode(item.label);
+      if (!modes.some((m) => m.toLowerCase() === mode.toLowerCase())) {
+        modes.push(mode);
+      }
+    }
+
+    const remainingFraction = Math.max(0, Math.min(1, Math.min(...items.map((m) => m.remainingFraction))));
+    const isExhausted = items.some((m) => m.isExhausted) || remainingFraction <= 0;
+    const resetTime = selectLatestResetTime(items.map((m) => m.resetTime));
+    const modelOrTier = items.find((m) => m.modelOrTier && m.modelOrTier.trim())?.modelOrTier?.trim();
+
+    return {
+      key,
+      label: displayLabel,
+      modelOrTier,
+      remainingFraction,
+      resetTime,
+      isExhausted,
+      modes
+    };
+  });
 }

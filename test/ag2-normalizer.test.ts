@@ -134,6 +134,265 @@ describe('AG2 Normalizer', () => {
       assert.equal(normalizeQuotaSnapshot(null), null);
       assert.equal(normalizeQuotaSnapshot({}), null);
     });
+
+    it('should deduplicate reasoning variants sharing modelOrTier and extract modes', () => {
+      const fixture: RawUserStatusResponse = {
+        userStatus: {
+          cascadeModelConfigData: {
+            clientModelConfigs: [
+              {
+                label: 'Gemini 2.5 Pro',
+                modelOrTier: 'gemini-2.5-pro',
+                quotaInfo: {
+                  remainingFraction: 0.85,
+                  resetTime: '2026-09-21T21:00:00Z',
+                  isExhausted: false
+                }
+              },
+              {
+                label: 'Gemini 2.5 Pro (Thinking)',
+                modelOrTier: 'gemini-2.5-pro',
+                quotaInfo: {
+                  remainingFraction: 0.85,
+                  resetTime: '2026-09-21T21:00:00Z',
+                  isExhausted: false
+                }
+              }
+            ]
+          }
+        }
+      };
+
+      const quota = normalizeQuotaSnapshot(fixture);
+      assert.ok(quota);
+      // Raw compatibility
+      assert.equal(quota.models.length, 2);
+
+      // Canonical deduplication
+      assert.ok(quota.canonicalModels);
+      assert.equal(quota.canonicalModels.length, 1);
+      const canonical = quota.canonicalModels[0];
+      assert.equal(canonical.key, 'tier:gemini-2.5-pro');
+      assert.equal(canonical.label, 'Gemini 2.5 Pro');
+      assert.equal(canonical.modelOrTier, 'gemini-2.5-pro');
+      assert.equal(canonical.remainingFraction, 0.85);
+      assert.equal(canonical.resetTime, '2026-09-21T21:00:00Z');
+      assert.equal(canonical.isExhausted, false);
+      assert.deepEqual(canonical.modes, ['Standard', 'Thinking']);
+    });
+
+    it('should never merge distinct modelOrTier even with similar labels or suffixes', () => {
+      const fixture: RawUserStatusResponse = {
+        userStatus: {
+          cascadeModelConfigData: {
+            clientModelConfigs: [
+              {
+                label: 'Gemini 3.8 Flash (High)',
+                modelOrTier: 'gemini-3.8-flash-high',
+                quotaInfo: { remainingFraction: 0.70 }
+              },
+              {
+                label: 'Gemini 3.1 Pro (High)',
+                modelOrTier: 'gemini-3.1-pro-high',
+                quotaInfo: { remainingFraction: 0.40 }
+              },
+              {
+                label: 'Identical Label Model',
+                modelOrTier: 'tier-alpha',
+                quotaInfo: { remainingFraction: 0.90 }
+              },
+              {
+                label: 'Identical Label Model',
+                modelOrTier: 'tier-beta',
+                quotaInfo: { remainingFraction: 0.90 }
+              }
+            ]
+          }
+        }
+      };
+
+      const quota = normalizeQuotaSnapshot(fixture);
+      assert.ok(quota?.canonicalModels);
+      assert.equal(quota.canonicalModels.length, 4);
+      assert.equal(quota.canonicalModels[0].label, 'Gemini 3.8 Flash (High)');
+      assert.equal(quota.canonicalModels[1].label, 'Gemini 3.1 Pro (High)');
+      assert.equal(quota.canonicalModels[2].key, 'tier:tier-alpha');
+      assert.equal(quota.canonicalModels[3].key, 'tier:tier-beta');
+    });
+
+    it('should safely merge by label fallback only when modelOrTier is missing and resetTimes match', () => {
+      const fixture: RawUserStatusResponse = {
+        userStatus: {
+          cascadeModelConfigData: {
+            clientModelConfigs: [
+              {
+                label: 'Claude 3.7 Sonnet',
+                quotaInfo: { remainingFraction: 0.60, resetTime: '2026-09-21T21:00:00Z' }
+              },
+              {
+                label: 'Claude 3.7 Sonnet (Thinking)',
+                quotaInfo: { remainingFraction: 0.60, resetTime: '2026-09-21T21:00:00Z' }
+              }
+            ]
+          }
+        }
+      };
+
+      const quota = normalizeQuotaSnapshot(fixture);
+      assert.ok(quota?.canonicalModels);
+      assert.equal(quota.canonicalModels.length, 1);
+      assert.equal(quota.canonicalModels[0].label, 'Claude 3.7 Sonnet');
+      assert.deepEqual(quota.canonicalModels[0].modes, ['Standard', 'Thinking']);
+    });
+
+    it('should not merge by label fallback when resetTimes differ', () => {
+      const fixture: RawUserStatusResponse = {
+        userStatus: {
+          cascadeModelConfigData: {
+            clientModelConfigs: [
+              {
+                label: 'Custom Pool',
+                quotaInfo: { remainingFraction: 0.50, resetTime: '2026-09-21T18:00:00Z' }
+              },
+              {
+                label: 'Custom Pool (Thinking)',
+                quotaInfo: { remainingFraction: 0.50, resetTime: '2026-09-28T00:00:00Z' }
+              }
+            ]
+          }
+        }
+      };
+
+      const quota = normalizeQuotaSnapshot(fixture);
+      assert.ok(quota?.canonicalModels);
+      assert.equal(quota.canonicalModels.length, 2);
+    });
+
+    it('should apply conservative conflict resolution (min fraction, OR exhausted, max resetTime)', () => {
+      const fixture: RawUserStatusResponse = {
+        userStatus: {
+          cascadeModelConfigData: {
+            clientModelConfigs: [
+              {
+                label: 'Conflicted Model',
+                modelOrTier: 'conflicted-model',
+                quotaInfo: {
+                  remainingFraction: 0.80,
+                  isExhausted: false,
+                  resetTime: '2026-09-21T18:00:00Z'
+                }
+              },
+              {
+                label: 'Conflicted Model (Reasoning)',
+                modelOrTier: 'conflicted-model',
+                quotaInfo: {
+                  remainingFraction: 0.30,
+                  isExhausted: true,
+                  resetTime: '2026-09-21T20:30:00Z'
+                }
+              }
+            ]
+          }
+        }
+      };
+
+      const quota = normalizeQuotaSnapshot(fixture);
+      assert.ok(quota?.canonicalModels);
+      assert.equal(quota.canonicalModels.length, 1);
+      const canonical = quota.canonicalModels[0];
+      assert.equal(canonical.remainingFraction, 0.30);
+      assert.equal(canonical.isExhausted, true);
+      assert.equal(canonical.resetTime, '2026-09-21T20:30:00Z');
+      assert.deepEqual(canonical.modes, ['Standard', 'Reasoning']);
+    });
+
+    it('should force isExhausted to true when remaining fraction is zero', () => {
+      const fixture: RawUserStatusResponse = {
+        userStatus: {
+          cascadeModelConfigData: {
+            clientModelConfigs: [
+              {
+                label: 'Zero Model',
+                modelOrTier: 'zero-model',
+                quotaInfo: { remainingFraction: 0.0, isExhausted: false }
+              }
+            ]
+          }
+        }
+      };
+
+      const quota = normalizeQuotaSnapshot(fixture);
+      assert.ok(quota?.canonicalModels);
+      assert.equal(quota.canonicalModels[0].isExhausted, true);
+      assert.equal(quota.canonicalModels[0].remainingFraction, 0.0);
+    });
+
+    it('should normalize real-world synthetic Connect-RPC payload with full model and credit segregation', () => {
+      const fixture: RawUserStatusResponse = {
+        userStatus: {
+          email: 'dev@example.com',
+          name: 'Developer Jane',
+          cascadeModelConfigData: {
+            clientModelConfigs: [
+              {
+                label: 'Gemini 2.5 Pro',
+                modelOrTier: 'gemini-2.5-pro',
+                quotaInfo: { remainingFraction: 0.90, resetTime: '2026-09-21T22:00:00Z' }
+              },
+              {
+                label: 'Gemini 2.5 Pro (Thinking)',
+                modelOrTier: 'gemini-2.5-pro',
+                quotaInfo: { remainingFraction: 0.90, resetTime: '2026-09-21T22:00:00Z' }
+              },
+              {
+                label: 'Claude 3.7 Sonnet',
+                modelOrTier: 'claude-3-7-sonnet',
+                quotaInfo: { remainingFraction: 0.45, resetTime: '2026-09-21T20:00:00Z' }
+              },
+              {
+                label: 'Claude 3.7 Sonnet (Thinking)',
+                modelOrTier: 'claude-3-7-sonnet',
+                quotaInfo: { remainingFraction: 0.45, resetTime: '2026-09-21T20:00:00Z' }
+              },
+              {
+                label: 'Gemini 2.5 Flash',
+                modelOrTier: 'gemini-2.5-flash',
+                quotaInfo: { remainingFraction: 1.0, resetTime: '2026-09-21T23:00:00Z' }
+              }
+            ]
+          },
+          planStatus: {
+            availablePromptCredits: 1500,
+            availableFlowCredits: 300,
+            planInfo: {
+              monthlyPromptCredits: 2000,
+              monthlyFlowCredits: 500,
+              planName: 'Google AI Pro'
+            }
+          }
+        }
+      };
+
+      const quota = normalizeQuotaSnapshot(fixture);
+      assert.ok(quota);
+      assert.equal(quota.models.length, 5);
+      assert.ok(quota.canonicalModels);
+      assert.equal(quota.canonicalModels.length, 3);
+
+      assert.equal(quota.canonicalModels[0].label, 'Gemini 2.5 Pro');
+      assert.deepEqual(quota.canonicalModels[0].modes, ['Standard', 'Thinking']);
+
+      assert.equal(quota.canonicalModels[1].label, 'Claude 3.7 Sonnet');
+      assert.deepEqual(quota.canonicalModels[1].modes, ['Standard', 'Thinking']);
+
+      assert.equal(quota.canonicalModels[2].label, 'Gemini 2.5 Flash');
+      assert.deepEqual(quota.canonicalModels[2].modes, ['Standard']);
+
+      assert.equal(quota.promptCredits?.availableCredits, 1500);
+      assert.equal(quota.promptCredits?.usedCredits, 500);
+      assert.equal(quota.flowCredits?.availableCredits, 300);
+      assert.equal(quota.flowCredits?.usedCredits, 200);
+    });
   });
 
   describe('normalizeActivitySnapshot', () => {

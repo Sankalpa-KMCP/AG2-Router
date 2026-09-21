@@ -68,6 +68,19 @@ export interface ModelQuotaInfo {
 }
 
 /**
+ * Deduplicated canonical model quota bucket grouping related execution/reasoning variants.
+ */
+export interface CanonicalModelQuotaInfo {
+  readonly key: string;
+  readonly label: string;
+  readonly modelOrTier?: string;
+  readonly remainingFraction: number;
+  readonly resetTime?: string;
+  readonly isExhausted: boolean;
+  readonly modes: readonly string[];
+}
+
+/**
  * Segregated prompt and flow credit telemetry.
  * Prompt and flow pools MUST NOT be combined or summed.
  */
@@ -85,6 +98,7 @@ export interface QuotaSnapshot {
   readonly models: readonly ModelQuotaInfo[];
   readonly promptCredits?: CreditPoolInfo;
   readonly flowCredits?: CreditPoolInfo;
+  readonly canonicalModels?: readonly CanonicalModelQuotaInfo[];
 }
 
 /**

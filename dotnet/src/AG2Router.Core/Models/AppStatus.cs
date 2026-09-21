@@ -59,7 +59,18 @@ public record QuotaSnapshotDto(
     string Timestamp,
     IReadOnlyList<ModelQuotaDto> Models,
     CreditPoolDto? PromptCredits,
-    CreditPoolDto? FlowCredits
+    CreditPoolDto? FlowCredits,
+    IReadOnlyList<CanonicalModelQuotaDto>? CanonicalModels = null
+);
+
+public record CanonicalModelQuotaDto(
+    string Key,
+    string Label,
+    string? ModelOrTier,
+    double RemainingFraction,
+    string? ResetTime,
+    bool IsExhausted,
+    IReadOnlyList<string> Modes
 );
 
 public record ModelQuotaDto(

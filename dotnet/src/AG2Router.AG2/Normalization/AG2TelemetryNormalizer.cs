@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using AG2Router.AG2.Rpc;
 using AG2Router.Core.Models;
 
@@ -88,11 +89,14 @@ public static class AG2TelemetryNormalizer
             );
         }
 
+        var canonicalModels = CanonicalizeModelQuotas(models);
+
         return new QuotaSnapshotDto(
             Timestamp: DateTime.UtcNow.ToString("o"),
             Models: models,
             PromptCredits: promptCredits,
-            FlowCredits: flowCredits
+            FlowCredits: flowCredits,
+            CanonicalModels: canonicalModels
         );
     }
 
@@ -118,5 +122,146 @@ public static class AG2TelemetryNormalizer
             RunningTrajectories: running,
             Timestamp: DateTime.UtcNow.ToString("o")
         );
+    }
+
+    private static readonly Regex VariantAnnotationRegex = new(
+        @"\s*\((?:thinking|reasoning)\)\s*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    public static string CleanModelLabel(string? label)
+    {
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            return "Unknown Model";
+        }
+
+        string cleaned = VariantAnnotationRegex.Replace(label, string.Empty).Trim();
+        return string.IsNullOrWhiteSpace(cleaned) ? "Unknown Model" : cleaned;
+    }
+
+    public static string ExtractMode(string? label)
+    {
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            return "Standard";
+        }
+
+        if (label.Contains("(thinking)", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Thinking";
+        }
+
+        if (label.Contains("(reasoning)", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Reasoning";
+        }
+
+        return "Standard";
+    }
+
+    public static string? SelectLatestResetTime(IEnumerable<string?> resetTimes)
+    {
+        var valid = resetTimes
+            .Where(t => !string.IsNullOrWhiteSpace(t))
+            .Select(t => t!.Trim())
+            .ToList();
+
+        if (valid.Count == 0) return null;
+        if (valid.Count == 1) return valid[0];
+
+        var parsed = new List<(string Raw, DateTimeOffset Parsed)>();
+        bool allParsed = true;
+        foreach (var t in valid)
+        {
+            if (DateTimeOffset.TryParse(t, out var dt))
+            {
+                parsed.Add((t, dt));
+            }
+            else
+            {
+                allParsed = false;
+                break;
+            }
+        }
+
+        if (allParsed && parsed.Count == valid.Count)
+        {
+            return parsed.MaxBy(p => p.Parsed).Raw;
+        }
+
+        return valid.OrderByDescending(s => s, StringComparer.Ordinal).First();
+    }
+
+    public static IReadOnlyList<CanonicalModelQuotaDto> CanonicalizeModelQuotas(IReadOnlyList<ModelQuotaDto>? models)
+    {
+        if (models == null || models.Count == 0)
+        {
+            return Array.Empty<CanonicalModelQuotaDto>();
+        }
+
+        var groups = new List<(string Key, List<ModelQuotaDto> Items)>();
+        var keyIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        foreach (var model in models)
+        {
+            string key;
+            if (!string.IsNullOrWhiteSpace(model.ModelOrTier))
+            {
+                key = $"tier:{model.ModelOrTier.Trim().ToLowerInvariant()}";
+            }
+            else
+            {
+                string cleanLabel = CleanModelLabel(model.Label).ToLowerInvariant();
+                string reset = string.IsNullOrWhiteSpace(model.ResetTime) ? "none" : model.ResetTime.Trim();
+                key = $"label:{cleanLabel}:{reset}";
+            }
+
+            if (keyIndex.TryGetValue(key, out int index))
+            {
+                groups[index].Items.Add(model);
+            }
+            else
+            {
+                keyIndex[key] = groups.Count;
+                groups.Add((key, new List<ModelQuotaDto> { model }));
+            }
+        }
+
+        var canonical = new List<CanonicalModelQuotaDto>(groups.Count);
+        foreach (var (key, items) in groups)
+        {
+            string displayLabel = CleanModelLabel(items[0].Label);
+            if (string.IsNullOrWhiteSpace(displayLabel) || displayLabel == "Unknown Model")
+            {
+                displayLabel = items[0].ModelOrTier?.Trim() ?? "Unknown Model";
+            }
+
+            var modes = new List<string>();
+            foreach (var item in items)
+            {
+                string mode = ExtractMode(item.Label);
+                if (!modes.Contains(mode, StringComparer.OrdinalIgnoreCase))
+                {
+                    modes.Add(mode);
+                }
+            }
+
+            double remainingFraction = Math.Clamp(items.Min(m => m.RemainingFraction), 0.0, 1.0);
+            bool isExhausted = items.Any(m => m.IsExhausted) || remainingFraction <= 0.0;
+            string? resetTime = SelectLatestResetTime(items.Select(m => m.ResetTime));
+            string? modelOrTier = items.FirstOrDefault(m => !string.IsNullOrWhiteSpace(m.ModelOrTier))?.ModelOrTier?.Trim();
+
+            canonical.Add(new CanonicalModelQuotaDto(
+                Key: key,
+                Label: displayLabel,
+                ModelOrTier: modelOrTier,
+                RemainingFraction: remainingFraction,
+                ResetTime: resetTime,
+                IsExhausted: isExhausted,
+                Modes: modes
+            ));
+        }
+
+        return canonical;
     }
 }
