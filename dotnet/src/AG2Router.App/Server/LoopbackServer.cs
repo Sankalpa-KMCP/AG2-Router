@@ -129,7 +129,7 @@ public class LoopbackServer : IAsyncDisposable
         {
             if (accountStore == null)
             {
-                return Results.Ok(new AccountsListDto(Array.Empty<AccountMetadata>()));
+                return Results.Ok(new AccountsListDto(Array.Empty<AccountMetadata>(), 0, null));
             }
 
             var accounts = await accountStore.ListAccountsAsync();
@@ -151,12 +151,20 @@ public class LoopbackServer : IAsyncDisposable
                 });
             }
 
-            return Results.Ok(new AccountsListDto(enriched));
+            return Results.Ok(new AccountsListDto(enriched, enriched.Count, activeId));
         });
 
         // POST /api/accounts - Register account metadata
         _app.MapPost("/api/accounts", async (HttpContext context) =>
         {
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Unauthorized origin." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (string.Equals(context.Request.Headers["Sec-Fetch-Site"], "cross-site", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.Json(new { error = "Cross-site requests forbidden." }, statusCode: StatusCodes.Status403Forbidden);
+            }
             if (accountStore == null)
             {
                 return Results.Json(new { error = "Account store is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
@@ -191,6 +199,10 @@ public class LoopbackServer : IAsyncDisposable
         // POST /api/accounts/enroll-current - Safely enroll active account from telemetry and WinCred
         _app.MapPost("/api/accounts/enroll-current", async (HttpContext context) =>
         {
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Unauthorized origin." }, statusCode: StatusCodes.Status403Forbidden);
+            }
             if (enrollmentService == null)
             {
                 return Results.Json(new { error = "Account enrollment service is not configured" }, statusCode: StatusCodes.Status501NotImplemented);
@@ -230,9 +242,80 @@ public class LoopbackServer : IAsyncDisposable
             }
         });
 
-        // DELETE /api/accounts/{id} - Remove account metadata and vaulted session
-        _app.MapDelete("/api/accounts/{id}", async (string id) =>
+        // PATCH /api/accounts/{id} - Update or clear account alias
+        _app.MapPatch("/api/accounts/{id}", async (string id, HttpContext context) =>
         {
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Unauthorized origin." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (string.Equals(context.Request.Headers["Sec-Fetch-Site"], "cross-site", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.Json(new { error = "Cross-site requests forbidden." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (accountStore == null)
+            {
+                return Results.Json(new { error = "Account store is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            }
+            if (string.IsNullOrWhiteSpace(id) || id.Contains('/') || id.Contains('\\'))
+            {
+                return Results.Json(new { error = "Account ID required" }, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            var existing = await accountStore.GetAccountAsync(id);
+            if (existing == null)
+            {
+                return Results.Json(new { error = "Account not found" }, statusCode: StatusCodes.Status404NotFound);
+            }
+
+            UpdateAccountAliasRequest? request;
+            try
+            {
+                request = await context.Request.ReadFromJsonAsync<UpdateAccountAliasRequest>(cancellationToken: context.RequestAborted);
+            }
+            catch (Exception)
+            {
+                return Results.Json(new { error = "Invalid JSON payload" }, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            if (request == null)
+            {
+                return Results.Json(new { error = "Invalid JSON payload" }, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            string? normalizedAlias = string.IsNullOrWhiteSpace(request.Alias) ? "" : request.Alias.Trim();
+            var updated = await accountStore.UpdateAccountAsync(id, new UpdateAccountInput(Alias: normalizedAlias));
+            if (updated == null)
+            {
+                return Results.Json(new { error = "Account not found" }, statusCode: StatusCodes.Status404NotFound);
+            }
+
+            bool hasVaulted = updated.HasVaultedSession;
+            if (!hasVaulted && sessionVault != null)
+            {
+                hasVaulted = await sessionVault.HasSessionAsync(updated.Id);
+            }
+            var activeId = await accountStore.GetActiveAccountIdAsync();
+            var enriched = updated with
+            {
+                HasVaultedSession = hasVaulted,
+                IsActive = updated.Id == activeId
+            };
+
+            return Results.Ok(new { success = true, account = enriched });
+        });
+
+        // DELETE /api/accounts/{id} - Remove account metadata and vaulted session
+        _app.MapDelete("/api/accounts/{id}", async (string id, HttpContext context) =>
+        {
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Unauthorized origin." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (string.Equals(context.Request.Headers["Sec-Fetch-Site"], "cross-site", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.Json(new { error = "Cross-site requests forbidden." }, statusCode: StatusCodes.Status403Forbidden);
+            }
             if (accountStore == null)
             {
                 return Results.Json(new { error = "Account store is not configured." }, statusCode: StatusCodes.Status501NotImplemented);

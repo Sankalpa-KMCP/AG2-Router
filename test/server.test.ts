@@ -488,4 +488,187 @@ describe('AppServer (Loopback HTTP & API)', () => {
       await plannerServer.stop();
     }
   });
+
+  it('should expose totalCount, activeAccountId, and alias in GET /api/accounts', async () => {
+    const acc1 = await accountStore.addAccount({ email: 'first@example.com', name: 'First User' });
+    const acc2 = await accountStore.addAccount({ email: 'second@example.com', name: 'Second User', alias: 'Backup' });
+    await accountStore.setActiveAccountId(acc2.id);
+
+    try {
+      const res = await request('/api/accounts');
+      assert.equal(res.status, 200);
+      const data = JSON.parse(res.body);
+
+      assert.equal(data.totalCount, 2);
+      assert.equal(data.activeAccountId, acc2.id);
+      assert.equal(data.accounts.length, 2);
+
+      const a1 = data.accounts.find((a: any) => a.id === acc1.id);
+      assert.equal(a1.isActive, false);
+      assert.equal(a1.alias, undefined);
+
+      const a2 = data.accounts.find((a: any) => a.id === acc2.id);
+      assert.equal(a2.isActive, true);
+      assert.equal(a2.alias, 'Backup');
+    } finally {
+      await accountStore.removeAccount(acc1.id);
+      await accountStore.removeAccount(acc2.id);
+      await accountStore.setActiveAccountId(null);
+    }
+  });
+
+  it('should handle PATCH /api/accounts/:id alias mutations (update, trim, clear, and security)', async () => {
+    const acc = await accountStore.addAccount({ email: 'patch_test@example.com', name: 'Patch Target' });
+
+    try {
+      // 1. Update with trimming
+      const updateRes = await request(`/api/accounts/${acc.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alias: '   Work Production   ' })
+      });
+      assert.equal(updateRes.status, 200);
+      const updateData = JSON.parse(updateRes.body);
+      assert.equal(updateData.success, true);
+      assert.equal(updateData.account.alias, 'Work Production');
+      assert.equal(updateData.account.email, 'patch_test@example.com');
+      assert.equal(updateData.account.name, 'Patch Target');
+
+      // Verify store persisted
+      const loaded1 = await accountStore.getAccount(acc.id);
+      assert.equal(loaded1?.alias, 'Work Production');
+
+      // 2. Whitespace clears alias
+      const clearWsRes = await request(`/api/accounts/${acc.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alias: '   ' })
+      });
+      assert.equal(clearWsRes.status, 200);
+      const clearWsData = JSON.parse(clearWsRes.body);
+      assert.equal(clearWsData.account.alias, undefined);
+
+      // 3. Null clears alias
+      await accountStore.updateAccount(acc.id, { alias: 'Temporary' });
+      const clearNullRes = await request(`/api/accounts/${acc.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alias: null })
+      });
+      assert.equal(clearNullRes.status, 200);
+      const clearNullData = JSON.parse(clearNullRes.body);
+      assert.equal(clearNullData.account.alias, undefined);
+
+      // 4. Unknown account returns 404
+      const notFoundRes = await request('/api/accounts/non_existent_id', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alias: 'New' })
+      });
+      assert.equal(notFoundRes.status, 404);
+
+      // 5. Malformed payload returns 400
+      const malformedRes = await request(`/api/accounts/${acc.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{ not valid json'
+      });
+      assert.equal(malformedRes.status, 400);
+
+      // 6. Invalid alias type returns 400
+      const invalidTypeRes = await request(`/api/accounts/${acc.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alias: 12345 })
+      });
+      assert.equal(invalidTypeRes.status, 400);
+
+      // 7. Unauthorized origin rejected with 403
+      const foreignRes = await request(`/api/accounts/${acc.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Origin: 'http://evil.com' },
+        body: JSON.stringify({ alias: 'Hacked' })
+      });
+      assert.equal(foreignRes.status, 403);
+
+      // 8. Sec-Fetch-Site cross-site rejected with 403
+      const crossSiteRes = await request(`/api/accounts/${acc.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'cross-site' },
+        body: JSON.stringify({ alias: 'CrossSite' })
+      });
+      assert.equal(crossSiteRes.status, 403);
+    } finally {
+      await accountStore.removeAccount(acc.id);
+    }
+  });
+
+  it('should expose canonical quota models in GET /api/status when adapter supplies them', async () => {
+    const customAdapter: any = {
+      discover: async () => ({ isRunning: true, status: 'CONNECTED' }),
+      getCurrentAccount: async () => ({ email: 'dev@example.com', name: 'Dev' }),
+      getQuota: async () => ({
+        timestamp: '2026-09-21T18:00:00Z',
+        models: [
+          { label: 'Gemini 2.5 Pro', modelOrTier: 'gemini-2.5-pro', remainingFraction: 0.85, isExhausted: false },
+          { label: 'Gemini 2.5 Pro (Thinking)', modelOrTier: 'gemini-2.5-pro', remainingFraction: 0.85, isExhausted: false }
+        ],
+        promptCredits: { availableCredits: 1000, monthlyCredits: 2000, usedCredits: 1000 },
+        flowCredits: { availableCredits: 200, monthlyCredits: 500, usedCredits: 300 },
+        canonicalModels: [
+          {
+            key: 'tier:gemini-2.5-pro',
+            label: 'Gemini 2.5 Pro',
+            modelOrTier: 'gemini-2.5-pro',
+            remainingFraction: 0.85,
+            isExhausted: false,
+            modes: ['Standard', 'Thinking']
+          }
+        ]
+      }),
+      getActivityState: async () => ({ state: 'IDLE', totalTrajectories: 0, runningTrajectories: 0, timestamp: '' })
+    };
+
+    const quotaServer = new AppServer(
+      { ...testConfig, port: testPort + 4 },
+      accountStore,
+      customAdapter,
+      router
+    );
+
+    await quotaServer.start();
+    try {
+      const res = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: testPort + 4,
+            path: '/api/status',
+            method: 'GET'
+          },
+          (r) => {
+            let b = '';
+            r.on('data', (c) => (b += c));
+            r.on('end', () => resolve({ status: r.statusCode || 0, body: b }));
+          }
+        );
+        req.on('error', reject);
+        req.end();
+      });
+
+      assert.equal(res.status, 200);
+      const json = JSON.parse(res.body);
+      const quota = json.telemetry.quota;
+
+      assert.equal(quota.models.length, 2);
+      assert.equal(quota.canonicalModels.length, 1);
+      assert.equal(quota.canonicalModels[0].key, 'tier:gemini-2.5-pro');
+      assert.equal(quota.canonicalModels[0].label, 'Gemini 2.5 Pro');
+      assert.deepEqual(quota.canonicalModels[0].modes, ['Standard', 'Thinking']);
+      assert.equal(quota.promptCredits.availableCredits, 1000);
+      assert.equal(quota.flowCredits.availableCredits, 200);
+    } finally {
+      await quotaServer.stop();
+    }
+  });
 });

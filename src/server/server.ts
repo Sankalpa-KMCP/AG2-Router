@@ -106,6 +106,26 @@ export class AppServer {
     );
   }
 
+  private isAllowedLoopbackHost(host?: string): boolean {
+    if (!host) return false;
+    const cleanHost = host.split(':')[0].toLowerCase();
+    return cleanHost === '127.0.0.1' || cleanHost === 'localhost';
+  }
+
+  private isAllowedMutationOrigin(req: http.IncomingMessage): boolean {
+    const origin = req.headers.origin;
+    if (!origin) return true;
+    try {
+      const url = new URL(origin);
+      if (url.protocol !== 'http:') return false;
+      if (!this.isAllowedLoopbackHost(url.hostname)) return false;
+      const port = url.port ? parseInt(url.port, 10) : 80;
+      return port === this.config.port;
+    } catch {
+      return false;
+    }
+  }
+
   private applySecurityHeaders(res: http.ServerResponse): void {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
@@ -153,6 +173,12 @@ export class AppServer {
     if (!this.isLoopback(req.socket.remoteAddress)) {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('Forbidden: loopback access only.');
+      return;
+    }
+
+    if (!this.isAllowedLoopbackHost(req.headers.host)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden: Invalid loopback host.');
       return;
     }
 
@@ -286,12 +312,24 @@ export class AppServer {
           };
         })
       );
-      this.sendJson(res, 200, { accounts: enriched });
+      this.sendJson(res, 200, {
+        accounts: enriched,
+        totalCount: enriched.length,
+        activeAccountId: activeId || null
+      });
       return;
     }
 
     // POST /api/accounts
     if (pathname === '/api/accounts' && method === 'POST') {
+      if (!this.isAllowedMutationOrigin(req)) {
+        this.sendJson(res, 403, { error: 'Unauthorized origin.' });
+        return;
+      }
+      if (req.headers['sec-fetch-site'] === 'cross-site') {
+        this.sendJson(res, 403, { error: 'Cross-site requests forbidden.' });
+        return;
+      }
       try {
         const body = (await this.readBodyJson(req)) as Record<string, unknown>;
         if (!body || typeof body.email !== 'string' || !body.email.includes('@')) {
@@ -313,6 +351,68 @@ export class AppServer {
         const message = err instanceof Error ? err.message : 'Failed to create account';
         this.sendJson(res, 400, { error: message });
       }
+      return;
+    }
+
+    // PATCH /api/accounts/:id - Update or clear account alias
+    if (pathname.startsWith('/api/accounts/') && method === 'PATCH') {
+      const id = pathname.slice('/api/accounts/'.length).trim();
+      if (!this.isAllowedMutationOrigin(req)) {
+        this.sendJson(res, 403, { error: 'Unauthorized origin.' });
+        return;
+      }
+      if (req.headers['sec-fetch-site'] === 'cross-site') {
+        this.sendJson(res, 403, { error: 'Cross-site requests forbidden.' });
+        return;
+      }
+      if (!id || id.includes('/') || id.includes('\\')) {
+        this.sendJson(res, 400, { error: 'Account ID required' });
+        return;
+      }
+
+      const existing = await this.accountStore.getAccount(id);
+      if (!existing) {
+        this.sendJson(res, 404, { error: 'Account not found' });
+        return;
+      }
+
+      let body: Record<string, unknown>;
+      try {
+        body = (await this.readBodyJson(req)) as Record<string, unknown>;
+      } catch {
+        this.sendJson(res, 400, { error: 'Invalid JSON payload' });
+        return;
+      }
+
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        this.sendJson(res, 400, { error: 'Invalid JSON payload' });
+        return;
+      }
+
+      if (body.alias !== undefined && body.alias !== null && typeof body.alias !== 'string') {
+        this.sendJson(res, 400, { error: 'Invalid alias: must be a string or null' });
+        return;
+      }
+
+      const rawAlias = typeof body.alias === 'string' ? body.alias.trim() : '';
+      const updated = await this.accountStore.updateAccount(id, { alias: rawAlias });
+      if (!updated) {
+        this.sendJson(res, 404, { error: 'Account not found' });
+        return;
+      }
+
+      let hasVaulted = updated.hasVaultedSession;
+      if (hasVaulted === undefined && this.sessionVault) {
+        hasVaulted = await this.sessionVault.hasSession(updated.id);
+      }
+      const activeId = await this.accountStore.getActiveAccountId();
+      const enriched = {
+        ...updated,
+        hasVaultedSession: Boolean(hasVaulted),
+        isActive: updated.id === activeId
+      };
+
+      this.sendJson(res, 200, { success: true, account: enriched });
       return;
     }
 
@@ -356,8 +456,16 @@ export class AppServer {
 
     // DELETE /api/accounts/:id
     if (pathname.startsWith('/api/accounts/') && method === 'DELETE') {
+      if (!this.isAllowedMutationOrigin(req)) {
+        this.sendJson(res, 403, { error: 'Unauthorized origin.' });
+        return;
+      }
+      if (req.headers['sec-fetch-site'] === 'cross-site') {
+        this.sendJson(res, 403, { error: 'Cross-site requests forbidden.' });
+        return;
+      }
       const id = pathname.slice('/api/accounts/'.length).trim();
-      if (!id || id.includes('/')) {
+      if (!id || id.includes('/') || id.includes('\\')) {
         this.sendJson(res, 400, { error: 'Account ID required' });
         return;
       }

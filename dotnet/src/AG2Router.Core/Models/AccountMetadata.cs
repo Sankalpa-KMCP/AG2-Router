@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AG2Router.Core.Models;
 
 public record AccountMetadata(
@@ -17,7 +19,13 @@ public record AccountMetadata(
 );
 
 public record AccountsListDto(
-    IReadOnlyList<AccountMetadata> Accounts
+    IReadOnlyList<AccountMetadata> Accounts,
+    int TotalCount = 0,
+    string? ActiveAccountId = null
+);
+
+public record UpdateAccountAliasRequest(
+    [property: JsonPropertyName("alias")] string? Alias
 );
 
 public record SwitchingStatusDto(

@@ -187,4 +187,267 @@ public class LoopbackServerAccountApiTests : IAsyncDisposable
         var json = await response.Content.ReadAsStringAsync();
         Assert.Contains("Native account switching is not configured", json);
     }
+
+    [Fact]
+    public async Task GetAccounts_IncludesAliasTotalCountAndActiveAccountId_WithoutExposingSecrets()
+    {
+        await EnsureServerStartedAsync();
+
+        var acc1 = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: "legacy@example.com",
+            Name: "Legacy Account",
+            Priority: 1
+        ));
+
+        var acc2 = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: "aliased@example.com",
+            Name: "Aliased Account",
+            Priority: 2,
+            Alias: "Work"
+        ));
+
+        await _accountStore.SetActiveAccountIdAsync(acc2.Id);
+
+        var response = await _client.GetAsync("/api/accounts");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        Assert.Equal(2, root.GetProperty("totalCount").GetInt32());
+        Assert.Equal(acc2.Id, root.GetProperty("activeAccountId").GetString());
+
+        var accounts = root.GetProperty("accounts");
+        Assert.Equal(2, accounts.GetArrayLength());
+
+        var first = accounts[0];
+        Assert.Equal(acc1.Id, first.GetProperty("id").GetString());
+        Assert.False(first.GetProperty("isActive").GetBoolean());
+        Assert.True(first.TryGetProperty("alias", out var a1) ? a1.ValueKind == JsonValueKind.Null : true);
+
+        var second = accounts[1];
+        Assert.Equal(acc2.Id, second.GetProperty("id").GetString());
+        Assert.True(second.GetProperty("isActive").GetBoolean());
+        Assert.Equal("Work", second.GetProperty("alias").GetString());
+
+        // Prove no session blobs, tokens, or DPAPI payloads are exposed
+        Assert.DoesNotContain("session-blob", json);
+        Assert.DoesNotContain("token", json);
+        Assert.DoesNotContain("dpapi", json);
+    }
+
+    [Fact]
+    public async Task PatchAccountAlias_WithValidTrimmedString_UpdatesAliasAndPersists()
+    {
+        await EnsureServerStartedAsync();
+
+        var acc = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: "to_alias@example.com",
+            Name: "Target Name",
+            Priority: 1
+        ));
+        await _sessionVault.SaveSessionAsync(acc.Id, "session-blob-secret"u8.ToArray());
+
+        var payload = new { alias = "  Production Primary  " };
+        var response = await _client.PatchAsJsonAsync($"/api/accounts/{acc.Id}", payload);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        Assert.True(doc.RootElement.GetProperty("success").GetBoolean());
+        var account = doc.RootElement.GetProperty("account");
+        Assert.Equal("Production Primary", account.GetProperty("alias").GetString());
+        Assert.Equal("to_alias@example.com", account.GetProperty("email").GetString());
+        Assert.Equal("Target Name", account.GetProperty("name").GetString());
+        Assert.True(account.GetProperty("hasVaultedSession").GetBoolean());
+
+        // Verify persisted state in store
+        var loaded = await _accountStore.GetAccountAsync(acc.Id);
+        Assert.NotNull(loaded);
+        Assert.Equal("Production Primary", loaded.Alias);
+        Assert.Equal("Target Name", loaded.Name);
+
+        // Verify session vault was not touched or corrupted
+        var session = await _sessionVault.GetSessionAsync(acc.Id);
+        Assert.NotNull(session);
+        Assert.Equal("session-blob-secret", Encoding.UTF8.GetString(session));
+    }
+
+    [Fact]
+    public async Task PatchAccountAlias_WithEmptyOrWhitespace_ClearsAlias()
+    {
+        await EnsureServerStartedAsync();
+
+        var acc = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: "clear_me@example.com",
+            Alias: "Existing Alias"
+        ));
+
+        // 1. Whitespace clears alias
+        var wsResponse = await _client.PatchAsJsonAsync($"/api/accounts/{acc.Id}", new { alias = "   " });
+        Assert.Equal(HttpStatusCode.OK, wsResponse.StatusCode);
+
+        var wsJson = await wsResponse.Content.ReadAsStringAsync();
+        using var wsDoc = JsonDocument.Parse(wsJson);
+        Assert.True(wsDoc.RootElement.GetProperty("account").TryGetProperty("alias", out var a1) ? a1.ValueKind == JsonValueKind.Null : true);
+
+        var loaded1 = await _accountStore.GetAccountAsync(acc.Id);
+        Assert.Null(loaded1?.Alias);
+
+        // Re-set alias
+        await _accountStore.UpdateAccountAsync(acc.Id, new UpdateAccountInput(Alias: "Temp"));
+
+        // 2. Empty string clears alias
+        var emptyResponse = await _client.PatchAsJsonAsync($"/api/accounts/{acc.Id}", new { alias = "" });
+        Assert.Equal(HttpStatusCode.OK, emptyResponse.StatusCode);
+
+        var loaded2 = await _accountStore.GetAccountAsync(acc.Id);
+        Assert.Null(loaded2?.Alias);
+    }
+
+    [Fact]
+    public async Task PatchAccountAlias_WithNull_ClearsAlias()
+    {
+        await EnsureServerStartedAsync();
+
+        var acc = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: "null_clear@example.com",
+            Alias: "Initial Alias"
+        ));
+
+        var response = await _client.PatchAsJsonAsync($"/api/accounts/{acc.Id}", new { alias = (string?)null });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var loaded = await _accountStore.GetAccountAsync(acc.Id);
+        Assert.Null(loaded?.Alias);
+    }
+
+    [Fact]
+    public async Task PatchAccountAlias_WithUnknownId_Returns404()
+    {
+        await EnsureServerStartedAsync();
+
+        var response = await _client.PatchAsJsonAsync("/api/accounts/non_existent_id", new { alias = "New" });
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchAccountAlias_WithInvalidJsonOrPayload_Returns400()
+    {
+        await EnsureServerStartedAsync();
+
+        var acc = await _accountStore.AddAccountAsync(new CreateAccountInput(Email: "malformed@example.com"));
+
+        // 1. Invalid JSON
+        using var badContent = new StringContent("{ not-json }", Encoding.UTF8, "application/json");
+        var badRes = await _client.PatchAsync($"/api/accounts/{acc.Id}", badContent);
+        Assert.Equal(HttpStatusCode.BadRequest, badRes.StatusCode);
+
+        // 2. Invalid ID traversal
+        var travRes = await _client.PatchAsJsonAsync("/api/accounts/bad%5Cid", new { alias = "Test" });
+        Assert.Equal(HttpStatusCode.BadRequest, travRes.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchAccountAlias_CrossSiteOrForeignOrigin_Returns403()
+    {
+        await EnsureServerStartedAsync();
+
+        var acc = await _accountStore.AddAccountAsync(new CreateAccountInput(Email: "sec_test@example.com"));
+
+        // 1. Foreign origin
+        using var foreignReq = new HttpRequestMessage(HttpMethod.Patch, $"/api/accounts/{acc.Id}")
+        {
+            Content = JsonContent.Create(new { alias = "Hacked" })
+        };
+        foreignReq.Headers.Add("Origin", "http://evil.com");
+        var foreignRes = await _client.SendAsync(foreignReq);
+        Assert.Equal(HttpStatusCode.Forbidden, foreignRes.StatusCode);
+
+        // 2. Sec-Fetch-Site cross-site
+        using var crossSiteReq = new HttpRequestMessage(HttpMethod.Patch, $"/api/accounts/{acc.Id}")
+        {
+            Content = JsonContent.Create(new { alias = "CrossSite" })
+        };
+        crossSiteReq.Headers.Add("Sec-Fetch-Site", "cross-site");
+        var crossSiteRes = await _client.SendAsync(crossSiteReq);
+        Assert.Equal(HttpStatusCode.Forbidden, crossSiteRes.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetStatus_ExposesCanonicalQuotaModels_WhilePreservingRawModelsAndCredits()
+    {
+        var server = new LoopbackServer();
+        try
+        {
+            var rawModels = new List<ModelQuotaDto>
+            {
+                new("Gemini 2.5 Pro", "gemini-2.5-pro", 0.90, "2026-09-21T22:00:00Z", false),
+                new("Gemini 2.5 Pro (Thinking)", "gemini-2.5-pro", 0.90, "2026-09-21T22:00:00Z", false)
+            };
+            var canonicalModels = new List<CanonicalModelQuotaDto>
+            {
+                new("tier:gemini-2.5-pro", "Gemini 2.5 Pro", "gemini-2.5-pro", 0.90, "2026-09-21T22:00:00Z", false, ["Standard", "Thinking"])
+            };
+            var quotaSnapshot = new QuotaSnapshotDto(
+                Timestamp: "2026-09-21T18:00:00Z",
+                Models: rawModels,
+                PromptCredits: new CreditPoolDto(1500, 2000, 500),
+                FlowCredits: new CreditPoolDto(300, 500, 200),
+                CanonicalModels: canonicalModels
+            );
+
+            var systemStatus = new SystemStatusDto(
+                Status: "ok",
+                Ag2: new Ag2StatusDto(true, "CONNECTED", null, "Antigravity 2 Connected"),
+                Router: new RouterStatusDto("IDLE", false, null, null, null, null, "Idle", new RouterConfigDto()),
+                Telemetry: new TelemetryDto(
+                    CurrentAccount: new AccountIdentityDto("dev@example.com", "Dev"),
+                    Quota: quotaSnapshot,
+                    Activity: null,
+                    TotalAvailableQuotaPercent: null,
+                    LastSuccessfulTelemetry: "2026-09-21T18:00:00Z"
+                )
+            );
+
+            await server.StartAsync(0, statusProvider: () => systemStatus);
+            using var client = new HttpClient { BaseAddress = new Uri(server.BoundUrl) };
+
+            var response = await client.GetAsync("/api/status");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var quotaElem = doc.RootElement.GetProperty("telemetry").GetProperty("quota");
+
+            // 1. Raw models preserved
+            var rawElem = quotaElem.GetProperty("models");
+            Assert.Equal(2, rawElem.GetArrayLength());
+
+            // 2. Canonical models exposed
+            var canonicalElem = quotaElem.GetProperty("canonicalModels");
+            Assert.Equal(1, canonicalElem.GetArrayLength());
+            var c0 = canonicalElem[0];
+            Assert.Equal("tier:gemini-2.5-pro", c0.GetProperty("key").GetString());
+            Assert.Equal("Gemini 2.5 Pro", c0.GetProperty("label").GetString());
+            Assert.Equal(0.90, c0.GetProperty("remainingFraction").GetDouble(), 2);
+            Assert.False(c0.GetProperty("isExhausted").GetBoolean());
+            Assert.Equal(2, c0.GetProperty("modes").GetArrayLength());
+
+            // 3. Credit pools segregated
+            var promptElem = quotaElem.GetProperty("promptCredits");
+            Assert.Equal(1500, promptElem.GetProperty("availableCredits").GetInt32());
+            Assert.Equal(2000, promptElem.GetProperty("monthlyCredits").GetInt32());
+
+            var flowElem = quotaElem.GetProperty("flowCredits");
+            Assert.Equal(300, flowElem.GetProperty("availableCredits").GetInt32());
+            Assert.Equal(500, flowElem.GetProperty("monthlyCredits").GetInt32());
+        }
+        finally
+        {
+            await server.StopAsync();
+            await server.DisposeAsync();
+        }
+    }
 }
