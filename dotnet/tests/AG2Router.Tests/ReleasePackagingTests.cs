@@ -248,4 +248,51 @@ public class ReleasePackagingTests
     }
 
     #endregion
+
+    #region Canonical Release Pipeline Contract
+
+    [Fact]
+    public void ReleaseWorkflow_RequiresPinnedCompilerAndAllCanonicalArtifacts()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string workflow = File.ReadAllText(Path.Combine(repoRoot, ".github", "workflows", "release.yml"));
+        string provisioner = File.ReadAllText(Path.Combine(repoRoot, "scripts", "provision-inno.ps1"));
+
+        Assert.Contains("./scripts/provision-inno.ps1 -PinnedVersion 6.4.0", workflow);
+        Assert.Contains("-RequireInstaller", workflow);
+        Assert.Contains("-IsccPath '${{ steps.inno.outputs.iscc_path }}'", workflow);
+        Assert.Contains("Assert Required Release Outputs", workflow);
+        Assert.Contains("dist/AG2Router-v${{ steps.version.outputs.version }}-win-x64.zip", workflow);
+        Assert.Contains("dist/AG2Router-Setup-v${{ steps.version.outputs.version }}-win-x64.exe", workflow);
+        Assert.DoesNotContain("VersionInfo", provisioner);
+        Assert.Contains("list --exact innosetup --limit-output", provisioner);
+        Assert.Contains("--allow-downgrade --force --install-if-not-installed", provisioner);
+        Assert.Contains("Compiler engine version: Inno Setup $PinnedVersion", provisioner);
+    }
+
+    [Fact]
+    public void PackageRelease_InstallerRequiredModeFailsClosed()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string packageScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "package-release.ps1"));
+
+        Assert.Contains("[switch]$RequireInstaller", packageScript);
+        Assert.Contains("[string]$IsccPath", packageScript);
+        Assert.Contains("Installer compilation is required", packageScript);
+        Assert.Contains("ISCC reported success, but the required installer was not produced", packageScript);
+        Assert.Contains("Required packaging output is missing", packageScript);
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "package.json")))
+        {
+            dir = dir.Parent;
+        }
+
+        return dir?.FullName ?? Directory.GetCurrentDirectory();
+    }
+
+    #endregion
 }
