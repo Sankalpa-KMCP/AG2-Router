@@ -38,16 +38,6 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install Inno Setup
-        shell: pwsh
-        run: |
-          choco install innosetup --version 6.4.0 --no-progress
-          $innoPath = "C:\Program Files (x86)\Inno Setup 6"
-          if (Test-Path $innoPath) {
-            Write-Host "Adding Inno Setup to GITHUB_PATH: $innoPath"
-            "$innoPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          }
-
       - name: Install Node Dependencies
         run: npm ci
 
@@ -59,6 +49,48 @@ jobs:
 
       - name: Combined Quality Gate - .NET Test Suite (Release)
         run: dotnet test dotnet/AG2Router.sln -c Release --verbosity normal
+
+      - name: Provision Pinned Inno Setup
+        shell: pwsh
+        run: |
+          $pinnedVersion = "6.4.0"
+          $innoPath = "C:\Program Files (x86)\Inno Setup 6"
+          $isccPath = Join-Path $innoPath "ISCC.exe"
+
+          $needsInstall = $true
+          if (Test-Path $isccPath) {
+            $verInfo = (Get-Item $isccPath).VersionInfo
+            $currentVer = if ($verInfo.ProductVersion) { $verInfo.ProductVersion.Trim() } else { $verInfo.FileVersion.Trim() }
+            Write-Host "Found existing Inno Setup at $isccPath (Version: $currentVer)"
+            if ($currentVer -like "$pinnedVersion*") {
+              Write-Host "Existing Inno Setup matches pinned version $pinnedVersion. Reusing."
+              $needsInstall = $false
+            } else {
+              Write-Host "Existing Inno Setup version ($currentVer) differs from pinned version ($pinnedVersion). Reinstalling."
+            }
+          } else {
+            Write-Host "Inno Setup not found at $isccPath."
+          }
+
+          if ($needsInstall) {
+            Write-Host "Installing Inno Setup $pinnedVersion via Chocolatey with downgrade support..."
+            choco install innosetup --version $pinnedVersion --allow-downgrade -y --no-progress
+          }
+
+          if (-not (Test-Path $isccPath)) {
+            throw "Inno Setup compiler (ISCC.exe) not found at expected path: $isccPath"
+          }
+
+          $finalVerInfo = (Get-Item $isccPath).VersionInfo
+          $finalVer = if ($finalVerInfo.ProductVersion) { $finalVerInfo.ProductVersion.Trim() } else { $finalVerInfo.FileVersion.Trim() }
+          Write-Host "Verified Inno Setup compiler at $isccPath (Version: $finalVer)"
+
+          if ($finalVer -notlike "$pinnedVersion*") {
+            throw "Inno Setup version mismatch! Expected: $pinnedVersion*, Found: $finalVer"
+          }
+
+          Write-Host "Adding Inno Setup to GITHUB_PATH: $innoPath"
+          "$innoPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Run Release Packaging Procedure
         shell: pwsh
