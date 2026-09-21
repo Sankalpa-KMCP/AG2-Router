@@ -18,6 +18,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { withCoordinatedFileAccess, writeFileAtomically } from '../persistence/file-coordination.js';
 import { IDpapiProvider, WindowsDpapiProvider } from './dpapi.js';
 import {
   VAULT_MAGIC,
@@ -26,18 +27,21 @@ import {
   VaultCorruptionError,
   VaultError,
   VaultFileEnvelope,
+  VaultMutationReceipt,
   VaultedSessionPlaintext
 } from './types.js';
 
 export interface SessionVaultOptions {
   readonly vaultDir?: string;
   readonly dpapiProvider?: IDpapiProvider;
+  readonly atomicWriter?: (filePath: string, content: string) => Promise<void>;
 }
 
 export class SessionVault {
   private readonly vaultDir: string;
   private readonly vaultFilePath: string;
   private readonly dpapiProvider: IDpapiProvider;
+  private readonly atomicWriter: (filePath: string, content: string) => Promise<void>;
 
   constructor(options: SessionVaultOptions = {}) {
     if (options.vaultDir) {
@@ -50,6 +54,7 @@ export class SessionVault {
 
     this.vaultFilePath = path.join(this.vaultDir, 'sessions.dat');
     this.dpapiProvider = options.dpapiProvider || new WindowsDpapiProvider();
+    this.atomicWriter = options.atomicWriter ?? writeFileAtomically;
   }
 
   /**
@@ -75,6 +80,14 @@ export class SessionVault {
     sessionBlob: Buffer,
     target: string = 'gemini:antigravity'
   ): Promise<void> {
+    await this.saveSessionWithReceipt(accountId, sessionBlob, target);
+  }
+
+  public async saveSessionWithReceipt(
+    accountId: string,
+    sessionBlob: Buffer,
+    target: string = 'gemini:antigravity'
+  ): Promise<VaultMutationReceipt> {
     if (!accountId || typeof accountId !== 'string') {
       throw new VaultError('accountId is required to save session');
     }
@@ -97,24 +110,44 @@ export class SessionVault {
     const encryptedBuffer = await this.dpapiProvider.encrypt(plaintextBuffer);
     const encryptedPayloadBase64 = encryptedBuffer.toString('base64');
 
-    // 3. Load current vault envelope (fails closed if existing file is corrupted)
-    const envelope = this.readEnvelope();
+    return withCoordinatedFileAccess(this.vaultFilePath, async () => {
+      // 3. Load current vault envelope (fails closed if existing file is corrupted)
+      const envelope = this.readEnvelope();
+      const now = new Date().toISOString();
+      const existing = envelope.records[accountId];
+      const committedRecord = {
+        accountId,
+        target,
+        encryptedPayloadBase64,
+        createdAt: existing ? existing.createdAt : now,
+        updatedAt: now
+      };
+      envelope.records[accountId] = committedRecord;
 
-    const now = new Date().toISOString();
-    const existing = envelope.records[accountId];
+      // 4. Flush temp content before same-directory replacement.
+      await this.writeEnvelope(envelope);
+      return {
+        accountId,
+        committedRecord,
+        previousRecord: existing
+      };
+    });
+  }
 
-    const record: VaultAccountRecord = {
-      accountId,
-      target,
-      encryptedPayloadBase64,
-      createdAt: existing ? existing.createdAt : now,
-      updatedAt: now
-    };
+  public async restoreIfCurrent(receipt: VaultMutationReceipt): Promise<boolean> {
+    return withCoordinatedFileAccess(this.vaultFilePath, async () => {
+      const envelope = this.readEnvelope();
+      const current = envelope.records[receipt.accountId];
+      if (!current || !this.recordsEqual(current, receipt.committedRecord)) return false;
 
-    envelope.records[accountId] = record;
-
-    // 4. Save atomically
-    this.writeEnvelope(envelope);
+      if (receipt.previousRecord) {
+        envelope.records[receipt.accountId] = receipt.previousRecord;
+      } else {
+        delete envelope.records[receipt.accountId];
+      }
+      await this.writeEnvelope(envelope);
+      return true;
+    });
   }
 
   /**
@@ -126,8 +159,8 @@ export class SessionVault {
       throw new VaultError('accountId is required to retrieve session');
     }
 
-    const envelope = this.readEnvelope();
-    const record = envelope.records[accountId];
+    const record = await withCoordinatedFileAccess(this.vaultFilePath, async () =>
+      this.readEnvelope().records[accountId]);
     if (!record) {
       return null;
     }
@@ -179,8 +212,8 @@ export class SessionVault {
    */
   public async hasSession(accountId: string): Promise<boolean> {
     if (!accountId) return false;
-    const envelope = this.readEnvelope();
-    return Boolean(envelope.records[accountId]);
+    return withCoordinatedFileAccess(this.vaultFilePath, async () =>
+      Boolean(this.readEnvelope().records[accountId]));
   }
 
   /**
@@ -189,22 +222,21 @@ export class SessionVault {
   public async removeSession(accountId: string): Promise<boolean> {
     if (!accountId) return false;
 
-    const envelope = this.readEnvelope();
-    if (!envelope.records[accountId]) {
-      return false;
-    }
-
-    delete envelope.records[accountId];
-    this.writeEnvelope(envelope);
-    return true;
+    return withCoordinatedFileAccess(this.vaultFilePath, async () => {
+      const envelope = this.readEnvelope();
+      if (!envelope.records[accountId]) return false;
+      delete envelope.records[accountId];
+      await this.writeEnvelope(envelope);
+      return true;
+    });
   }
 
   /**
    * List all account IDs stored in the vault.
    */
   public async listStoredAccountIds(): Promise<string[]> {
-    const envelope = this.readEnvelope();
-    return Object.keys(envelope.records);
+    return withCoordinatedFileAccess(this.vaultFilePath, async () =>
+      Object.keys(this.readEnvelope().records));
   }
 
   /**
@@ -261,35 +293,27 @@ export class SessionVault {
     return envelope as VaultFileEnvelope;
   }
 
+  private recordsEqual(left: VaultAccountRecord, right: VaultAccountRecord): boolean {
+    return left.accountId === right.accountId &&
+      left.target === right.target &&
+      left.encryptedPayloadBase64 === right.encryptedPayloadBase64 &&
+      left.createdAt === right.createdAt &&
+      left.updatedAt === right.updatedAt;
+  }
+
   /**
    * Write the vault file envelope atomically via a temporary file.
    */
-  private writeEnvelope(envelope: VaultFileEnvelope): void {
-    const dir = path.dirname(this.vaultFilePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    }
-
+  private async writeEnvelope(envelope: VaultFileEnvelope): Promise<void> {
     const updatedEnvelope: VaultFileEnvelope = {
       ...envelope,
       updatedAt: new Date().toISOString()
     };
 
     const serialized = JSON.stringify(updatedEnvelope, null, 2);
-    const tempPath = `${this.vaultFilePath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-
     try {
-      fs.writeFileSync(tempPath, serialized, { encoding: 'utf8', mode: 0o600 });
-      fs.renameSync(tempPath, this.vaultFilePath);
+      await this.atomicWriter(this.vaultFilePath, serialized);
     } catch (err) {
-      // Clean up temp file on failure
-      if (fs.existsSync(tempPath)) {
-        try {
-          fs.unlinkSync(tempPath);
-        } catch {
-          // ignore unlink error
-        }
-      }
       throw new VaultError(`Failed to atomically write vault file: ${err instanceof Error ? err.message : String(err)}`);
     }
   }

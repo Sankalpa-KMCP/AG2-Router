@@ -59,12 +59,23 @@ class MockAccountStore implements IAccountStore {
     return this.accounts.delete(id);
   }
 
+  public async removeAccountIfUnchanged(expected: AccountMetadata): Promise<boolean> {
+    if (this.accounts.get(expected.id) !== expected) return false;
+    return this.accounts.delete(expected.id);
+  }
+
   public async getActiveAccountId(): Promise<string | null> {
     return this.activeAccountId;
   }
 
   public async setActiveAccountId(id: string | null): Promise<void> {
     this.activeAccountId = id;
+  }
+
+  public async compareExchangeActiveAccountId(expectedId: string | null, newId: string | null): Promise<boolean> {
+    if (this.activeAccountId !== expectedId) return false;
+    this.activeAccountId = newId;
+    return true;
   }
 }
 

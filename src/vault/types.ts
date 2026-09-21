@@ -17,6 +17,12 @@ export interface VaultAccountRecord {
   readonly updatedAt: string;
 }
 
+export interface VaultMutationReceipt {
+  readonly accountId: string;
+  readonly committedRecord: VaultAccountRecord;
+  readonly previousRecord?: VaultAccountRecord;
+}
+
 /**
  * Top-level versioned file envelope for `sessions.dat`.
  * Contains metadata and the dictionary of account records.

@@ -14,6 +14,8 @@ import { IAG2Adapter } from '../ag2/adapter.js';
 import { redactSensitiveText, sanitizeError } from '../ag2/security.js';
 import { IWinCredReader, DEFAULT_AG2_WINCRED_TARGET } from '../ag2/wincred.js';
 import { SessionVault } from '../vault/session-vault.js';
+import { VaultMutationReceipt } from '../vault/types.js';
+import { withCoordinatedFileAccess } from '../persistence/file-coordination.js';
 import { AccountMetadata, IAccountStore } from './types.js';
 
 export interface EnrollmentOptions {
@@ -42,6 +44,24 @@ export interface AccountEnrollmentServiceOptions {
   readonly wincredReader: IWinCredReader;
   readonly sessionVault: SessionVault;
   readonly accountStore: IAccountStore;
+}
+
+const enrollmentLocks = new Map<string, Promise<void>>();
+
+async function withEnrollmentLock<T>(email: string, action: () => Promise<T>): Promise<T> {
+  const key = email.trim().toLowerCase();
+  const previous = enrollmentLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  enrollmentLocks.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await action();
+  } finally {
+    release();
+    if (enrollmentLocks.get(key) === tail) enrollmentLocks.delete(key);
+  }
 }
 
 export class AccountEnrollmentService {
@@ -90,65 +110,74 @@ export class AccountEnrollmentService {
         throw new AccountEnrollmentError('Failed to parse Windows Credential JSON payload.');
       }
 
-      // 4. Check if account already exists in AccountStore
       const email = currentAccount.email.trim();
-      const existing = await this.accountStore.getAccountByEmail(email);
-
-      let account: AccountMetadata;
-      let isNew = false;
-
-      if (existing) {
-        // Update existing account
-        const updated = await this.accountStore.updateAccount(existing.id, {
-          name: options.name ?? existing.name ?? currentAccount.name ?? undefined,
-          priority: options.priority ?? existing.priority,
-          isReserve: options.isReserve ?? existing.isReserve,
-          validationStatus: 'VALID',
-          hasVaultedSession: true,
-          lastActiveAt: new Date().toISOString(),
-          notes: options.notes ?? existing.notes
-        });
-
-        if (!updated) {
-          throw new AccountEnrollmentError(`Failed to update existing account record for '${email}'.`);
-        }
-        account = updated;
-      } else {
-        // Register new account
-        isNew = true;
-        account = await this.accountStore.addAccount({
+      return await withEnrollmentLock(email, async () => {
+        const enrollmentResource = `${this.sessionVault.getVaultPath()}.enrollment`;
+        return withCoordinatedFileAccess(enrollmentResource, async () => {
+        // Recheck inside the identity lock so concurrent duplicate enrollment is idempotent.
+        const existing = await this.accountStore.getAccountByEmail(email);
+        const previousActiveId = await this.accountStore.getActiveAccountId();
+        const isNew = existing === null;
+        const pending = existing ?? await this.accountStore.addAccount({
           email,
           name: options.name ?? currentAccount.name ?? undefined,
           priority: options.priority,
           isReserve: options.isReserve,
-          hasVaultedSession: true,
+          hasVaultedSession: false,
           notes: options.notes
         });
 
-        // Set validationStatus to VALID
-        const validated = await this.accountStore.updateAccount(account.id, {
-          validationStatus: 'VALID',
-          lastActiveAt: new Date().toISOString()
-        });
-        if (validated) {
-          account = validated;
+        let vaultReceipt: VaultMutationReceipt | null = null;
+        let vaultCommitted = false;
+        let account: AccountMetadata;
+        try {
+          // Vault-first: HasVaultedSession remains unchanged/false until this succeeds.
+          vaultReceipt = await this.sessionVault.saveSessionWithReceipt(pending.id, cred.blob, cred.target);
+          vaultCommitted = true;
+
+          const committed = await this.accountStore.updateAccount(pending.id, {
+            name: options.name,
+            priority: options.priority,
+            isReserve: options.isReserve,
+            validationStatus: 'VALID',
+            hasVaultedSession: true,
+            lastActiveAt: new Date().toISOString(),
+            notes: options.notes
+          });
+          if (!committed) throw new AccountEnrollmentError(`Failed to update account record for '${email}'.`);
+          account = committed;
+        } catch (error) {
+          if (vaultCommitted) {
+            try {
+              await this.sessionVault.restoreIfCurrent(vaultReceipt!);
+            } catch {}
+          }
+          if (isNew) {
+            try { await this.accountStore.removeAccountIfUnchanged(pending); } catch {}
+          }
+          throw error;
         }
-      }
 
-      // 5. Encrypt and save session into the session vault
-      await this.sessionVault.saveSession(account.id, cred.blob, cred.target);
+        // Core enrollment is committed. Preserve a concurrent active-account choice and avoid
+        // compensating a later selection through a value-only CAS rollback.
+        let activeUpdated = false;
+        try {
+          activeUpdated = await this.accountStore.compareExchangeActiveAccountId(previousActiveId, pending.id);
+        } catch {}
 
-      // 6. Mark as active account in account store
-      await this.accountStore.setActiveAccountId(account.id);
-
-      return {
-        success: true,
-        account,
-        isNew,
-        message: isNew
+        const baseMessage = isNew
           ? `Successfully enrolled new account '${email}' into encrypted vault.`
-          : `Successfully updated session vault for existing account '${email}'.`
-      };
+          : `Successfully updated session vault for existing account '${email}'.`;
+        return {
+          success: true,
+          account,
+          isNew,
+          message: activeUpdated
+            ? baseMessage
+            : `${baseMessage} The current active-account selection was preserved.`
+        };
+        });
+      });
     } catch (err) {
       const sanitized = sanitizeError(err);
       throw new AccountEnrollmentError(redactSensitiveText(sanitized.message));

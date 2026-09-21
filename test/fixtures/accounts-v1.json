@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "activeAccountId": "acc_shared01",
+  "accounts": [
+    {
+      "id": "acc_shared01",
+      "email": "interop@example.com",
+      "name": "Interoperability ✓",
+      "priority": 0,
+      "isReserve": false,
+      "validationStatus": "VALID",
+      "hasVaultedSession": false,
+      "createdAt": "2026-09-21T01:02:03.4567890Z",
+      "updatedAt": "2026-09-21T02:03:04.5678900Z",
+      "lastActiveAt": null,
+      "notes": "Synthetic shared-contract fixture"
+    },
+    {
+      "id": "acc_minimal1",
+      "email": "minimal@example.com",
+      "priority": 2,
+      "isReserve": true,
+      "validationStatus": "UNVALIDATED",
+      "createdAt": "2026-09-21T03:04:05.6789010+00:00",
+      "updatedAt": "2026-09-21T03:04:05.6789010+00:00",
+      "lastActiveAt": null
+    }
+  ]
+}

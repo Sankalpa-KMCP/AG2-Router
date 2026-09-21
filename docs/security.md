@@ -35,7 +35,7 @@ Static asset handling enforces multi-layer directory traversal protection:
 ## 3. Account Storage & Credential Model
 
 ### 3.1 Metadata Storage (Foundation Layer)
-* File: `data/accounts.json`
+* File: `%LOCALAPPDATA%\AG2-Router\data\accounts.json` by default in both runtimes; `DATA_DIR` is the shared explicit override.
 * Contents: Strictly non-sensitive metadata (email address, priority rating, reserve flag, validation status).
 * Git Hygiene: The `data/` directory is gitignored to ensure local configuration and metadata are never pushed to version control.
 

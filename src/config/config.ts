@@ -8,6 +8,7 @@
  */
 
 import * as path from 'node:path';
+import { resolveAccountMetadataPath } from '../accounts/account-store.js';
 import { DEFAULT_ROUTER_CONFIG, RouterConfig } from '../router/types.js';
 
 export interface AppConfig {
@@ -29,7 +30,7 @@ export function loadConfig(): AppConfig {
   // Paths
   const storageDir = process.env.DATA_DIR
     ? path.resolve(process.env.DATA_DIR)
-    : path.resolve(process.cwd(), 'data');
+    : path.dirname(resolveAccountMetadataPath());
 
   const uiDir = process.env.UI_DIR
     ? path.resolve(process.env.UI_DIR)

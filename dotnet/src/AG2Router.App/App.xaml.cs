@@ -1,11 +1,14 @@
 using System.Windows;
+using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Adapter;
+using AG2Router.AG2.Vault;
 using AG2Router.App.Lifecycle;
 using AG2Router.App.Server;
 using AG2Router.App.Services;
 using AG2Router.App.Tray;
 using AG2Router.App.Views;
 using AG2Router.Windows.Lifecycle;
+using AG2Router.Windows.Security;
 
 namespace AG2Router.App;
 
@@ -18,6 +21,11 @@ public partial class App : System.Windows.Application
     private QuickStatusWindow? _quickStatusWindow;
     private AG2LiveAdapter? _ag2Adapter;
     private TelemetryPollingCoordinator? _telemetryCoordinator;
+    private WindowsDpapiProvider? _dpapiProvider;
+    private SessionVault? _sessionVault;
+    private LocalMetadataAccountStore? _accountStore;
+    private WindowsWinCredReader? _wincredReader;
+    private AccountEnrollmentService? _enrollmentService;
     private bool _isShuttingDown;
 
     private static void Log(string msg)
@@ -102,9 +110,21 @@ public partial class App : System.Windows.Application
             _telemetryCoordinator = new TelemetryPollingCoordinator(_ag2Adapter);
             _telemetryCoordinator.Start();
 
+            Log("Initializing native vault and account services...");
+            _dpapiProvider = new WindowsDpapiProvider();
+            _sessionVault = new SessionVault(dpapiProvider: _dpapiProvider);
+            _accountStore = new LocalMetadataAccountStore();
+            _wincredReader = new WindowsWinCredReader();
+            _enrollmentService = new AccountEnrollmentService(_ag2Adapter, _wincredReader, _sessionVault, _accountStore);
+
             Log("Starting loopback server...");
             _loopbackServer = new LoopbackServer();
-            await _loopbackServer.StartAsync(0, statusProvider: () => _telemetryCoordinator.CurrentStatus);
+            await _loopbackServer.StartAsync(
+                0,
+                statusProvider: () => _telemetryCoordinator.CurrentStatus,
+                accountStore: _accountStore,
+                sessionVault: _sessionVault,
+                enrollmentService: _enrollmentService);
 
             var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
             Log($"Loopback server bound to: {dashboardUrl}");

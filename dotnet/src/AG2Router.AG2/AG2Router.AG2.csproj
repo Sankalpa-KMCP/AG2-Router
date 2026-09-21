@@ -6,4 +6,8 @@
   <ItemGroup>
     <ProjectReference Include="..\AG2Router.Core\AG2Router.Core.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AG2Router.Tests" />
+  </ItemGroup>
 </Project>

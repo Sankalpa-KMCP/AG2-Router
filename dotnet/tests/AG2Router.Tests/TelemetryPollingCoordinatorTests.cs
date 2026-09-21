@@ -12,6 +12,11 @@ public class MockAG2Adapter : IAG2Adapter
     public Func<CancellationToken, Task<AccountIdentityDto?>>? GetCurrentAccountFunc { get; set; }
     public Func<CancellationToken, Task<QuotaSnapshotDto?>>? GetQuotaFunc { get; set; }
     public Func<CancellationToken, Task<ActivityStatusDto>>? GetActivityStateFunc { get; set; }
+    public AccountIdentityDto? CurrentAccount
+    {
+        get => GetCurrentAccountFunc != null ? GetCurrentAccountFunc(default).GetAwaiter().GetResult() : null;
+        set => GetCurrentAccountFunc = _ => Task.FromResult(value);
+    }
 
     public Task<Ag2StatusDto> GetStatusAsync(CancellationToken cancellationToken = default)
     {

@@ -171,6 +171,76 @@ describe('SessionVault (Encrypted Multi-Account Session Persistence)', () => {
     }
   });
 
+  for (const [label, content] of [
+    ['zero-byte', ''],
+    ['whitespace', '  \r\n'],
+    ['truncated', '{"magic":"AG2_ROUTER_SESSION_VAULT"']
+  ] as const) {
+    it(`should fail closed and preserve a ${label} vault`, async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-vault-invalid-test-'));
+      try {
+        const vault = new SessionVault({ vaultDir: tempDir, dpapiProvider: new MockDpapiProvider() });
+        fs.writeFileSync(vault.getVaultPath(), content, 'utf8');
+        const before = fs.readFileSync(vault.getVaultPath());
+        await assert.rejects(() => vault.saveSession('acc-blocked', Buffer.from('synthetic')),
+          (error: unknown) => error instanceof VaultCorruptionError);
+        assert.deepEqual(fs.readFileSync(vault.getVaultPath()), before);
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('should preserve the previous snapshot when persistence fails', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-vault-failure-test-'));
+    try {
+      const dpapi = new MockDpapiProvider();
+      const seed = new SessionVault({ vaultDir: tempDir, dpapiProvider: dpapi });
+      await seed.saveSession('acc-stable', Buffer.from('stable-session'));
+      const before = fs.readFileSync(seed.getVaultPath());
+      const failing = new SessionVault({
+        vaultDir: tempDir,
+        dpapiProvider: dpapi,
+        atomicWriter: async () => { throw new Error('injected pre-replacement failure'); }
+      });
+
+      await assert.rejects(() => failing.saveSession('acc-new', Buffer.from('new-session')));
+      assert.deepEqual(fs.readFileSync(seed.getVaultPath()), before);
+      assert.equal(await seed.hasSession('acc-new'), false);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('should serialize concurrent saves from two instances without lost updates', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-vault-concurrency-test-'));
+    try {
+      const dpapi = new MockDpapiProvider();
+      const first = new SessionVault({ vaultDir: tempDir, dpapiProvider: dpapi });
+      const second = new SessionVault({ vaultDir: tempDir, dpapiProvider: dpapi });
+      await Promise.all(Array.from({ length: 20 }, (_, index) =>
+        (index % 2 === 0 ? first : second).saveSession(`acc-${index}`, Buffer.from(`session-${index}`))));
+      assert.equal((await first.listStoredAccountIds()).length, 20);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('conditionally restores only when the enrollment write is still current', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-vault-receipt-test-'));
+    try {
+      const vault = new SessionVault({ vaultDir: tempDir, dpapiProvider: new MockDpapiProvider() });
+      await vault.saveSession('acc-receipt', Buffer.from('original'));
+      const receipt = await vault.saveSessionWithReceipt('acc-receipt', Buffer.from('candidate'));
+      await vault.saveSession('acc-receipt', Buffer.from('newer'));
+
+      assert.equal(await vault.restoreIfCurrent(receipt), false);
+      assert.equal((await vault.getSession('acc-receipt'))?.toString(), 'newer');
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('should work with real WindowsDpapiProvider in an isolated directory', { skip: process.platform !== 'win32' ? 'Windows DPAPI is only supported on Windows' : false }, async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-vault-real-test-'));
     try {

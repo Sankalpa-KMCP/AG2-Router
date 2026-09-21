@@ -1,0 +1,325 @@
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using AG2Router.AG2.Persistence;
+using AG2Router.AG2.Vault;
+using AG2Router.Core.Models;
+using AG2Router.Windows.Security;
+using Xunit;
+
+namespace AG2Router.Tests;
+
+public class SessionVaultTests : IDisposable
+{
+    private readonly string _tempVaultDir;
+
+    public SessionVaultTests()
+    {
+        _tempVaultDir = Path.Combine(Path.GetTempPath(), $"ag2_vault_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempVaultDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempVaultDir))
+        {
+            try { Directory.Delete(_tempVaultDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task EmptyVault_ReturnsNullAndFalse_AndListsEmpty()
+    {
+        var fakeDpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, fakeDpapi);
+
+        Assert.False(await vault.HasSessionAsync("non_existent_id"));
+        Assert.Null(await vault.GetSessionAsync("non_existent_id"));
+        var ids = await vault.ListStoredAccountIdsAsync();
+        Assert.Empty(ids);
+    }
+
+    [Fact]
+    public async Task SaveAndGetSession_WithFakeDpapi_RoundTripsSuccessfully()
+    {
+        var fakeDpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, fakeDpapi);
+
+        byte[] sessionBlob = Encoding.UTF8.GetBytes("{\"token\":\"test-session-token-12345\"}");
+        await vault.SaveSessionAsync("acc_test_1", sessionBlob, "gemini:antigravity");
+
+        Assert.True(await vault.HasSessionAsync("acc_test_1"));
+        var retrieved = await vault.GetSessionAsync("acc_test_1");
+
+        Assert.NotNull(retrieved);
+        Assert.Equal(sessionBlob, retrieved);
+
+        var ids = await vault.ListStoredAccountIdsAsync();
+        Assert.Single(ids);
+        Assert.Contains("acc_test_1", ids);
+
+        // Verify sessions.dat exists on disk and has magic
+        string vaultPath = vault.GetVaultPath();
+        Assert.True(File.Exists(vaultPath));
+        string rawJson = File.ReadAllText(vaultPath);
+        Assert.Contains(VaultConstants.Magic, rawJson);
+        Assert.DoesNotContain("test-session-token-12345", rawJson); // Secret is encrypted at rest
+    }
+
+    [Fact]
+    public async Task SaveAndGetSession_WithRealWindowsDpapi_RoundTripsInTempDir()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var dpapi = new WindowsDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, dpapi);
+
+        byte[] sessionBlob = Encoding.UTF8.GetBytes("{\"token\":\"real-dpapi-token-abcde\"}");
+        await vault.SaveSessionAsync("acc_real_dpapi", sessionBlob, "gemini:antigravity");
+
+        var retrieved = await vault.GetSessionAsync("acc_real_dpapi");
+        Assert.NotNull(retrieved);
+        Assert.Equal(sessionBlob, retrieved);
+    }
+
+    [Fact]
+    public async Task SaveSession_UpsertsExistingRecord_PreservingCreatedAt()
+    {
+        var fakeDpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, fakeDpapi);
+
+        byte[] blob1 = Encoding.UTF8.GetBytes("session-v1");
+        await vault.SaveSessionAsync("acc_upsert", blob1);
+
+        // Read envelope to check createdAt
+        string raw1 = File.ReadAllText(vault.GetVaultPath());
+        var env1 = JsonSerializer.Deserialize<VaultFileEnvelope>(raw1);
+        string createdAt1 = env1!.Records["acc_upsert"].CreatedAt;
+
+        await Task.Delay(15);
+
+        byte[] blob2 = Encoding.UTF8.GetBytes("session-v2");
+        await vault.SaveSessionAsync("acc_upsert", blob2);
+
+        string raw2 = File.ReadAllText(vault.GetVaultPath());
+        var env2 = JsonSerializer.Deserialize<VaultFileEnvelope>(raw2);
+        string createdAt2 = env2!.Records["acc_upsert"].CreatedAt;
+        string updatedAt2 = env2.Records["acc_upsert"].UpdatedAt;
+
+        Assert.Equal(createdAt1, createdAt2);
+        Assert.True(string.CompareOrdinal(updatedAt2, createdAt1) >= 0);
+
+        var retrieved = await vault.GetSessionAsync("acc_upsert");
+        Assert.Equal(blob2, retrieved);
+    }
+
+    [Fact]
+    public async Task RemoveSession_RemovesRecordAndReturnsTrue()
+    {
+        var fakeDpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, fakeDpapi);
+
+        byte[] blob = Encoding.UTF8.GetBytes("session-to-delete");
+        await vault.SaveSessionAsync("acc_delete_me", blob);
+
+        Assert.True(await vault.HasSessionAsync("acc_delete_me"));
+        bool removed = await vault.RemoveSessionAsync("acc_delete_me");
+        Assert.True(removed);
+
+        Assert.False(await vault.HasSessionAsync("acc_delete_me"));
+        Assert.Null(await vault.GetSessionAsync("acc_delete_me"));
+
+        // Removing non-existent returns false
+        Assert.False(await vault.RemoveSessionAsync("acc_delete_me"));
+    }
+
+    [Fact]
+    public async Task GetSession_WithFramingAccountIdMismatch_ThrowsVaultCorruptionException()
+    {
+        var fakeDpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, fakeDpapi);
+
+        // Manually create a swapped record where key in envelope != inner payload accountId
+        var framed = new VaultedSessionPlaintext(
+            Version: 1,
+            AccountId: "acc_real_owner",
+            Target: "gemini:antigravity",
+            CredentialBlobBase64: Convert.ToBase64String("token"u8.ToArray()),
+            EnrolledAt: DateTime.UtcNow.ToString("o")
+        );
+        byte[] plaintext = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(framed));
+        byte[] ciphertext = await fakeDpapi.EncryptAsync(plaintext);
+
+        var envelope = new VaultFileEnvelope(
+            Magic: VaultConstants.Magic,
+            SchemaVersion: 1,
+            UpdatedAt: DateTime.UtcNow.ToString("o"),
+            Records: new Dictionary<string, VaultAccountRecord>
+            {
+                ["acc_attacker_key"] = new VaultAccountRecord(
+                    AccountId: "acc_attacker_key", // Mismatch with inner "acc_real_owner"
+                    Target: "gemini:antigravity",
+                    EncryptedPayloadBase64: Convert.ToBase64String(ciphertext),
+                    CreatedAt: DateTime.UtcNow.ToString("o"),
+                    UpdatedAt: DateTime.UtcNow.ToString("o")
+                )
+            }
+        );
+
+        File.WriteAllText(vault.GetVaultPath(), JsonSerializer.Serialize(envelope));
+
+        var ex = await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.GetSessionAsync("acc_attacker_key"));
+        Assert.Contains("Identity framing violation", ex.Message);
+    }
+
+    [Fact]
+    public async Task GetSession_WithFramingTargetMismatch_ThrowsVaultCorruptionException()
+    {
+        var fakeDpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, fakeDpapi);
+
+        var framed = new VaultedSessionPlaintext(
+            Version: 1,
+            AccountId: "acc_target_test",
+            Target: "gemini:original_target",
+            CredentialBlobBase64: Convert.ToBase64String("token"u8.ToArray()),
+            EnrolledAt: DateTime.UtcNow.ToString("o")
+        );
+        byte[] plaintext = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(framed));
+        byte[] ciphertext = await fakeDpapi.EncryptAsync(plaintext);
+
+        var envelope = new VaultFileEnvelope(
+            Magic: VaultConstants.Magic,
+            SchemaVersion: 1,
+            UpdatedAt: DateTime.UtcNow.ToString("o"),
+            Records: new Dictionary<string, VaultAccountRecord>
+            {
+                ["acc_target_test"] = new VaultAccountRecord(
+                    AccountId: "acc_target_test",
+                    Target: "gemini:swapped_target", // Target mismatch
+                    EncryptedPayloadBase64: Convert.ToBase64String(ciphertext),
+                    CreatedAt: DateTime.UtcNow.ToString("o"),
+                    UpdatedAt: DateTime.UtcNow.ToString("o")
+                )
+            }
+        );
+
+        File.WriteAllText(vault.GetVaultPath(), JsonSerializer.Serialize(envelope));
+
+        var ex = await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.GetSessionAsync("acc_target_test"));
+        Assert.Contains("Target mismatch", ex.Message);
+    }
+
+    [Fact]
+    public async Task CorruptedVaultFile_FailsClosedAndNeverOverwrites()
+    {
+        var fakeDpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, fakeDpapi);
+
+        // Write non-JSON corrupt bytes
+        string corruptedContent = "<<<CORRUPTED_BINARY_DATA>>>";
+        File.WriteAllText(vault.GetVaultPath(), corruptedContent);
+
+        // All operations must fail closed
+        await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.GetSessionAsync("any_id"));
+        await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.HasSessionAsync("any_id"));
+        await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.ListStoredAccountIdsAsync());
+        await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.SaveSessionAsync("new_id", "blob"u8.ToArray()));
+
+        // Confirm the corrupted file was NOT wiped or overwritten
+        Assert.Equal(corruptedContent, File.ReadAllText(vault.GetVaultPath()));
+    }
+
+    [Fact]
+    public async Task WrongMagicOrVersion_ThrowsVaultCorruptionException()
+    {
+        var fakeDpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, fakeDpapi);
+
+        var wrongMagic = new VaultFileEnvelope(
+            Magic: "WRONG_MAGIC",
+            SchemaVersion: 1,
+            UpdatedAt: DateTime.UtcNow.ToString("o"),
+            Records: new()
+        );
+        File.WriteAllText(vault.GetVaultPath(), JsonSerializer.Serialize(wrongMagic));
+        await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.ListStoredAccountIdsAsync());
+
+        var wrongVersion = new VaultFileEnvelope(
+            Magic: VaultConstants.Magic,
+            SchemaVersion: 99,
+            UpdatedAt: DateTime.UtcNow.ToString("o"),
+            Records: new()
+        );
+        File.WriteAllText(vault.GetVaultPath(), JsonSerializer.Serialize(wrongVersion));
+        await Assert.ThrowsAsync<VaultCorruptionException>(() => vault.ListStoredAccountIdsAsync());
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   \r\n")]
+    [InlineData("{\"magic\":\"AG2_ROUTER_SESSION_VAULT\"")]
+    public async Task EmptyWhitespaceOrTruncatedVaultFailsClosedAndPreservesBytes(string content)
+    {
+        var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider());
+        byte[] original = Encoding.UTF8.GetBytes(content);
+        await File.WriteAllBytesAsync(vault.GetVaultPath(), original);
+
+        await Assert.ThrowsAsync<VaultCorruptionException>(() =>
+            vault.SaveSessionAsync("acc_blocked", "synthetic"u8.ToArray()));
+
+        Assert.Equal(original, await File.ReadAllBytesAsync(vault.GetVaultPath()));
+    }
+
+    [Fact]
+    public async Task PersistenceFailurePreservesPreviousVaultSnapshot()
+    {
+        var dpapi = new FakeDpapiProvider();
+        var seed = new SessionVault(_tempVaultDir, dpapi);
+        await seed.SaveSessionAsync("acc_stable", "stable-session"u8.ToArray());
+        byte[] before = await File.ReadAllBytesAsync(seed.GetVaultPath());
+
+        var failing = new SessionVault(_tempVaultDir, dpapi, new ThrowingFileWriter());
+        await Assert.ThrowsAsync<VaultException>(() =>
+            failing.SaveSessionAsync("acc_new", "new-session"u8.ToArray()));
+
+        Assert.Equal(before, await File.ReadAllBytesAsync(seed.GetVaultPath()));
+        Assert.Equal("stable-session"u8.ToArray(), await seed.GetSessionAsync("acc_stable"));
+        Assert.False(await seed.HasSessionAsync("acc_new"));
+    }
+
+    [Fact]
+    public async Task TwoVaultInstancesConcurrentSavesDoNotLoseUpdates()
+    {
+        var dpapi = new FakeDpapiProvider();
+        var first = new SessionVault(_tempVaultDir, dpapi);
+        var second = new SessionVault(_tempVaultDir, dpapi);
+
+        await Task.WhenAll(Enumerable.Range(0, 20).Select(index =>
+            (index % 2 == 0 ? first : second).SaveSessionAsync(
+                $"acc_{index}",
+                Encoding.UTF8.GetBytes($"session-{index}"))));
+
+        var reloaded = new SessionVault(_tempVaultDir, dpapi);
+        Assert.Equal(20, (await reloaded.ListStoredAccountIdsAsync()).Count);
+    }
+
+    [Fact]
+    public async Task RestoreIfCurrent_DoesNotOverwriteNewerRecord()
+    {
+        var dpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, dpapi);
+        await vault.SaveSessionAsync("acc_receipt", "original"u8.ToArray());
+        var receipt = await vault.SaveSessionWithReceiptAsync("acc_receipt", "candidate"u8.ToArray());
+        await vault.SaveSessionAsync("acc_receipt", "newer"u8.ToArray());
+
+        Assert.False(await vault.RestoreIfCurrentAsync(receipt));
+        Assert.Equal("newer"u8.ToArray(), await vault.GetSessionAsync("acc_receipt"));
+    }
+
+    private sealed class ThrowingFileWriter : IDurableFileWriter
+    {
+        public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken) =>
+            throw new IOException("Injected pre-replacement persistence failure.");
+    }
+}

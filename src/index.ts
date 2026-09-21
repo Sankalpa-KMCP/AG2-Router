@@ -5,7 +5,7 @@
  * AG2 adapter foundation, and quota router.
  */
 
-import { LocalMetadataAccountStore } from './accounts/account-store.js';
+import { LocalMetadataAccountStore, resolveAccountMetadataPath } from './accounts/account-store.js';
 import { AccountEnrollmentService } from './accounts/enrollment.js';
 import { AG2LiveAdapter } from './ag2/adapter.js';
 import { AG2WinCredReader, AG2WinCredWriter } from './ag2/wincred.js';
@@ -20,7 +20,7 @@ import { SwitchTransactionCoordinator } from './switching/transaction.js';
 async function bootstrap() {
   const config = loadConfig();
 
-  const accountStore = new LocalMetadataAccountStore();
+  const accountStore = new LocalMetadataAccountStore(resolveAccountMetadataPath(config.storageDir));
   const adapter = new AG2LiveAdapter();
   const winCredReader = new AG2WinCredReader();
   const winCredWriter = new AG2WinCredWriter();
