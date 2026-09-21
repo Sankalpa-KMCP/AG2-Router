@@ -205,6 +205,38 @@ public class InMemoryAccountStore : IAccountStore
         }
     }
 
+    public Task<AccountMetadata?> TryFinalizeSwitchAsync(
+        string? expectedActiveId,
+        string targetId,
+        UpdateAccountInput updates,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(updates);
+        lock (_syncRoot)
+        {
+            if (!string.Equals(_activeAccountId, expectedActiveId, StringComparison.Ordinal) ||
+                !_accounts.TryGetValue(targetId, out var existing))
+            {
+                return Task.FromResult<AccountMetadata?>(null);
+            }
+
+            var updated = existing with
+            {
+                Name = updates.Name != null ? updates.Name.Trim() : existing.Name,
+                Priority = updates.Priority ?? existing.Priority,
+                IsReserve = updates.IsReserve ?? existing.IsReserve,
+                ValidationStatus = updates.ValidationStatus ?? existing.ValidationStatus,
+                HasVaultedSession = updates.HasVaultedSession ?? existing.HasVaultedSession,
+                LastActiveAt = updates.LastActiveAt ?? existing.LastActiveAt,
+                Notes = updates.Notes ?? existing.Notes,
+                UpdatedAt = DateTimeOffset.UtcNow.ToString("O")
+            };
+            _accounts[targetId] = updated;
+            _activeAccountId = targetId;
+            return Task.FromResult<AccountMetadata?>(updated);
+        }
+    }
+
     /// <summary>
     /// Restores accounts and active ID from persistent storage.
     /// </summary>

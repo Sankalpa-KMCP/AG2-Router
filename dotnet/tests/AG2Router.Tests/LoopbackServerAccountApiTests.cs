@@ -177,14 +177,14 @@ public class LoopbackServerAccountApiTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task PostSwitch_Returns403Forbidden_HardSafetyGate()
+    public async Task PostSwitch_WithoutCoordinator_Returns501()
     {
         await EnsureServerStartedAsync();
 
         var response = await _client.PostAsync("/api/accounts/acc_test/switch", null);
-        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(HttpStatusCode.NotImplemented, response.StatusCode);
 
         var json = await response.Content.ReadAsStringAsync();
-        Assert.Contains("Live account switching execution is not authorized", json);
+        Assert.Contains("Native account switching is not configured", json);
     }
 }

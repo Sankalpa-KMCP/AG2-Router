@@ -64,6 +64,20 @@ public class AG2ProcessDetector
         }
     }
 
+    /// <summary>
+    /// Clears cached generation and offline throttling before an explicitly authorized
+    /// process transition. This is never called by telemetry polling or startup.
+    /// </summary>
+    public void PrepareForProcessTransition()
+    {
+        lock (_lock)
+        {
+            InvalidateCacheInternal("Explicit process transition");
+            _lastOfflineScanTimestamp = 0;
+            _consecutiveFailures = 0;
+        }
+    }
+
     private void InvalidateCacheInternal(string? reason)
     {
         if (_cachedSession != null)

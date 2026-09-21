@@ -11,10 +11,18 @@ namespace AG2Router.Windows.Security;
 /// </summary>
 public class WindowsWinCredWriter : IWinCredWriter
 {
+    private const int MaxCredentialBlobSize = 2560;
+    private const int MaxUserNameLength = 513;
+    private const int MaxTargetNameLength = 32767;
     /// <inheritdoc />
     public Task<bool> WriteCredentialAsync(WinCredEntry entry, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(entry);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // The paired reader rejects native flags, comments, aliases, and attributes.
+        // Consequently this writer only ever replaces the canonical AG2 generic-credential schema
+        // and cannot silently discard an unsupported native field captured during preflight.
 
         if (string.IsNullOrWhiteSpace(entry.Target))
         {
@@ -29,6 +37,19 @@ public class WindowsWinCredWriter : IWinCredWriter
         if (entry.Blob == null || entry.Blob.Length == 0)
         {
             throw new WinCredException("Credential blob cannot be null or empty");
+        }
+        if (entry.Blob.Length > MaxCredentialBlobSize)
+        {
+            throw new WinCredException("Credential blob exceeds the Windows generic-credential bound");
+        }
+        if (entry.Persistence is < 1 or > 3)
+        {
+            throw new WinCredException($"Unsupported credential persistence value: {entry.Persistence}");
+        }
+        if (entry.Target.Length > MaxTargetNameLength || (entry.UserName?.Length ?? 0) > MaxUserNameLength ||
+            entry.Target.IndexOf('\0') >= 0 || (entry.UserName?.IndexOf('\0') ?? -1) >= 0)
+        {
+            throw new WinCredException("Credential target or username is invalid");
         }
 
         IntPtr targetPtr = IntPtr.Zero;
@@ -52,7 +73,7 @@ public class WindowsWinCredWriter : IWinCredWriter
                 LastWritten = default,
                 CredentialBlobSize = (uint)entry.Blob.Length,
                 CredentialBlob = blobPtr,
-                Persist = entry.Persistence != 0 ? entry.Persistence : Advapi32.CRED_PERSIST_LOCAL_MACHINE,
+                Persist = entry.Persistence,
                 AttributeCount = 0,
                 Attributes = IntPtr.Zero,
                 TargetAlias = IntPtr.Zero,

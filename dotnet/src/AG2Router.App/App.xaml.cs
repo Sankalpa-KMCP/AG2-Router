@@ -1,6 +1,8 @@
 using System.Windows;
 using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Adapter;
+using AG2Router.AG2.Discovery;
+using AG2Router.AG2.Switching;
 using AG2Router.AG2.Vault;
 using AG2Router.App.Lifecycle;
 using AG2Router.App.Server;
@@ -25,7 +27,9 @@ public partial class App : System.Windows.Application
     private SessionVault? _sessionVault;
     private LocalMetadataAccountStore? _accountStore;
     private WindowsWinCredReader? _wincredReader;
+    private WindowsWinCredWriter? _wincredWriter;
     private AccountEnrollmentService? _enrollmentService;
+    private NativeAccountSwitchCoordinator? _switchCoordinator;
     private bool _isShuttingDown;
 
     private static void Log(string msg)
@@ -106,7 +110,8 @@ public partial class App : System.Windows.Application
         try
         {
             Log("Initializing AG2LiveAdapter and TelemetryPollingCoordinator...");
-            _ag2Adapter = new AG2LiveAdapter();
+            var processDetector = new AG2ProcessDetector();
+            _ag2Adapter = new AG2LiveAdapter(processDetector);
             _telemetryCoordinator = new TelemetryPollingCoordinator(_ag2Adapter);
             _telemetryCoordinator.Start();
 
@@ -115,7 +120,16 @@ public partial class App : System.Windows.Application
             _sessionVault = new SessionVault(dpapiProvider: _dpapiProvider);
             _accountStore = new LocalMetadataAccountStore();
             _wincredReader = new WindowsWinCredReader();
+            _wincredWriter = new WindowsWinCredWriter();
             _enrollmentService = new AccountEnrollmentService(_ag2Adapter, _wincredReader, _sessionVault, _accountStore);
+            var processLifecycle = new WindowsAG2ProcessLifecycle(processDetector);
+            _switchCoordinator = new NativeAccountSwitchCoordinator(
+                _accountStore,
+                _sessionVault,
+                _wincredReader,
+                _wincredWriter,
+                _ag2Adapter,
+                processLifecycle);
 
             Log("Starting loopback server...");
             _loopbackServer = new LoopbackServer();
@@ -124,7 +138,8 @@ public partial class App : System.Windows.Application
                 statusProvider: () => _telemetryCoordinator.CurrentStatus,
                 accountStore: _accountStore,
                 sessionVault: _sessionVault,
-                enrollmentService: _enrollmentService);
+                enrollmentService: _enrollmentService,
+                switchCoordinator: _switchCoordinator);
 
             var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
             Log($"Loopback server bound to: {dashboardUrl}");
