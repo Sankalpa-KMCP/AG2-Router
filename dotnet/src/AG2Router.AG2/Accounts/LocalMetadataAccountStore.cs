@@ -25,7 +25,8 @@ public class LocalMetadataAccountStore : IAccountStore
         [property: JsonPropertyName("createdAt"), JsonRequired] string CreatedAt,
         [property: JsonPropertyName("updatedAt"), JsonRequired] string UpdatedAt,
         [property: JsonPropertyName("lastActiveAt"), JsonRequired] string? LastActiveAt,
-        [property: JsonPropertyName("notes"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Notes
+        [property: JsonPropertyName("notes"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Notes,
+        [property: JsonPropertyName("alias"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Alias = null
     );
 
     private sealed record StoredData(
@@ -146,6 +147,7 @@ public class LocalMetadataAccountStore : IAccountStore
             }
 
             string now = DateTimeOffset.UtcNow.ToString("O");
+            string? alias = string.IsNullOrWhiteSpace(input.Alias) ? null : input.Alias.Trim();
             var account = new AccountMetadata(
                 Id: $"acc_{Guid.NewGuid():N}"[..12],
                 Email: email,
@@ -157,7 +159,8 @@ public class LocalMetadataAccountStore : IAccountStore
                 CreatedAt: now,
                 UpdatedAt: now,
                 LastActiveAt: null,
-                Notes: input.Notes);
+                Notes: input.Notes,
+                Alias: alias);
 
             var accounts = state.Accounts.Append(account).ToList();
             return (new StoreState(accounts, state.ActiveAccountId), account);
@@ -182,6 +185,10 @@ public class LocalMetadataAccountStore : IAccountStore
                 throw new ArgumentException($"Unsupported validation status '{validationStatus}'.", nameof(updates));
             }
 
+            string? alias = updates.Alias != null
+                ? (string.IsNullOrWhiteSpace(updates.Alias) ? null : updates.Alias.Trim())
+                : existing.Alias;
+
             var updated = existing with
             {
                 Name = updates.Name != null ? updates.Name.Trim() : existing.Name,
@@ -191,6 +198,7 @@ public class LocalMetadataAccountStore : IAccountStore
                 HasVaultedSession = updates.HasVaultedSession ?? existing.HasVaultedSession,
                 LastActiveAt = updates.LastActiveAt ?? existing.LastActiveAt,
                 Notes = updates.Notes ?? existing.Notes,
+                Alias = alias,
                 UpdatedAt = DateTimeOffset.UtcNow.ToString("O")
             };
 
@@ -299,6 +307,10 @@ public class LocalMetadataAccountStore : IAccountStore
                 throw new ArgumentException($"Unsupported validation status '{validationStatus}'.", nameof(updates));
             }
 
+            string? alias = updates.Alias != null
+                ? (string.IsNullOrWhiteSpace(updates.Alias) ? null : updates.Alias.Trim())
+                : existing.Alias;
+
             var updated = existing with
             {
                 Name = updates.Name != null ? updates.Name.Trim() : existing.Name,
@@ -308,6 +320,7 @@ public class LocalMetadataAccountStore : IAccountStore
                 HasVaultedSession = updates.HasVaultedSession ?? existing.HasVaultedSession,
                 LastActiveAt = updates.LastActiveAt ?? existing.LastActiveAt,
                 Notes = updates.Notes ?? existing.Notes,
+                Alias = alias,
                 UpdatedAt = DateTimeOffset.UtcNow.ToString("O")
             };
             accounts[index] = updated;
@@ -401,7 +414,8 @@ public class LocalMetadataAccountStore : IAccountStore
                 account.CreatedAt,
                 account.UpdatedAt,
                 account.LastActiveAt,
-                account.Notes)).ToList(),
+                account.Notes,
+                account.Alias)).ToList(),
             data.ActiveAccountId);
     }
 
@@ -421,7 +435,8 @@ public class LocalMetadataAccountStore : IAccountStore
                 account.CreatedAt,
                 account.UpdatedAt,
                 account.LastActiveAt,
-                account.Notes)).ToList());
+                account.Notes,
+                account.Alias)).ToList());
 
         string json = JsonSerializer.Serialize(data, JsonOptions);
         await _fileWriter.WriteAtomicAsync(_filePath, json, cancellationToken).ConfigureAwait(false);

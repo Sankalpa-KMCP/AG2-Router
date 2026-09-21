@@ -222,6 +222,35 @@ describe('AccountEnrollmentService', () => {
     }
   });
 
+  it('should enroll a new account with alias and persist in store', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-enroll-test-'));
+    try {
+      const store = new InMemoryAccountStore();
+      const vault = new SessionVault({ vaultDir: tempDir, dpapiProvider: new MockDpapiProvider() });
+      const adapter = new MockAG2Adapter({ email: 'work@example.com', name: 'Work User', tierName: 'PRO' });
+      const rawPayload = JSON.stringify({ token: 'work-tok-123', auth_method: 'oauth' });
+      const wincred = new MockWinCredReader({
+        target: 'gemini:antigravity',
+        type: 1,
+        userName: 'antigravity',
+        persistence: 2,
+        blob: Buffer.from(rawPayload, 'utf8')
+      });
+
+      const service = new AccountEnrollmentService({ adapter, wincredReader: wincred, sessionVault: vault, accountStore: store });
+
+      const result = await service.enrollCurrentAccount({ alias: 'Work Account', priority: 1 });
+      assert.strictEqual(result.success, true);
+      assert.strictEqual(result.account.alias, 'Work Account');
+
+      const retrieved = await store.getAccount(result.account.id);
+      assert.ok(retrieved);
+      assert.strictEqual(retrieved.alias, 'Work Account');
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('should update existing account when enrolling duplicate email without creating a second record', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-enroll-test-'));
     try {

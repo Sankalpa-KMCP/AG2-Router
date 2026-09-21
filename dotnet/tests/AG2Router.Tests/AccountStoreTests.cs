@@ -2,6 +2,7 @@ using System.IO;
 using System.Text.Json;
 using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Persistence;
+using AG2Router.AG2.Vault;
 using AG2Router.Core.Models;
 using Xunit;
 
@@ -342,6 +343,214 @@ public class AccountStoreTests : IDisposable
         Assert.Equal(
             Path.GetFullPath(Path.Combine(absoluteData, "accounts.json")),
             LocalMetadataAccountStore.ResolveDefaultFilePath(absoluteData, cwd, localRoot));
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_AccountWithAlias_RoundTripsAndPersistsJson()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var store1 = new LocalMetadataAccountStore(filePath);
+
+        var acc = await store1.AddAccountAsync(new CreateAccountInput(
+            Email: "work@example.com",
+            Name: "Work Account",
+            Alias: "Work"
+        ));
+
+        Assert.Equal("Work", acc.Alias);
+
+        using var document = JsonDocument.Parse(await File.ReadAllTextAsync(filePath));
+        var storedAccount = document.RootElement.GetProperty("accounts")[0];
+        Assert.True(storedAccount.TryGetProperty("alias", out var aliasProp));
+        Assert.Equal("Work", aliasProp.GetString());
+
+        var store2 = new LocalMetadataAccountStore(filePath);
+        var loaded = await store2.GetAccountAsync(acc.Id);
+        Assert.NotNull(loaded);
+        Assert.Equal("Work", loaded.Alias);
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_LegacyAccountWithoutAlias_LoadsSuccessfullyWithNullAlias()
+    {
+        string fixture = Path.Combine(AppContext.BaseDirectory, "fixtures", "accounts-v1.json");
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        File.Copy(fixture, filePath);
+
+        var store = new LocalMetadataAccountStore(filePath);
+        var accounts = await store.ListAccountsAsync();
+        Assert.Equal(2, accounts.Count);
+        Assert.All(accounts, account => Assert.Null(account.Alias));
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_UpdateAlias_PersistsCorrectlyAndPreservesUnrelatedFields()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var store = new LocalMetadataAccountStore(filePath);
+
+        var created = await store.AddAccountAsync(new CreateAccountInput(
+            Email: "personal@example.com",
+            Name: "Personal Account",
+            Priority: 3,
+            IsReserve: true,
+            Notes: "Keep this note",
+            Alias: "OldAlias"
+        ));
+
+        string priorUpdatedAt = created.UpdatedAt;
+        await Task.Delay(10);
+
+        var updated = await store.UpdateAccountAsync(created.Id, new UpdateAccountInput(
+            Alias: "NewAlias"
+        ));
+
+        Assert.NotNull(updated);
+        Assert.Equal("NewAlias", updated.Alias);
+        Assert.Equal("Personal Account", updated.Name);
+        Assert.Equal(3, updated.Priority);
+        Assert.True(updated.IsReserve);
+        Assert.Equal("Keep this note", updated.Notes);
+        Assert.NotEqual(priorUpdatedAt, updated.UpdatedAt);
+
+        var reloadedStore = new LocalMetadataAccountStore(filePath);
+        var reloaded = await reloadedStore.GetAccountAsync(created.Id);
+        Assert.NotNull(reloaded);
+        Assert.Equal("NewAlias", reloaded.Alias);
+        Assert.Equal("Personal Account", reloaded.Name);
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_ClearingOrWhitespaceAlias_ResultsInNoEffectiveAlias()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var store = new LocalMetadataAccountStore(filePath);
+
+        var acc1 = await store.AddAccountAsync(new CreateAccountInput(
+            Email: "ws1@example.com",
+            Alias: "   "
+        ));
+        Assert.Null(acc1.Alias);
+
+        var acc2 = await store.AddAccountAsync(new CreateAccountInput(
+            Email: "ws2@example.com",
+            Alias: "Temporary"
+        ));
+        Assert.Equal("Temporary", acc2.Alias);
+
+        var cleared = await store.UpdateAccountAsync(acc2.Id, new UpdateAccountInput(
+            Alias: ""
+        ));
+        Assert.NotNull(cleared);
+        Assert.Null(cleared.Alias);
+
+        var acc3 = await store.AddAccountAsync(new CreateAccountInput(
+            Email: "ws3@example.com",
+            Alias: "Temporary2"
+        ));
+        var clearedWs = await store.UpdateAccountAsync(acc3.Id, new UpdateAccountInput(
+            Alias: "   \t  "
+        ));
+        Assert.NotNull(clearedWs);
+        Assert.Null(clearedWs.Alias);
+
+        using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(filePath));
+        foreach (var accountElem in doc.RootElement.GetProperty("accounts").EnumerateArray())
+        {
+            Assert.False(accountElem.TryGetProperty("alias", out _));
+        }
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_StrictUnknownFieldRejection_ThrowsInvalidDataException()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts-unknown.json");
+        string json = """
+        {
+          "version": 1,
+          "activeAccountId": null,
+          "accounts": [
+            {
+              "id": "acc_unknown",
+              "email": "unknown@example.com",
+              "priority": 1,
+              "isReserve": false,
+              "validationStatus": "VALID",
+              "createdAt": "2026-09-21T00:00:00.000Z",
+              "updatedAt": "2026-09-21T00:00:00.000Z",
+              "lastActiveAt": null,
+              "unrecognizedField": "should fail"
+            }
+          ]
+        }
+        """;
+        await File.WriteAllTextAsync(filePath, json);
+        var store = new LocalMetadataAccountStore(filePath);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => store.ListAccountsAsync());
+    }
+
+    [Fact]
+    public async Task LocalMetadataStore_AliasMutation_DoesNotTouchSessionVault()
+    {
+        string accountsPath = Path.Combine(_tempDir, "accounts.json");
+        string vaultDir = Path.Combine(_tempDir, "vault");
+        Directory.CreateDirectory(vaultDir);
+
+        var vault = new SessionVault(vaultDir, new FakeDpapiProvider());
+        var store = new LocalMetadataAccountStore(accountsPath);
+
+        var account = await store.AddAccountAsync(new CreateAccountInput(
+            Email: "vault-sep@example.com",
+            HasVaultedSession: true
+        ));
+
+        byte[] sessionBytes = System.Text.Encoding.UTF8.GetBytes("{\"token\":\"secret-session-token\"}");
+        await vault.SaveSessionAsync(account.Id, sessionBytes);
+
+        string sessionFilePath = Path.Combine(vaultDir, "sessions.dat");
+        Assert.True(File.Exists(sessionFilePath));
+        byte[] vaultBytesBefore = await File.ReadAllBytesAsync(sessionFilePath);
+        DateTime vaultModifiedBefore = File.GetLastWriteTimeUtc(sessionFilePath);
+
+        await Task.Delay(20);
+        var updated = await store.UpdateAccountAsync(account.Id, new UpdateAccountInput(
+            Alias: "SecureAccount"
+        ));
+        Assert.Equal("SecureAccount", updated!.Alias);
+
+        byte[] vaultBytesAfter = await File.ReadAllBytesAsync(sessionFilePath);
+        DateTime vaultModifiedAfter = File.GetLastWriteTimeUtc(sessionFilePath);
+
+        Assert.Equal(vaultBytesBefore, vaultBytesAfter);
+        Assert.Equal(vaultModifiedBefore, vaultModifiedAfter);
+
+        var sessionRetrieved = await vault.GetSessionAsync(account.Id);
+        Assert.Equal(sessionBytes, sessionRetrieved);
+    }
+
+    [Fact]
+    public async Task InMemoryStore_Alias_Add_Update_Normalize_Works()
+    {
+        var store = new InMemoryAccountStore();
+
+        var acc = await store.AddAccountAsync(new CreateAccountInput(
+            Email: "test@example.com",
+            Alias: "  My Alias  "
+        ));
+        Assert.Equal("My Alias", acc.Alias);
+
+        var cleared = await store.UpdateAccountAsync(acc.Id, new UpdateAccountInput(
+            Alias: "   "
+        ));
+        Assert.NotNull(cleared);
+        Assert.Null(cleared.Alias);
+
+        var reset = await store.UpdateAccountAsync(acc.Id, new UpdateAccountInput(
+            Alias: "New Name"
+        ));
+        Assert.NotNull(reset);
+        Assert.Equal("New Name", reset.Alias);
     }
 
     private sealed class ThrowingFileWriter : IDurableFileWriter

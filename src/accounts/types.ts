@@ -21,6 +21,7 @@ export interface AccountMetadata {
   readonly id: string;
   readonly email: string;
   readonly name?: string;
+  readonly alias?: string;
   /**
    * Router preference priority. Lower integer represents higher preference (1 is top priority).
    */
@@ -43,6 +44,7 @@ export interface AccountMetadata {
 export interface CreateAccountInput {
   readonly email: string;
   readonly name?: string;
+  readonly alias?: string;
   readonly priority?: number;
   readonly isReserve?: boolean;
   readonly hasVaultedSession?: boolean;
@@ -54,6 +56,7 @@ export interface CreateAccountInput {
  */
 export interface UpdateAccountInput {
   readonly name?: string;
+  readonly alias?: string;
   readonly priority?: number;
   readonly isReserve?: boolean;
   readonly validationStatus?: AccountValidationStatus;

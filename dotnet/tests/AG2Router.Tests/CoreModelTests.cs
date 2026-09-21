@@ -40,6 +40,32 @@ public class CoreModelTests
         Assert.Equal(account.Email, deserialized.Email);
         Assert.True(deserialized.HasVaultedSession);
         Assert.True(deserialized.IsActive);
+        Assert.Null(deserialized.Alias);
+    }
+
+    [Fact]
+    public void AccountMetadata_SerializesAndDeserializesCleanly_WithAlias()
+    {
+        var account = new AccountMetadata(
+            Id: "acc_123",
+            Email: "user@example.com",
+            Name: "User One",
+            Priority: 1,
+            IsReserve: false,
+            ValidationStatus: "VALID",
+            HasVaultedSession: true,
+            CreatedAt: "2026-09-20T08:00:00.000Z",
+            UpdatedAt: "2026-09-20T08:00:00.000Z",
+            Alias: "Work",
+            IsActive: true
+        );
+
+        var json = JsonSerializer.Serialize(account);
+        var deserialized = JsonSerializer.Deserialize<AccountMetadata>(json);
+
+        Assert.NotNull(deserialized);
+        Assert.Equal(account.Id, deserialized.Id);
+        Assert.Equal("Work", deserialized.Alias);
     }
 
     [Fact]

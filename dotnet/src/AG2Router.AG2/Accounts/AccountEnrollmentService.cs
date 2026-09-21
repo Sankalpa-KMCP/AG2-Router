@@ -116,7 +116,8 @@ public class AccountEnrollmentService
                     Priority: options?.Priority,
                     IsReserve: options?.IsReserve,
                     HasVaultedSession: false,
-                    Notes: options?.Notes
+                    Notes: options?.Notes,
+                    Alias: options?.Alias
                 ), cancellationToken).ConfigureAwait(false);
 
                 VaultMutationReceipt? vaultReceipt = null;
@@ -140,7 +141,8 @@ public class AccountEnrollmentService
                         ValidationStatus: AccountValidationStatus.Valid,
                         HasVaultedSession: true,
                         LastActiveAt: now,
-                        Notes: options?.Notes
+                        Notes: options?.Notes,
+                        Alias: options?.Alias
                     ), cancellationToken).ConfigureAwait(false);
 
                     if (committed == null)

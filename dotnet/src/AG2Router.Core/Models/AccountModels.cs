@@ -22,7 +22,8 @@ public record CreateAccountInput(
     int? Priority = null,
     bool? IsReserve = null,
     bool? HasVaultedSession = null,
-    string? Notes = null
+    string? Notes = null,
+    string? Alias = null
 );
 
 /// <summary>
@@ -35,7 +36,8 @@ public record UpdateAccountInput(
     string? ValidationStatus = null,
     bool? HasVaultedSession = null,
     string? LastActiveAt = null,
-    string? Notes = null
+    string? Notes = null,
+    string? Alias = null
 );
 
 /// <summary>
@@ -65,7 +67,8 @@ public record EnrollmentOptions(
     string? Name = null,
     int? Priority = null,
     bool? IsReserve = null,
-    string? Notes = null
+    string? Notes = null,
+    string? Alias = null
 );
 
 /// <summary>

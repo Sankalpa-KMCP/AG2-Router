@@ -20,6 +20,7 @@ import { AccountMetadata, IAccountStore } from './types.js';
 
 export interface EnrollmentOptions {
   readonly name?: string;
+  readonly alias?: string;
   readonly priority?: number;
   readonly isReserve?: boolean;
   readonly notes?: string;
@@ -121,6 +122,7 @@ export class AccountEnrollmentService {
         const pending = existing ?? await this.accountStore.addAccount({
           email,
           name: options.name ?? currentAccount.name ?? undefined,
+          alias: options.alias,
           priority: options.priority,
           isReserve: options.isReserve,
           hasVaultedSession: false,
@@ -137,6 +139,7 @@ export class AccountEnrollmentService {
 
           const committed = await this.accountStore.updateAccount(pending.id, {
             name: options.name,
+            alias: options.alias,
             priority: options.priority,
             isReserve: options.isReserve,
             validationStatus: 'VALID',

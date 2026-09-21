@@ -93,6 +93,24 @@ describe('InMemoryAccountStore', () => {
     assert.equal(await store.compareExchangeActiveAccountId(first.id, null), false);
     assert.equal(await store.getActiveAccountId(), second.id);
   });
+
+  it('should store, trim, and clear account alias', async () => {
+    const created = await store.addAccount({
+      email: 'alias@example.com',
+      alias: '  Work Account  '
+    });
+    assert.equal(created.alias, 'Work Account');
+
+    const updated = await store.updateAccount(created.id, {
+      alias: 'Personal'
+    });
+    assert.equal(updated?.alias, 'Personal');
+
+    const cleared = await store.updateAccount(created.id, {
+      alias: '   '
+    });
+    assert.equal(cleared?.alias, undefined);
+  });
 });
 
 describe('LocalMetadataAccountStore (Filesystem Persistence)', () => {
@@ -142,8 +160,10 @@ describe('LocalMetadataAccountStore (Filesystem Persistence)', () => {
     const full = loaded.find((account) => account.id === 'acc_shared01');
     const minimal = loaded.find((account) => account.id === 'acc_minimal1');
     assert.equal(full?.name, 'Interoperability ✓');
+    assert.equal(full?.alias, undefined);
     assert.equal(full?.hasVaultedSession, false);
     assert.equal(minimal?.name, undefined);
+    assert.equal(minimal?.alias, undefined);
     assert.equal(minimal?.notes, undefined);
     assert.equal(minimal?.hasVaultedSession, undefined);
     assert.equal(await store.getActiveAccountId(), 'acc_shared01');
@@ -269,5 +289,61 @@ describe('LocalMetadataAccountStore (Filesystem Persistence)', () => {
     assert.equal(
       resolveAccountMetadataPath(absoluteData, cwd, localRoot),
       path.resolve(absoluteData, 'accounts.json'));
+  });
+
+  it('persists account alias to disk and reloads across instances', async () => {
+    const store1 = new LocalMetadataAccountStore(tmpFile);
+    const acc = await store1.addAccount({
+      email: 'alias-persisted@example.com',
+      alias: 'Work'
+    });
+    assert.equal(acc.alias, 'Work');
+
+    const parsed = JSON.parse(await fs.readFile(tmpFile, 'utf8')) as Record<string, unknown>;
+    const stored = (parsed.accounts as Array<Record<string, unknown>>)[0];
+    assert.equal(stored.alias, 'Work');
+
+    const store2 = new LocalMetadataAccountStore(tmpFile);
+    const loaded = await store2.getAccount(acc.id);
+    assert.ok(loaded);
+    assert.equal(loaded.alias, 'Work');
+  });
+
+  it('normalizes whitespace alias to undefined and omits it from JSON', async () => {
+    const store = new LocalMetadataAccountStore(tmpFile);
+    const acc = await store.addAccount({
+      email: 'ws-alias@example.com',
+      alias: '   '
+    });
+    assert.equal(acc.alias, undefined);
+
+    const parsed = JSON.parse(await fs.readFile(tmpFile, 'utf8')) as Record<string, unknown>;
+    const stored = (parsed.accounts as Array<Record<string, unknown>>)[0];
+    assert.equal('alias' in stored, false);
+
+    await store.updateAccount(acc.id, { alias: 'Temporary' });
+    assert.equal((await store.getAccount(acc.id))?.alias, 'Temporary');
+
+    await store.updateAccount(acc.id, { alias: '   ' });
+    assert.equal((await store.getAccount(acc.id))?.alias, undefined);
+
+    const parsedAfterClear = JSON.parse(await fs.readFile(tmpFile, 'utf8')) as Record<string, unknown>;
+    const storedAfterClear = (parsedAfterClear.accounts as Array<Record<string, unknown>>)[0];
+    assert.equal('alias' in storedAfterClear, false);
+  });
+
+  it('fails closed when account record contains unrecognized keys', async () => {
+    const store = new LocalMetadataAccountStore(tmpFile);
+    await store.addAccount({ email: 'seed@example.com' });
+    const content = JSON.parse(await fs.readFile(tmpFile, 'utf8')) as Record<string, unknown>;
+    const accounts = content.accounts as Array<Record<string, unknown>>;
+    accounts[0].unrecognizedKey = 'fail';
+    await fs.writeFile(tmpFile, JSON.stringify(content, null, 2), 'utf8');
+
+    const failingStore = new LocalMetadataAccountStore(tmpFile);
+    await assert.rejects(
+      () => failingStore.listAccounts(),
+      /violates schema version 1/i
+    );
   });
 });

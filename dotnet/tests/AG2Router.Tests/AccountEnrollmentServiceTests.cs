@@ -151,6 +151,24 @@ public class AccountEnrollmentServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task EnrollCurrentAccount_WithOptionsAlias_PersistsAlias()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("alias-test@example.com", "Dev");
+        byte[] blob = Encoding.UTF8.GetBytes("{\"token\":\"test\"}");
+        _winCredStore.Seed("gemini:antigravity", "antigravity", blob);
+
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+        var result = await service.EnrollCurrentAccountAsync(new EnrollmentOptions(Alias: "Primary Work"));
+
+        Assert.True(result.Success);
+        Assert.Equal("Primary Work", result.Account.Alias);
+
+        var stored = await _accountStore.GetAccountAsync(result.Account.Id);
+        Assert.NotNull(stored);
+        Assert.Equal("Primary Work", stored.Alias);
+    }
+
+    [Fact]
     public async Task EnrollCurrentAccount_WhenVaultSaveFails_DoesNotExposeVaultedMetadata()
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("vault-failure@example.com", "Synthetic");

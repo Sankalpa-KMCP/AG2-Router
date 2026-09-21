@@ -76,6 +76,7 @@ public class InMemoryAccountStore : IAccountStore
             string now = DateTime.UtcNow.ToString("o");
             string id = $"acc_{Guid.NewGuid().ToString("N")[..8]}";
             int priority = input.Priority ?? (_accounts.Count + 1);
+            string? alias = string.IsNullOrWhiteSpace(input.Alias) ? null : input.Alias.Trim();
 
             var account = new AccountMetadata(
                 Id: id,
@@ -88,7 +89,8 @@ public class InMemoryAccountStore : IAccountStore
                 CreatedAt: now,
                 UpdatedAt: now,
                 LastActiveAt: null,
-                Notes: input.Notes
+                Notes: input.Notes,
+                Alias: alias
             );
 
             _accounts[id] = account;
@@ -109,6 +111,10 @@ public class InMemoryAccountStore : IAccountStore
                 return Task.FromResult<AccountMetadata?>(null);
             }
 
+            string? alias = updates.Alias != null
+                ? (string.IsNullOrWhiteSpace(updates.Alias) ? null : updates.Alias.Trim())
+                : existing.Alias;
+
             var updated = existing with
             {
                 Name = updates.Name != null ? updates.Name.Trim() : existing.Name,
@@ -118,6 +124,7 @@ public class InMemoryAccountStore : IAccountStore
                 HasVaultedSession = updates.HasVaultedSession ?? existing.HasVaultedSession,
                 LastActiveAt = updates.LastActiveAt ?? existing.LastActiveAt,
                 Notes = updates.Notes ?? existing.Notes,
+                Alias = alias,
                 UpdatedAt = DateTime.UtcNow.ToString("o")
             };
 
@@ -220,6 +227,10 @@ public class InMemoryAccountStore : IAccountStore
                 return Task.FromResult<AccountMetadata?>(null);
             }
 
+            string? alias = updates.Alias != null
+                ? (string.IsNullOrWhiteSpace(updates.Alias) ? null : updates.Alias.Trim())
+                : existing.Alias;
+
             var updated = existing with
             {
                 Name = updates.Name != null ? updates.Name.Trim() : existing.Name,
@@ -229,6 +240,7 @@ public class InMemoryAccountStore : IAccountStore
                 HasVaultedSession = updates.HasVaultedSession ?? existing.HasVaultedSession,
                 LastActiveAt = updates.LastActiveAt ?? existing.LastActiveAt,
                 Notes = updates.Notes ?? existing.Notes,
+                Alias = alias,
                 UpdatedAt = DateTimeOffset.UtcNow.ToString("O")
             };
             _accounts[targetId] = updated;

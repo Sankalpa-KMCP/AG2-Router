@@ -20,7 +20,7 @@ const REQUIRED_ACCOUNT_KEYS = new Set([
   'id', 'email', 'priority', 'isReserve', 'validationStatus',
   'createdAt', 'updatedAt', 'lastActiveAt'
 ]);
-const OPTIONAL_ACCOUNT_KEYS = new Set(['name', 'hasVaultedSession', 'notes']);
+const OPTIONAL_ACCOUNT_KEYS = new Set(['name', 'hasVaultedSession', 'notes', 'alias']);
 
 export function resolveAccountMetadataPath(
   dataDirectory: string | undefined = process.env.DATA_DIR,
@@ -57,7 +57,8 @@ function accountsEqual(left: AccountMetadata, right: AccountMetadata): boolean {
     left.createdAt === right.createdAt &&
     left.updatedAt === right.updatedAt &&
     left.lastActiveAt === right.lastActiveAt &&
-    left.notes === right.notes;
+    left.notes === right.notes &&
+    left.alias === right.alias;
 }
 
 function parseStoredData(raw: string, filePath: string): StoredData {
@@ -99,6 +100,7 @@ function parseStoredData(raw: string, filePath: string): StoredData {
         !(candidate.lastActiveAt === null || isValidDate(candidate.lastActiveAt)) ||
         !(candidate.name === undefined || typeof candidate.name === 'string') ||
         !(candidate.notes === undefined || typeof candidate.notes === 'string') ||
+        !(candidate.alias === undefined || typeof candidate.alias === 'string') ||
         !(candidate.hasVaultedSession === undefined || typeof candidate.hasVaultedSession === 'boolean')) {
       throw new Error(`Account metadata record '${String(id)}' contains invalid fields.`);
     }
@@ -133,10 +135,7 @@ export class InMemoryAccountStore implements IAccountStore {
 
   public async getAccountByEmail(email: string): Promise<AccountMetadata | null> {
     const normalized = email.trim().toLowerCase();
-    for (const account of this.accounts.values()) {
-      if (account.email.toLowerCase() === normalized) return account;
-    }
-    return null;
+    return Array.from(this.accounts.values()).find((account) => account.email.toLowerCase() === normalized) ?? null;
   }
 
   public async addAccount(input: CreateAccountInput): Promise<AccountMetadata> {
@@ -148,6 +147,7 @@ export class InMemoryAccountStore implements IAccountStore {
       id: `acc_${randomUUID().slice(0, 8)}`,
       email: input.email.trim(),
       name: input.name?.trim(),
+      alias: input.alias && input.alias.trim().length > 0 ? input.alias.trim() : undefined,
       priority: input.priority ?? (this.accounts.size + 1),
       isReserve: Boolean(input.isReserve),
       validationStatus: 'UNVALIDATED',
@@ -167,6 +167,9 @@ export class InMemoryAccountStore implements IAccountStore {
     const updated: AccountMetadata = {
       ...existing,
       name: updates.name !== undefined ? updates.name.trim() : existing.name,
+      alias: updates.alias !== undefined
+        ? (updates.alias.trim().length > 0 ? updates.alias.trim() : undefined)
+        : existing.alias,
       priority: updates.priority !== undefined ? updates.priority : existing.priority,
       isReserve: updates.isReserve !== undefined ? updates.isReserve : existing.isReserve,
       validationStatus: updates.validationStatus ?? existing.validationStatus,
@@ -302,6 +305,7 @@ export class LocalMetadataAccountStore implements IAccountStore {
         id: `acc_${randomUUID().slice(0, 8)}`,
         email,
         name: input.name?.trim(),
+        alias: input.alias && input.alias.trim().length > 0 ? input.alias.trim() : undefined,
         priority: input.priority ?? current.accounts.length + 1,
         isReserve: Boolean(input.isReserve),
         validationStatus: 'UNVALIDATED',
@@ -323,6 +327,9 @@ export class LocalMetadataAccountStore implements IAccountStore {
       const updated: AccountMetadata = {
         ...existing,
         name: updates.name !== undefined ? updates.name.trim() : existing.name,
+        alias: updates.alias !== undefined
+          ? (updates.alias.trim().length > 0 ? updates.alias.trim() : undefined)
+          : existing.alias,
         priority: updates.priority ?? existing.priority,
         isReserve: updates.isReserve ?? existing.isReserve,
         validationStatus: updates.validationStatus ?? existing.validationStatus,

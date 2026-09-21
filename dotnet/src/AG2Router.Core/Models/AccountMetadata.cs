@@ -12,6 +12,7 @@ public record AccountMetadata(
     string UpdatedAt,
     string? LastActiveAt = null,
     string? Notes = null,
+    string? Alias = null,
     bool IsActive = false
 );
 
