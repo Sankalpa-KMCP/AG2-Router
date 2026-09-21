@@ -283,7 +283,122 @@ public class ReleasePackagingTests
         Assert.Contains("Required packaging output is missing", packageScript);
     }
 
+    #region Inno Setup Upgrade & Safety Semantics (vNext)
+
+    [Fact]
+    public void InnoSetup_AppIdAndUpgradeDirectives_AreEnforced()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+
+        // 1. Stable AppId invariant
+        Assert.Contains("AppId={{D37E7404-585A-4B6A-B7F9-5360980DF628}", issContent);
+
+        // 2. Default directory and seamless upgrade directives
+        Assert.Contains(@"DefaultDirName={localappdata}\Programs\AG2Router", issContent);
+        Assert.Contains("DisableDirPage=auto", issContent);
+        Assert.Contains("CloseApplications=no", issContent);
+        Assert.Contains("PrivilegesRequired=lowest", issContent);
+    }
+
+    [Fact]
+    public void InnoSetup_NeverTouchesUserDataOrCredentialManager()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+
+        // Inno Setup must never touch %LOCALAPPDATA%\AG2-Router or gemini:antigravity
+        Assert.DoesNotContain("AG2-Router", issContent);
+        Assert.DoesNotContain("gemini:antigravity", issContent);
+        Assert.DoesNotContain("[UninstallDelete]", issContent);
+    }
+
+    [Theory]
+    // Positive match: exact legacy script registration properties
+    [InlineData("AG2 Router", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe -File ""C:\Users\test\AppData\Local\Programs\AG2Router\uninstall.ps1""", @"C:\Users\test\AppData\Local\Programs\AG2Router", true)]
+    [InlineData("ag2 router", "ag2", @"C:\Users\test\AppData\Local\Programs\AG2Router\", @"powershell.exe -File C:\Users\test\AppData\Local\Programs\AG2Router\uninstall.ps1", @"C:\Users\test\AppData\Local\Programs\AG2Router", true)]
+    // Negative guards: foreign name, publisher, mismatched directory, or foreign uninstall string
+    [InlineData("Other App", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe -File uninstall.ps1", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData("AG2 Router", "Other Corp", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe -File uninstall.ps1", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData("AG2 Router", "AG2", @"C:\Program Files\OtherApp", @"powershell.exe -File uninstall.ps1", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData("AG2 Router", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"cmd.exe /c del /f", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData(null, "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    public void LegacyScriptUninstall_StrictGuards_RecognizeOnlyOwnedRegistrations(
+        string? displayName,
+        string? publisher,
+        string? installLocation,
+        string? uninstallString,
+        string expectedAppDir,
+        bool expectedResult)
+    {
+        bool isOwned = IsLegacyScriptUninstallOwned(displayName, publisher, installLocation, uninstallString, expectedAppDir);
+        Assert.Equal(expectedResult, isOwned);
+    }
+
+    /// <summary>
+    /// Mirrors the exact 5-guard Pascal verification logic in Inno Setup.
+    /// </summary>
+    public static bool IsLegacyScriptUninstallOwned(
+        string? displayName,
+        string? publisher,
+        string? installLocation,
+        string? uninstallString,
+        string expectedAppDir)
+    {
+        if (string.IsNullOrWhiteSpace(displayName) || !string.Equals(displayName.Trim(), "AG2 Router", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (string.IsNullOrWhiteSpace(publisher) || !string.Equals(publisher.Trim(), "AG2", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (string.IsNullOrWhiteSpace(installLocation))
+            return false;
+
+        string cleanInstallLocation = installLocation.Trim().TrimEnd('\\');
+        string cleanExpectedAppDir = expectedAppDir.Trim().TrimEnd('\\');
+        if (!string.Equals(cleanInstallLocation, cleanExpectedAppDir, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(uninstallString))
+            return false;
+        string lowerUninstall = uninstallString.ToLowerInvariant();
+        if (!lowerUninstall.Contains("uninstall.ps1") && !lowerUninstall.Contains("ag2router"))
+            return false;
+
+        return true;
+    }
+
+    [Fact]
+    public void InnoSetup_PrunesLegacyUninstallKeyDuringPostInstall()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+
+        Assert.Contains("procedure CurStepChanged", issContent);
+        Assert.Contains("CurStep = ssPostInstall", issContent);
+        Assert.Contains(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router", issContent);
+        Assert.Contains("RegDeleteKeyIncludingSubkeys", issContent);
+    }
+
+    [Fact]
+    public void StartupRunKey_IsNeverDisturbedDuringUpgrade()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+
+        // Ensure no [Registry] directive touches the Run key
+        Assert.DoesNotContain("[Registry]", issContent);
+
+        // Verify RegDeleteValue on Run key only occurs in CurUninstallStepChanged (usUninstall)
+        Assert.Contains("CurUninstallStep = usUninstall", issContent);
+        int runKeyDeletePos = issContent.IndexOf(@"RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run'", StringComparison.Ordinal);
+        Assert.True(runKeyDeletePos > 0);
+        string deleteSection = issContent.Substring(runKeyDeletePos);
+        Assert.DoesNotContain("CurStepChanged", deleteSection);
+    }
+
+    #endregion
+
     private static string FindRepositoryRoot()
+
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir != null && !File.Exists(Path.Combine(dir.FullName, "package.json")))

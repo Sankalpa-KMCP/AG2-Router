@@ -88,6 +88,62 @@ begin
   end;
 end;
 
+// Helper function to strip trailing backslashes for exact path comparisons
+function StripTrailingBackslash(const S: String): String;
+begin
+  Result := S;
+  while (Length(Result) > 0) and (Result[Length(Result)] = '\') do
+    Delete(Result, Length(Result), 1);
+end;
+
+// Safely prune legacy script-based uninstall registration (from scripts/install.ps1)
+// to guarantee a single entry in Windows Installed Apps post-upgrade.
+procedure CleanLegacyScriptUninstallRegistration();
+var
+  LegacyKey: String;
+  DisplayNameVal: String;
+  PublisherVal: String;
+  InstallLocationVal: String;
+  UninstallStringVal: String;
+  ExpectedAppDir: String;
+  LowerUninstall: String;
+begin
+  LegacyKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router';
+
+  // Guard 1: Legacy registry key must exist in HKCU
+  if not RegKeyExists(HKCU, LegacyKey) then
+    Exit;
+
+  // Guard 2: DisplayName must match 'AG2 Router'
+  if not RegQueryStringValue(HKCU, LegacyKey, 'DisplayName', DisplayNameVal) or
+     (CompareText(Trim(DisplayNameVal), 'AG2 Router') <> 0) then
+    Exit;
+
+  // Guard 3: Publisher must match 'AG2'
+  if not RegQueryStringValue(HKCU, LegacyKey, 'Publisher', PublisherVal) or
+     (CompareText(Trim(PublisherVal), 'AG2') <> 0) then
+    Exit;
+
+  // Guard 4: InstallLocation must match the active {app} target directory
+  if not RegQueryStringValue(HKCU, LegacyKey, 'InstallLocation', InstallLocationVal) then
+    Exit;
+
+  ExpectedAppDir := StripTrailingBackslash(ExpandConstant('{app}'));
+  if CompareText(StripTrailingBackslash(Trim(InstallLocationVal)), ExpectedAppDir) <> 0 then
+    Exit;
+
+  // Guard 5: UninstallString must reference 'uninstall.ps1' or 'AG2Router'
+  if not RegQueryStringValue(HKCU, LegacyKey, 'UninstallString', UninstallStringVal) then
+    Exit;
+
+  LowerUninstall := Lowercase(UninstallStringVal);
+  if (Pos('uninstall.ps1', LowerUninstall) = 0) and (Pos('ag2router', LowerUninstall) = 0) then
+    Exit;
+
+  // All 5 strict ownership guards passed: safe to delete legacy uninstall key
+  RegDeleteKeyIncludingSubkeys(HKCU, LegacyKey);
+end;
+
 // Graceful shutdown before installing or upgrading over existing files
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
@@ -105,6 +161,11 @@ begin
       begin
         Result := 'AG2 Router is currently running and could not be gracefully closed.' + #13#10 +
                   'Please exit AG2 Router from the system tray before proceeding with installation.';
+      end
+      else
+      begin
+        // Allow brief pause for OS process handle closure and file unlocks before extraction
+        Sleep(250);
       end;
     end
     else
@@ -113,6 +174,15 @@ begin
     end;
   end;
 end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    CleanLegacyScriptUninstallRegistration();
+  end;
+end;
+
 
 // Startup ownership verification during uninstall
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
