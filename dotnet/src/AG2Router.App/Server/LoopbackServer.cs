@@ -34,6 +34,7 @@ public class LoopbackServer : IAsyncDisposable
         IAccountStore? accountStore = null,
         ISessionVault? sessionVault = null,
         AccountEnrollmentService? enrollmentService = null,
+        INativeAccountSwitchCoordinator? switchCoordinator = null,
         CancellationToken cancellationToken = default)
     {
         var builder = WebApplication.CreateSlimBuilder();
@@ -259,20 +260,53 @@ public class LoopbackServer : IAsyncDisposable
         // GET /api/switching/status - Switching state machine status
         _app.MapGet("/api/switching/status", () =>
         {
-            return Results.Ok(new SwitchStatusContainerDto(new SwitchingStatusDto(
-                ActiveTransactionId: null,
-                CurrentState: "IDLE",
-                LastResult: null
-            )));
+            if (switchCoordinator == null)
+            {
+                return Results.Ok(new SwitchStatusContainerDto(new SwitchingStatusDto(
+                    ActiveTransactionId: null,
+                    CurrentState: "IDLE",
+                    LastResult: null
+                )));
+            }
+            return Results.Ok(new { status = switchCoordinator.GetStatus() });
         });
 
         // POST /api/accounts/{id}/switch-plan - Dry-run evaluation
         _app.MapPost("/api/accounts/{id}/switch-plan", (string id) =>
             Results.Json(new { error = "Switch planner service is not configured" }, statusCode: StatusCodes.Status501NotImplemented));
 
-        // POST /api/accounts/{id}/switch - Enforced hard safety boundary preventing live mutation
-        _app.MapPost("/api/accounts/{id}/switch", (string id) =>
-            Results.Json(new { error = "Live account switching execution is not authorized in this runtime mode. Use switch-plan for dry-run evaluation." }, statusCode: StatusCodes.Status403Forbidden));
+        // POST /api/accounts/{id}/switch - Explicit user-requested native switch only.
+        _app.MapPost("/api/accounts/{id}/switch", async (string id, HttpContext context) =>
+        {
+            if (switchCoordinator == null)
+            {
+                return Results.Json(new { error = "Native account switching is not configured." },
+                    statusCode: StatusCodes.Status501NotImplemented);
+            }
+            if (string.IsNullOrWhiteSpace(id) || id.Contains('/') || id.Contains('\\'))
+            {
+                return Results.Json(new { error = "Account ID required" },
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            var result = await switchCoordinator.SwitchAsync(id, context.RequestAborted);
+            int statusCode = result.Code switch
+            {
+                SwitchResultCodes.Success => StatusCodes.Status200OK,
+                SwitchResultCodes.TargetNotFound => StatusCodes.Status404NotFound,
+                SwitchResultCodes.TelemetryUnavailable => StatusCodes.Status503ServiceUnavailable,
+                SwitchResultCodes.SwitchFailedRollbackFailed => StatusCodes.Status503ServiceUnavailable,
+                SwitchResultCodes.Cancelled => StatusCodes.Status408RequestTimeout,
+                SwitchResultCodes.SwitchFailedRolledBack => StatusCodes.Status500InternalServerError,
+                SwitchResultCodes.TargetNotVaulted or
+                SwitchResultCodes.AlreadyActive or
+                SwitchResultCodes.Ag2Busy or
+                SwitchResultCodes.UnsafeProcess or
+                SwitchResultCodes.SwitchInProgress => StatusCodes.Status409Conflict,
+                _ => StatusCodes.Status500InternalServerError
+            };
+            return Results.Json(result, statusCode: statusCode);
+        });
 
         _app.MapPost("/api/config", () =>
             Results.Json(new { error = "Configuration updates are not implemented in native shell foundation." }, statusCode: StatusCodes.Status501NotImplemented));

@@ -109,9 +109,9 @@ public class LoopbackServerTests
             var planRes = await httpClient.PostAsync($"{server.BoundUrl}/api/accounts/acc_1/switch-plan", null);
             Assert.Equal(HttpStatusCode.NotImplemented, planRes.StatusCode);
 
-            // POST /api/accounts/acc_1/switch -> 403 Forbidden
+            // POST /api/accounts/acc_1/switch -> 501 when no native coordinator is configured
             var switchRes = await httpClient.PostAsync($"{server.BoundUrl}/api/accounts/acc_1/switch", null);
-            Assert.Equal(HttpStatusCode.Forbidden, switchRes.StatusCode);
+            Assert.Equal(HttpStatusCode.NotImplemented, switchRes.StatusCode);
 
             // DELETE /api/accounts/acc_1 -> 501 Not Implemented
             var delRes = await httpClient.DeleteAsync($"{server.BoundUrl}/api/accounts/acc_1");

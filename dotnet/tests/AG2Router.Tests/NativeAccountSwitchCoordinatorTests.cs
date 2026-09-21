@@ -1,0 +1,512 @@
+using System.Collections.Concurrent;
+using System.IO;
+using System.Text;
+using AG2Router.AG2.Accounts;
+using AG2Router.AG2.Switching;
+using AG2Router.AG2.Vault;
+using AG2Router.Core.Contracts;
+using AG2Router.Core.Models;
+using Xunit;
+
+namespace AG2Router.Tests;
+
+public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
+{
+    private readonly string _tempDir = Path.Combine(Path.GetTempPath(), $"ag2_switch_{Guid.NewGuid():N}");
+    private readonly InMemoryAccountStore _accounts = new();
+    private readonly FakeDpapiProvider _dpapi = new();
+    private readonly SwitchCredentialStore _credentials = new();
+    private readonly SwitchAdapter _adapter = new();
+    private readonly SwitchProcessLifecycle _process = new();
+    private readonly SessionVault _vault;
+    private AccountMetadata? _source;
+    private AccountMetadata? _target;
+
+    public NativeAccountSwitchCoordinatorTests()
+    {
+        Directory.CreateDirectory(_tempDir);
+        _vault = new SessionVault(_tempDir, _dpapi);
+        _credentials.Set(Credential("source@example.com", "source-secret"));
+        _adapter.Identity = new AccountIdentityDto("source@example.com");
+        _process.OnReplacement = () => _adapter.Identity = new AccountIdentityDto("target@example.com");
+        _process.OnRestore = () => _adapter.Identity = new AccountIdentityDto("source@example.com");
+    }
+
+    public void Dispose()
+    {
+        _credentials.Clear();
+        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+    }
+
+    [Fact]
+    public async Task MissingTargetFailsBeforeMutation()
+    {
+        var result = await Coordinator().SwitchAsync("missing");
+        Assert.Equal(SwitchResultCodes.TargetNotFound, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+    }
+
+    [Fact]
+    public async Task MissingVaultFailsBeforeMutation()
+    {
+        await SeedAccountsAsync(vaultTarget: false);
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.TargetNotVaulted, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task AlreadyActiveFailsBeforeMutation()
+    {
+        await SeedAccountsAsync();
+        await _accounts.SetActiveAccountIdAsync(_target!.Id);
+        _adapter.Identity = new AccountIdentityDto(_target.Email);
+        var result = await Coordinator().SwitchAsync(_target.Id);
+        Assert.Equal(SwitchResultCodes.AlreadyActive, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Theory]
+    [InlineData("BUSY", 1, SwitchResultCodes.Ag2Busy)]
+    [InlineData("UNKNOWN", 0, SwitchResultCodes.TelemetryUnavailable)]
+    public async Task NonIdleActivityFailsClosed(string state, int running, string expected)
+    {
+        await SeedAccountsAsync();
+        _adapter.Activity = new ActivityStatusDto(state, running, running, DateTimeOffset.UtcNow.ToString("O"));
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(expected, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Theory]
+    [InlineData("DEGRADED")]
+    [InlineData("OFFLINE")]
+    [InlineData("ERROR")]
+    public async Task UnavailableTelemetryFailsClosed(string status)
+    {
+        await SeedAccountsAsync();
+        _adapter.Status = new Ag2StatusDto(false, status, _adapter.Activity, "synthetic");
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task AmbiguousOrUnverifiedProcessFailsBeforeCredentialWrite()
+    {
+        await SeedAccountsAsync();
+        _process.CaptureError = new AG2ProcessLifecycleException("ambiguous synthetic processes");
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.UnsafeProcess, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task SuccessfulSyntheticSwitchVerifiesIdentityThenCommitsMetadata()
+    {
+        await SeedAccountsAsync();
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.True(result.Success);
+        Assert.Equal(SwitchResultCodes.Success, result.Code);
+        Assert.Equal(_target.Id, await _accounts.GetActiveAccountIdAsync());
+        Assert.True((await _accounts.GetAccountAsync(_target.Id))!.HasVaultedSession);
+        Assert.Equal("target@example.com", _adapter.Identity!.Email);
+        Assert.Equal(1, _process.StopCount);
+        Assert.Equal(1, _process.LaunchCount);
+        Assert.Contains("TARGET_IDENTITY_VERIFIED", result.StagesCompleted);
+        Assert.True(result.StagesCompleted.IndexOf("TARGET_IDENTITY_VERIFIED") <
+                    result.StagesCompleted.IndexOf("METADATA_COMMITTED"));
+    }
+
+    [Theory]
+    [InlineData("credential")]
+    [InlineData("stop")]
+    [InlineData("launch")]
+    [InlineData("reconnect")]
+    [InlineData("wrong_identity")]
+    [InlineData("identity_timeout")]
+    public async Task PostMutationFailuresRollbackCredentialProcessAndIdentity(string failure)
+    {
+        await SeedAccountsAsync();
+        ConfigureFailure(failure);
+
+        var result = await Coordinator(TimeSpan.FromMilliseconds(40)).SwitchAsync(_target!.Id);
+
+        Assert.False(result.Success);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
+        Assert.Equal("source-secret", Encoding.UTF8.GetString(_credentials.Snapshot().Blob));
+        Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
+        Assert.Equal("source@example.com", _adapter.Identity!.Email);
+        Assert.True(_process.RestoreCount >= 1);
+        Assert.Contains("SOURCE_IDENTITY_VERIFIED", result.StagesCompleted);
+    }
+
+    [Fact]
+    public async Task RollbackCredentialWriteFailureIsExplicitManualRecovery()
+    {
+        await SeedAccountsAsync();
+        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
+        _credentials.WriteBehavior = (call, entry, _) =>
+        {
+            if (call == 1) { _credentials.Set(entry); return Task.FromResult(true); }
+            throw new InvalidOperationException("synthetic rollback write failure");
+        };
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, result.Code);
+        Assert.False(result.Success);
+        Assert.Contains("manual recovery", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.NotEqual(_target.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public async Task RollbackIdentityVerificationFailureIsExplicit()
+    {
+        await SeedAccountsAsync();
+        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
+        _process.OnRestore = () => _adapter.Identity = new AccountIdentityDto("wrong-source@example.com");
+        var result = await Coordinator(TimeSpan.FromMilliseconds(30)).SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, result.Code);
+        Assert.Contains("ROLLBACK_FAILED", result.StagesCompleted);
+    }
+
+    [Fact]
+    public async Task RollbackProcessRestoreFailureIsExplicit()
+    {
+        await SeedAccountsAsync();
+        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
+        _process.RestoreError = new AG2ProcessLifecycleException("synthetic restore failure");
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, result.Code);
+    }
+
+    [Fact]
+    public async Task FinalMetadataCasConflictPreservesNewerActiveSelectionAndRollsBackRuntime()
+    {
+        await SeedAccountsAsync();
+        var third = await _accounts.AddAccountAsync(new CreateAccountInput(Email: "third@example.com"));
+        _process.OnReplacement = () =>
+        {
+            _adapter.Identity = new AccountIdentityDto("target@example.com");
+            _accounts.SetActiveAccountIdAsync(third.Id).GetAwaiter().GetResult();
+        };
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
+        Assert.Equal(third.Id, await _accounts.GetActiveAccountIdAsync());
+        Assert.Equal("source@example.com", _adapter.Identity!.Email);
+        Assert.Equal("source-secret", Encoding.UTF8.GetString(_credentials.Snapshot().Blob));
+    }
+
+    [Fact]
+    public async Task ConcurrentRequestsNeverOverlapCredentialMutation()
+    {
+        await SeedAccountsAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _credentials.WriteBehavior = async (call, entry, ct) =>
+        {
+            if (call == 1)
+            {
+                _credentials.Set(entry);
+                entered.TrySetResult();
+                await release.Task.WaitAsync(ct);
+                return true;
+            }
+            _credentials.Set(entry);
+            return true;
+        };
+
+        Task<NativeSwitchResult> first = Coordinator().SwitchAsync(_target!.Id);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var second = await Coordinator().SwitchAsync(_target.Id);
+        Assert.Equal(SwitchResultCodes.SwitchInProgress, second.Code);
+        Assert.Equal(1, _credentials.WriteCount);
+        release.TrySetResult();
+        Assert.True((await first).Success);
+    }
+
+    [Fact]
+    public async Task CancellationBeforeMutationMakesNoChanges()
+    {
+        await SeedAccountsAsync();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var result = await Coordinator().SwitchAsync(_target!.Id, cts.Token);
+        Assert.Equal(SwitchResultCodes.Cancelled, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public async Task CancellationDuringUncertainCredentialWriteStillRollsBack()
+    {
+        await SeedAccountsAsync();
+        using var cts = new CancellationTokenSource();
+        _credentials.WriteBehavior = (call, entry, _) =>
+        {
+            _credentials.Set(entry);
+            if (call == 1)
+            {
+                cts.Cancel();
+                throw new OperationCanceledException(cts.Token);
+            }
+            return Task.FromResult(true);
+        };
+        var result = await Coordinator().SwitchAsync(_target!.Id, cts.Token);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
+        Assert.Equal("source-secret", Encoding.UTF8.GetString(_credentials.Snapshot().Blob));
+    }
+
+    [Fact]
+    public async Task StaleProcessGenerationBeforeMutationIsRejected()
+    {
+        await SeedAccountsAsync();
+        _process.RevalidateErrorOnCall = 2;
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task StaleGenerationCannotFalselyVerifyTarget()
+    {
+        await SeedAccountsAsync();
+        _process.GenerationCurrent = false;
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
+        Assert.NotEqual(_target.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public async Task ExternalCredentialChangeIsNeverOverwrittenByRollback()
+    {
+        await SeedAccountsAsync();
+        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
+        _credentials.WriteBehavior = (call, entry, _) =>
+        {
+            if (call == 1)
+            {
+                _credentials.Set(Credential("external@example.com", "external-newer-secret"));
+                return Task.FromResult(true);
+            }
+            _credentials.Set(entry);
+            return Task.FromResult(true);
+        };
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, result.Code);
+        Assert.Equal("external-newer-secret", Encoding.UTF8.GetString(_credentials.Snapshot().Blob));
+    }
+
+    [Fact]
+    public async Task SensitiveDependencyErrorsAreRedactedFromResultAndStatus()
+    {
+        await SeedAccountsAsync();
+        _process.StopError = new AG2ProcessLifecycleException(
+            "--csrf_token supersecret --host_bridge_token=bridgevalue --password hunter2");
+        _process.RestoreError = new AG2ProcessLifecycleException("token=rollbacksecret");
+        var coordinator = Coordinator();
+        var result = await coordinator.SwitchAsync(_target!.Id);
+        string exposed = System.Text.Json.JsonSerializer.Serialize(new { result, status = coordinator.GetStatus() });
+        Assert.DoesNotContain("supersecret", exposed);
+        Assert.DoesNotContain("bridgevalue", exposed);
+        Assert.DoesNotContain("hunter2", exposed);
+        Assert.DoesNotContain("rollbacksecret", exposed);
+    }
+
+    private async Task SeedAccountsAsync(bool vaultTarget = true)
+    {
+        _source = await _accounts.AddAccountAsync(new CreateAccountInput(
+            Email: "source@example.com", HasVaultedSession: true));
+        _target = await _accounts.AddAccountAsync(new CreateAccountInput(
+            Email: "target@example.com", HasVaultedSession: vaultTarget));
+        await _accounts.SetActiveAccountIdAsync(_source.Id);
+        if (vaultTarget)
+        {
+            await _vault.SaveSessionAsync(_target.Id, Encoding.UTF8.GetBytes("target-secret"));
+        }
+    }
+
+    private NativeAccountSwitchCoordinator Coordinator(TimeSpan? verificationTimeout = null) =>
+        new(_accounts, _vault, _credentials, _credentials, _adapter, _process,
+            processTimeout: TimeSpan.FromMilliseconds(100),
+            verificationTimeout: verificationTimeout ?? TimeSpan.FromMilliseconds(100),
+            pollInterval: TimeSpan.FromMilliseconds(5));
+
+    private void ConfigureFailure(string failure)
+    {
+        switch (failure)
+        {
+            case "credential":
+                _credentials.WriteBehavior = (call, entry, _) =>
+                {
+                    _credentials.Set(entry);
+                    if (call == 1) throw new InvalidOperationException("synthetic uncertain write failure");
+                    return Task.FromResult(true);
+                };
+                break;
+            case "stop": _process.StopError = new AG2ProcessLifecycleException("stop failed"); break;
+            case "launch": _process.LaunchError = new AG2ProcessLifecycleException("launch failed"); break;
+            case "reconnect": _process.WaitError = new AG2ProcessLifecycleException("reconnect timeout"); break;
+            case "wrong_identity":
+                _process.OnReplacement = () => _adapter.Identity = new AccountIdentityDto("wrong@example.com");
+                break;
+            case "identity_timeout": _process.OnReplacement = () => _adapter.Identity = null; break;
+        }
+    }
+
+    private static WinCredEntry Credential(string user, string secret) =>
+        new("gemini:antigravity", 1, user, 2, Encoding.UTF8.GetBytes(secret));
+
+    private sealed class SwitchCredentialStore : IWinCredReader, IWinCredWriter
+    {
+        private WinCredEntry? _current;
+        public int WriteCount { get; private set; }
+        public Func<int, WinCredEntry, CancellationToken, Task<bool>>? WriteBehavior { get; set; }
+
+        public void Set(WinCredEntry entry)
+        {
+            Clear();
+            _current = Clone(entry);
+        }
+
+        public WinCredEntry Snapshot() => Clone(_current!);
+
+        public Task<WinCredEntry?> ReadCredentialAsync(
+            string target = "gemini:antigravity",
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult<WinCredEntry?>(_current == null ? null : Clone(_current));
+        }
+
+        public async Task<bool> WriteCredentialAsync(
+            WinCredEntry entry,
+            CancellationToken cancellationToken = default)
+        {
+            WriteCount++;
+            if (WriteBehavior != null) return await WriteBehavior(WriteCount, entry, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            Set(entry);
+            return true;
+        }
+
+        public void Clear()
+        {
+            if (_current?.Blob is { Length: > 0 })
+                System.Security.Cryptography.CryptographicOperations.ZeroMemory(_current.Blob);
+            _current = null;
+        }
+
+        private static WinCredEntry Clone(WinCredEntry entry) =>
+            new(entry.Target, entry.Type, entry.UserName, entry.Persistence, (byte[])entry.Blob.Clone());
+    }
+
+    private sealed class SwitchAdapter : IAG2Adapter
+    {
+        public AccountIdentityDto? Identity { get; set; }
+        public ActivityStatusDto Activity { get; set; } =
+            new("IDLE", 0, 0, DateTimeOffset.UtcNow.ToString("O"));
+        public Ag2StatusDto Status { get; set; } =
+            new(true, "HEALTHY", new ActivityStatusDto("IDLE", 0, 0, DateTimeOffset.UtcNow.ToString("O")), "synthetic");
+
+        public Task<Ag2StatusDto> GetStatusAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(Status);
+        public Task<AccountIdentityDto?> GetCurrentAccountAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(Identity);
+        public Task<QuotaSnapshotDto?> GetQuotaAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult<QuotaSnapshotDto?>(null);
+        public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(Activity);
+    }
+
+    private sealed class SwitchProcessLifecycle : IAG2ProcessLifecycle
+    {
+        private readonly AG2ProcessSnapshot _snapshot = new(
+            100, DateTime.UtcNow.AddMinutes(-1), @"C:\Synthetic\Antigravity\resources\bin\language_server.exe",
+            ["--standalone", "--csrf_token", "synthetic"],
+            ["--standalone", "--csrf_token", "[REDACTED]"], 10, DateTime.UtcNow.AddDays(-1), 1);
+        private readonly AG2ProcessGeneration _replacement = new(
+            101, DateTime.UtcNow, @"C:\Synthetic\Antigravity\resources\bin\language_server.exe", 2);
+        private int _revalidateCalls;
+
+        public Exception? CaptureError { get; set; }
+        public Exception? StopError { get; set; }
+        public Exception? LaunchError { get; set; }
+        public Exception? WaitError { get; set; }
+        public Exception? RestoreError { get; set; }
+        public int RevalidateErrorOnCall { get; set; }
+        public bool GenerationCurrent { get; set; } = true;
+        public int StopCount { get; private set; }
+        public int LaunchCount { get; private set; }
+        public int RestoreCount { get; private set; }
+        public Action? OnReplacement { get; set; }
+        public Action? OnRestore { get; set; }
+
+        public Task<AG2ProcessSnapshot> CaptureVerifiedAsync(CancellationToken cancellationToken = default) =>
+            CaptureError != null ? Task.FromException<AG2ProcessSnapshot>(CaptureError) : Task.FromResult(_snapshot);
+
+        public Task RevalidateAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default)
+        {
+            _revalidateCalls++;
+            if (RevalidateErrorOnCall == _revalidateCalls)
+                throw new AG2ProcessLifecycleException("stale synthetic process generation");
+            return Task.CompletedTask;
+        }
+
+        public Task StopVerifiedAsync(
+            AG2ProcessSnapshot snapshot,
+            TimeSpan timeout,
+            CancellationToken cancellationToken = default)
+        {
+            StopCount++;
+            return StopError != null ? Task.FromException(StopError) : Task.CompletedTask;
+        }
+
+        public Task<int> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default)
+        {
+            LaunchCount++;
+            return LaunchError != null ? Task.FromException<int>(LaunchError) : Task.FromResult(101);
+        }
+
+        public Task<AG2ProcessGeneration> WaitForHealthyReplacementAsync(
+            AG2ProcessSnapshot original,
+            int launchedProcessId,
+            TimeSpan timeout,
+            CancellationToken cancellationToken = default)
+        {
+            if (WaitError != null) return Task.FromException<AG2ProcessGeneration>(WaitError);
+            OnReplacement?.Invoke();
+            return Task.FromResult(_replacement);
+        }
+
+        public Task<AG2ProcessGeneration> RestoreAsync(
+            AG2ProcessSnapshot original,
+            TimeSpan timeout,
+            CancellationToken cancellationToken = default)
+        {
+            RestoreCount++;
+            if (RestoreError != null) return Task.FromException<AG2ProcessGeneration>(RestoreError);
+            GenerationCurrent = true;
+            OnRestore?.Invoke();
+            return Task.FromResult(new AG2ProcessGeneration(102, DateTime.UtcNow,
+                original.ExecutablePath, 3));
+        }
+
+        public Task<bool> IsGenerationCurrentAsync(
+            AG2ProcessGeneration generation,
+            CancellationToken cancellationToken = default) => Task.FromResult(GenerationCurrent);
+    }
+}
+
+internal static class SwitchTestListExtensions
+{
+    public static int IndexOf(this IReadOnlyList<string> values, string value)
+    {
+        for (int i = 0; i < values.Count; i++) if (values[i] == value) return i;
+        return -1;
+    }
+}
