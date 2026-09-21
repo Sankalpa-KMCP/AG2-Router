@@ -83,9 +83,18 @@ public partial class App : System.Windows.Application
 
         if (e.Args.Contains("--exit"))
         {
-            Log("Command line: --exit requested. Forwarding to primary instance.");
-            SingleInstanceGuard.SendCommand("EXIT");
-            Shutdown();
+            Log("Command line: --exit requested. Requesting graceful shutdown of primary instance...");
+            bool exited = SingleInstanceGuard.RequestExitAndWait(timeoutMs: 5000);
+            if (exited)
+            {
+                Log("Primary instance confirmed exited (or was not running).");
+                Shutdown(0);
+            }
+            else
+            {
+                Log("Warning: Primary instance did not exit within 5000ms.");
+                Shutdown(1);
+            }
             return;
         }
 

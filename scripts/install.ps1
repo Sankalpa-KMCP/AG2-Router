@@ -24,7 +24,10 @@ if ($runningProcesses) {
     Write-Host "Detected running AG2 Router instance. Requesting graceful shutdown (--exit)..."
     if (Test-Path $ExePath) {
         try {
-            Start-Process -FilePath $ExePath -ArgumentList "--exit" -Wait -WindowStyle Hidden
+            $exitProcess = Start-Process -FilePath $ExePath -ArgumentList "--exit" -Wait -PassThru -WindowStyle Hidden
+            if ($exitProcess.ExitCode -ne 0) {
+                Write-Warning "Shutdown request (--exit) returned exit code $($exitProcess.ExitCode)"
+            }
         } catch {
             Write-Warning "Failed to invoke --exit signal: $_"
         }

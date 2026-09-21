@@ -36,7 +36,10 @@ if ($runningProcesses) {
     Write-Host "Detected running AG2 Router instance. Requesting graceful shutdown (--exit)..."
     if (Test-Path $ExePath) {
         try {
-            Start-Process -FilePath $ExePath -ArgumentList "--exit" -Wait -WindowStyle Hidden
+            $exitProcess = Start-Process -FilePath $ExePath -ArgumentList "--exit" -Wait -PassThru -WindowStyle Hidden
+            if ($exitProcess.ExitCode -ne 0) {
+                Write-Warning "Shutdown request (--exit) returned exit code $($exitProcess.ExitCode)"
+            }
         } catch {
             Write-Warning "Failed to invoke --exit signal: $_"
         }
@@ -61,14 +64,21 @@ if (Test-Path $RunKey) {
     $runVal = (Get-ItemProperty -Path $RunKey -Name $RunValueName -ErrorAction SilentlyContinue).$RunValueName
     if ($runVal) {
         Write-Host "Evaluating startup registration ownership for '$RunValueName'..."
-        # Extract executable path from registry string (handles quotes and command line args like --tray)
-        $cleanRunPath = $runVal.Trim().Trim('"')
-        if ($cleanRunPath -match '^(?<exe>[^"]+?\.exe)($|\s+.*)') {
-            $cleanRunPath = $Matches['exe'].Trim()
+        # Extract executable path from registry string
+        # Handles canonical quoted paths: "C:\path\AG2Router.exe" --tray
+        # Handles unquoted paths: C:\path\AG2Router.exe --tray
+        $trimmedRunVal = $runVal.Trim()
+        $extractedExe = $null
+        if ($trimmedRunVal -match '^"(?<exe>[^"]+)"(?:\s+.*)?$') {
+            $extractedExe = $Matches['exe'].Trim()
+        } elseif ($trimmedRunVal -match '^(?<exe>.*?\.exe)(?:\s+.*)?$') {
+            $extractedExe = $Matches['exe'].Trim()
+        } else {
+            $extractedExe = $trimmedRunVal
         }
 
         try {
-            $normalizedRunPath = [System.IO.Path]::GetFullPath($cleanRunPath)
+            $normalizedRunPath = [System.IO.Path]::GetFullPath($extractedExe)
             $normalizedExePath = [System.IO.Path]::GetFullPath($ExePath)
 
             if ($normalizedRunPath.Equals($normalizedExePath, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -78,7 +88,7 @@ if (Test-Path $RunKey) {
                 Write-Host "  [SKIPPED] Startup Run value '$RunValueName' points to a different target: '$runVal'. Leaving untouched (ownership mismatch)." -ForegroundColor Yellow
             }
         } catch {
-            Write-Host "  [SKIPPED] Could not normalize startup path '$cleanRunPath'. Leaving untouched." -ForegroundColor Yellow
+            Write-Host "  [SKIPPED] Could not normalize startup path '$extractedExe'. Leaving untouched." -ForegroundColor Yellow
         }
     }
 }

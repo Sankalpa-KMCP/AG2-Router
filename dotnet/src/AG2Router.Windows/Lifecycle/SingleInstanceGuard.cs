@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 
@@ -95,6 +96,79 @@ public class SingleInstanceGuard : IAsyncDisposable
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Sends an EXIT command to the primary running instance and waits boundedly
+    /// for the primary instance to release its session mutex and terminate.
+    /// Returns true if the primary instance has successfully exited or if no primary
+    /// instance was running; returns false if the primary instance timed out.
+    /// </summary>
+    public static bool RequestExitAndWait(int timeoutMs = 5000)
+    {
+        // 1. Send the EXIT command over the session IPC pipe
+        bool sent = SendCommand("EXIT", timeoutMs: Math.Min(timeoutMs, 2000));
+        if (!sent)
+        {
+            // No primary instance was listening. Check if mutex exists.
+            if (!Mutex.TryOpenExisting(MutexName, out var existingMutex))
+            {
+                // No mutex and no pipe -> primary instance is definitely not running
+                return true;
+            }
+            existingMutex.Dispose();
+        }
+
+        // 2. Wait boundedly for the primary instance to release/abandon the mutex
+        return WaitForPrimaryExit(timeoutMs);
+    }
+
+    /// <summary>
+    /// Waits up to timeoutMs for the primary instance's session mutex to be released or abandoned.
+    /// Returns true if the primary instance exited or was not running; false if timed out.
+    /// </summary>
+    public static bool WaitForPrimaryExit(int timeoutMs = 5000)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            try
+            {
+                if (!Mutex.TryOpenExisting(MutexName, out var mutex))
+                {
+                    // Mutex no longer exists: primary instance has disposed it and exited
+                    return true;
+                }
+
+                using (mutex)
+                {
+                    int remainingMs = Math.Max(10, timeoutMs - (int)sw.ElapsedMilliseconds);
+                    if (mutex.WaitOne(remainingMs))
+                    {
+                        try { mutex.ReleaseMutex(); } catch { }
+                        return true;
+                    }
+                }
+            }
+            catch (AbandonedMutexException)
+            {
+                // Primary process terminated and abandoned the mutex
+                return true;
+            }
+            catch (WaitHandleCannotBeOpenedException)
+            {
+                // Mutex ceased to exist
+                return true;
+            }
+            catch
+            {
+                // Transient exception during teardown
+            }
+
+            Thread.Sleep(50);
+        }
+
+        return false;
     }
 
     private static void SendActivationSignal()

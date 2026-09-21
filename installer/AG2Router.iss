@@ -22,7 +22,7 @@ DefaultDirName={localappdata}\Programs\AG2Router
 DisableDirPage=auto
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequiredOverridesAllowed=commandline
 OutputBaseFilename=AG2Router-Setup-v{#AppVersion}-win-x64
 OutputDir={#OutputDir}
 Compression=lzma2/max
@@ -43,17 +43,28 @@ Name: "{autoprograms}\AG2 Router"; Filename: "{app}\AG2Router.exe"; WorkingDir: 
 Filename: "{app}\AG2Router.exe"; Description: "{cm:LaunchProgram,AG2 Router}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Gracefully signal running instance to exit before uninstallation begins
+; Gracefully signal running instance to exit and wait boundedly for primary termination before uninstallation begins
 Filename: "{app}\AG2Router.exe"; Parameters: "--exit"; Flags: runhidden skipifdoesntexist
 
 [Code]
-// Prerequisite check for Microsoft Edge WebView2 Evergreen Runtime
+// Prerequisite check for Microsoft Edge WebView2 Evergreen Runtime & per-user validation
 function InitializeSetup(): Boolean;
 var
   Wv2Ver: String;
   Wv2Found: Boolean;
 begin
   Result := True;
+
+  // Enforce strictly per-user non-admin installation invariant
+  if IsAdminInstallMode then
+  begin
+    MsgBox('AG2 Router is a per-user application and cannot be installed with administrative privileges.' + #13#10 +
+           'Please run the installer as a standard user without elevation.',
+           mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+
   Wv2Found := False;
 
   if RegQueryStringValue(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', Wv2Ver) then
@@ -74,6 +85,32 @@ begin
            'The system tray and background routing will function, but the dashboard UI requires WebView2.' + #13#10 +
            'You can install it from: https://developer.microsoft.com/en-us/microsoft-edge/webview2/',
            mbInformation, MB_OK);
+  end;
+end;
+
+// Graceful shutdown before installing or upgrading over existing files
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  InstalledExe: String;
+  ResultCode: Integer;
+begin
+  Result := '';
+  InstalledExe := ExpandConstant('{app}\AG2Router.exe');
+  if FileExists(InstalledExe) then
+  begin
+    // Request graceful shutdown and wait boundedly for primary instance termination via AG2Router.exe --exit
+    if Exec(InstalledExe, '--exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      if ResultCode <> 0 then
+      begin
+        Result := 'AG2 Router is currently running and could not be gracefully closed.' + #13#10 +
+                  'Please exit AG2 Router from the system tray before proceeding with installation.';
+      end;
+    end
+    else
+    begin
+      Result := 'Failed to execute AG2 Router shutdown command (--exit).';
+    end;
   end;
 end;
 
@@ -99,9 +136,12 @@ begin
         if Pos('"', CleanExePath) > 0 then
           CleanExePath := Copy(CleanExePath, 1, Pos('"', CleanExePath) - 1);
       end
-      else if Pos(' ', CleanExePath) > 0 then
+      else
       begin
-        CleanExePath := Copy(CleanExePath, 1, Pos(' ', CleanExePath) - 1);
+        if Pos('.exe', Lowercase(CleanExePath)) > 0 then
+          CleanExePath := Copy(CleanExePath, 1, Pos('.exe', Lowercase(CleanExePath)) + 3)
+        else if Pos(' ', CleanExePath) > 0 then
+          CleanExePath := Copy(CleanExePath, 1, Pos(' ', CleanExePath) - 1);
       end;
 
       // Only delete Run key if it points to THIS installation
