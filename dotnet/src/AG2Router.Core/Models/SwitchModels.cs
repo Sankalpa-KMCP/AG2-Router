@@ -45,7 +45,12 @@ public record NativeSwitchResult(
     [property: JsonPropertyName("message")] string Message,
     [property: JsonPropertyName("stagesCompleted")] IReadOnlyList<string> StagesCompleted,
     [property: JsonPropertyName("startedAt")] string StartedAt,
-    [property: JsonPropertyName("finishedAt")] string FinishedAt
+    [property: JsonPropertyName("finishedAt")] string FinishedAt,
+    [property: JsonPropertyName("manualRecoveryRequired")] bool ManualRecoveryRequired = false
+);
+
+public sealed record ExplicitSwitchRequest(
+    [property: JsonPropertyName("confirm")] bool Confirm
 );
 
 public record NativeSwitchStatus(

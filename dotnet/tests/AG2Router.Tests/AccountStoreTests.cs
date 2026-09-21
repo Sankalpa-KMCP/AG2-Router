@@ -281,6 +281,34 @@ public class AccountStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task LocalMetadataStore_FinalizesSwitchMetadataAndActiveIdInOneDurableMutation()
+    {
+        string filePath = Path.Combine(_tempDir, "accounts.json");
+        var store = new LocalMetadataAccountStore(filePath);
+        var source = await store.AddAccountAsync(new CreateAccountInput(Email: "source-finalize@example.com"));
+        var target = await store.AddAccountAsync(new CreateAccountInput(Email: "target-finalize@example.com"));
+        await store.SetActiveAccountIdAsync(source.Id);
+        string activatedAt = DateTimeOffset.UtcNow.ToString("O");
+
+        var finalized = await store.TryFinalizeSwitchAsync(source.Id, target.Id, new UpdateAccountInput(
+            ValidationStatus: AccountValidationStatus.Valid,
+            HasVaultedSession: true,
+            LastActiveAt: activatedAt));
+
+        Assert.NotNull(finalized);
+        var reloaded = new LocalMetadataAccountStore(filePath);
+        Assert.Equal(target.Id, await reloaded.GetActiveAccountIdAsync());
+        var persisted = await reloaded.GetAccountAsync(target.Id);
+        Assert.Equal(activatedAt, persisted!.LastActiveAt);
+        Assert.True(persisted.HasVaultedSession);
+
+        await reloaded.SetActiveAccountIdAsync(source.Id);
+        Assert.Null(await store.TryFinalizeSwitchAsync(target.Id, target.Id,
+            new UpdateAccountInput(LastActiveAt: DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"))));
+        Assert.Equal(activatedAt, (await store.GetAccountAsync(target.Id))!.LastActiveAt);
+    }
+
+    [Fact]
     public async Task LocalMetadataStore_ConditionalRemovePreservesNewerConcurrentUpdate()
     {
         string filePath = Path.Combine(_tempDir, "accounts.json");

@@ -13,12 +13,6 @@ namespace AG2Router.Windows.Security;
 public class WindowsWinCredReader : IWinCredReader
 {
     private const uint MaxCredentialBlobSize = 2560;
-    private readonly string _defaultTarget;
-
-    public WindowsWinCredReader(string defaultTarget = "gemini:antigravity")
-    {
-        _defaultTarget = defaultTarget;
-    }
 
     /// <inheritdoc />
     public Task<WinCredEntry?> ReadCredentialAsync(string target = "gemini:antigravity", CancellationToken cancellationToken = default)
@@ -55,6 +49,14 @@ public class WindowsWinCredReader : IWinCredReader
             if (cred.CredentialBlobSize > 0 && cred.CredentialBlob == IntPtr.Zero)
             {
                 throw new WinCredException("Credential blob pointer was null for a non-empty credential");
+            }
+            string? comment = cred.Comment == IntPtr.Zero ? null : Marshal.PtrToStringUni(cred.Comment);
+            string? alias = cred.TargetAlias == IntPtr.Zero ? null : Marshal.PtrToStringUni(cred.TargetAlias);
+            if (cred.Flags != 0 || cred.AttributeCount != 0 || cred.Attributes != IntPtr.Zero ||
+                !string.IsNullOrEmpty(comment) || !string.IsNullOrEmpty(alias))
+            {
+                throw new WinCredException(
+                    "Credential contains metadata unsupported by the safe switch writer; mutation was refused");
             }
             byte[] blob = Array.Empty<byte>();
 

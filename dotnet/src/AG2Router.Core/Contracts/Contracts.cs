@@ -19,6 +19,11 @@ public interface IAccountStore
         string? expectedId,
         string? newId,
         CancellationToken cancellationToken = default);
+    Task<AccountMetadata?> TryFinalizeSwitchAsync(
+        string? expectedActiveId,
+        string targetId,
+        UpdateAccountInput updates,
+        CancellationToken cancellationToken = default);
 }
 
 public interface IAG2Adapter

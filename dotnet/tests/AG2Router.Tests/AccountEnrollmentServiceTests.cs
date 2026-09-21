@@ -425,6 +425,10 @@ public class AccountEnrollmentServiceTests : IDisposable
             string? newId,
             CancellationToken cancellationToken = default) =>
             inner.CompareExchangeActiveAccountIdAsync(expectedId, newId, cancellationToken);
+        public Task<AccountMetadata?> TryFinalizeSwitchAsync(
+            string? expectedActiveId, string targetId, UpdateAccountInput updates,
+            CancellationToken cancellationToken = default) =>
+            inner.TryFinalizeSwitchAsync(expectedActiveId, targetId, updates, cancellationToken);
     }
 
     private sealed class BlockingFailUpdateAccountStore(IAccountStore inner) : IAccountStore
@@ -469,6 +473,10 @@ public class AccountEnrollmentServiceTests : IDisposable
             string? newId,
             CancellationToken cancellationToken = default) =>
             inner.CompareExchangeActiveAccountIdAsync(expectedId, newId, cancellationToken);
+        public Task<AccountMetadata?> TryFinalizeSwitchAsync(
+            string? expectedActiveId, string targetId, UpdateAccountInput updates,
+            CancellationToken cancellationToken = default) =>
+            inner.TryFinalizeSwitchAsync(expectedActiveId, targetId, updates, cancellationToken);
     }
 
     private sealed class RejectActiveCasAccountStore(IAccountStore inner) : IAccountStore
@@ -500,5 +508,8 @@ public class AccountEnrollmentServiceTests : IDisposable
             string? expectedId,
             string? newId,
             CancellationToken cancellationToken = default) => Task.FromResult(false);
+        public Task<AccountMetadata?> TryFinalizeSwitchAsync(
+            string? expectedActiveId, string targetId, UpdateAccountInput updates,
+            CancellationToken cancellationToken = default) => Task.FromResult<AccountMetadata?>(null);
     }
 }

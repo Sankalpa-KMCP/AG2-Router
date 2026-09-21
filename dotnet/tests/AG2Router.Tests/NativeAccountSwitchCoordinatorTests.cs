@@ -147,7 +147,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
     public async Task RollbackCredentialWriteFailureIsExplicitManualRecovery()
     {
         await SeedAccountsAsync();
-        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
+        _process.WaitError = new AG2ProcessLifecycleException("synthetic reconnect failure");
         _credentials.WriteBehavior = (call, entry, _) =>
         {
             if (call == 1) { _credentials.Set(entry); return Task.FromResult(true); }
@@ -197,6 +197,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
 
         Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
         Assert.Equal(third.Id, await _accounts.GetActiveAccountIdAsync());
+        Assert.Null((await _accounts.GetAccountAsync(_target.Id))!.LastActiveAt);
         Assert.Equal("source@example.com", _adapter.Identity!.Email);
         Assert.Equal("source-secret", Encoding.UTF8.GetString(_credentials.Snapshot().Blob));
     }
@@ -259,6 +260,8 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         var result = await Coordinator().SwitchAsync(_target!.Id, cts.Token);
         Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
         Assert.Equal("source-secret", Encoding.UTF8.GetString(_credentials.Snapshot().Blob));
+        Assert.All(_credentials.WriteTokenWasCancelled.Skip(1), Assert.False);
+        Assert.False(_process.RollbackTokenWasCancelled);
     }
 
     [Fact]
@@ -267,7 +270,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         await SeedAccountsAsync();
         _process.RevalidateErrorOnCall = 2;
         var result = await Coordinator().SwitchAsync(_target!.Id);
-        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(SwitchResultCodes.UnsafeProcess, result.Code);
         Assert.Equal(0, _credentials.WriteCount);
     }
 
@@ -282,10 +285,37 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task InFlightOldGenerationIdentityCannotFinalizeSwitch()
+    {
+        await SeedAccountsAsync();
+        var identityEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseIdentity = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calls = 0;
+        _adapter.IdentityBehavior = async ct =>
+        {
+            int call = Interlocked.Increment(ref calls);
+            if (call == 1)
+                return new AccountIdentityDto("source@example.com");
+            if (call > 2) return new AccountIdentityDto("source@example.com");
+            identityEntered.TrySetResult();
+            await releaseIdentity.Task.WaitAsync(ct);
+            return new AccountIdentityDto("target@example.com");
+        };
+
+        Task<NativeSwitchResult> pending = Coordinator().SwitchAsync(_target!.Id);
+        await identityEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        _process.GenerationCurrent = false;
+        releaseIdentity.TrySetResult();
+
+        var result = await pending;
+        Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
+        Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
     public async Task ExternalCredentialChangeIsNeverOverwrittenByRollback()
     {
         await SeedAccountsAsync();
-        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
         _credentials.WriteBehavior = (call, entry, _) =>
         {
             if (call == 1)
@@ -366,6 +396,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         private WinCredEntry? _current;
         public int WriteCount { get; private set; }
         public Func<int, WinCredEntry, CancellationToken, Task<bool>>? WriteBehavior { get; set; }
+        public List<bool> WriteTokenWasCancelled { get; } = [];
 
         public void Set(WinCredEntry entry)
         {
@@ -388,6 +419,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             CancellationToken cancellationToken = default)
         {
             WriteCount++;
+            WriteTokenWasCancelled.Add(cancellationToken.IsCancellationRequested);
             if (WriteBehavior != null) return await WriteBehavior(WriteCount, entry, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             Set(entry);
@@ -412,11 +444,12 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             new("IDLE", 0, 0, DateTimeOffset.UtcNow.ToString("O"));
         public Ag2StatusDto Status { get; set; } =
             new(true, "HEALTHY", new ActivityStatusDto("IDLE", 0, 0, DateTimeOffset.UtcNow.ToString("O")), "synthetic");
+        public Func<CancellationToken, Task<AccountIdentityDto?>>? IdentityBehavior { get; set; }
 
         public Task<Ag2StatusDto> GetStatusAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(Status);
         public Task<AccountIdentityDto?> GetCurrentAccountAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult(Identity);
+            IdentityBehavior?.Invoke(cancellationToken) ?? Task.FromResult(Identity);
         public Task<QuotaSnapshotDto?> GetQuotaAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult<QuotaSnapshotDto?>(null);
         public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default) =>
@@ -428,7 +461,8 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         private readonly AG2ProcessSnapshot _snapshot = new(
             100, DateTime.UtcNow.AddMinutes(-1), @"C:\Synthetic\Antigravity\resources\bin\language_server.exe",
             ["--standalone", "--csrf_token", "synthetic"],
-            ["--standalone", "--csrf_token", "[REDACTED]"], 10, DateTime.UtcNow.AddDays(-1), 1);
+            ["--standalone", "--csrf_token", "[REDACTED]"], 10, DateTime.UtcNow.AddDays(-1),
+            new string('A', 64), 1);
         private readonly AG2ProcessGeneration _replacement = new(
             101, DateTime.UtcNow, @"C:\Synthetic\Antigravity\resources\bin\language_server.exe", 2);
         private int _revalidateCalls;
@@ -443,6 +477,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         public int StopCount { get; private set; }
         public int LaunchCount { get; private set; }
         public int RestoreCount { get; private set; }
+        public bool RollbackTokenWasCancelled { get; private set; }
         public Action? OnReplacement { get; set; }
         public Action? OnRestore { get; set; }
 
@@ -466,15 +501,19 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             return StopError != null ? Task.FromException(StopError) : Task.CompletedTask;
         }
 
-        public Task<int> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default)
+        public Task<AG2ProcessGeneration> LaunchAsync(
+            AG2ProcessSnapshot snapshot,
+            CancellationToken cancellationToken = default)
         {
             LaunchCount++;
-            return LaunchError != null ? Task.FromException<int>(LaunchError) : Task.FromResult(101);
+            return LaunchError != null
+                ? Task.FromException<AG2ProcessGeneration>(LaunchError)
+                : Task.FromResult(_replacement);
         }
 
         public Task<AG2ProcessGeneration> WaitForHealthyReplacementAsync(
             AG2ProcessSnapshot original,
-            int launchedProcessId,
+            AG2ProcessGeneration launched,
             TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
@@ -483,12 +522,25 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             return Task.FromResult(_replacement);
         }
 
+        public Task QuiesceForRollbackAsync(
+            AG2ProcessSnapshot original,
+            AG2ProcessGeneration? transactionOwnedReplacement,
+            TimeSpan timeout,
+            CancellationToken cancellationToken = default)
+        {
+            RollbackTokenWasCancelled = cancellationToken.IsCancellationRequested;
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        }
+
         public Task<AG2ProcessGeneration> RestoreAsync(
             AG2ProcessSnapshot original,
             TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
             RestoreCount++;
+            RollbackTokenWasCancelled |= cancellationToken.IsCancellationRequested;
+            cancellationToken.ThrowIfCancellationRequested();
             if (RestoreError != null) return Task.FromException<AG2ProcessGeneration>(RestoreError);
             GenerationCurrent = true;
             OnRestore?.Invoke();

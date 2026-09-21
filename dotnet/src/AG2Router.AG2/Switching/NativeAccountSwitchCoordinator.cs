@@ -94,7 +94,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         byte[]? targetSession = null;
         AG2ProcessSnapshot? processSnapshot = null;
         AG2ProcessGeneration? replacementGeneration = null;
-        bool credentialWriteAttempted = false;
+        bool processTransitionStarted = false;
 
         SetActive(transactionId, NativeSwitchStates.Preflight);
         try
@@ -171,6 +171,12 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             {
                 ValidateCredential(readCredential, requireConfiguredTarget: true);
                 originalCredential = CloneCredential(readCredential);
+                if (!string.Equals(originalCredential.UserName, previousEmail, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new SwitchRejectedException(
+                        SwitchResultCodes.TelemetryUnavailable,
+                        "Current credential identity does not match verified telemetry.");
+                }
             }
             finally
             {
@@ -179,9 +185,25 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             stages.Add("ROLLBACK_SNAPSHOT_CAPTURED");
 
             // Re-check both process generation and idle telemetry immediately before mutation.
-            await _processLifecycle.RevalidateAsync(processSnapshot, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _processLifecycle.RevalidateAsync(processSnapshot, cancellationToken).ConfigureAwait(false);
+            }
+            catch (AG2ProcessLifecycleException ex)
+            {
+                throw new SwitchRejectedException(SwitchResultCodes.UnsafeProcess,
+                    $"Antigravity process generation became unsafe: {AG2Security.SanitizeError(ex)}");
+            }
             var finalActivity = await _adapter.GetActivityStateAsync(cancellationToken).ConfigureAwait(false);
-            await _processLifecycle.RevalidateAsync(processSnapshot, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _processLifecycle.RevalidateAsync(processSnapshot, cancellationToken).ConfigureAwait(false);
+            }
+            catch (AG2ProcessLifecycleException ex)
+            {
+                throw new SwitchRejectedException(SwitchResultCodes.UnsafeProcess,
+                    $"Antigravity process generation became unsafe: {AG2Security.SanitizeError(ex)}");
+            }
             if (finalActivity.RunningTrajectories > 0 ||
                 string.Equals(finalActivity.State, "BUSY", StringComparison.OrdinalIgnoreCase))
             {
@@ -201,28 +223,35 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     SwitchResultCodes.TargetNotVaulted,
                     "Target vaulted session is missing, empty, or outside credential bounds.");
             }
-            targetCredential = new WinCredEntry(WinCredTarget, 1, target.Email, 2, targetSession);
+            targetCredential = new WinCredEntry(
+                WinCredTarget,
+                originalCredential.Type,
+                target.Email,
+                originalCredential.Persistence,
+                targetSession);
             ValidateCredential(targetCredential, requireConfiguredTarget: true);
 
+            // Quiesce the verified source before changing its credential. This prevents the
+            // old generation from racing the transaction by persisting a newer session.
+            SetState(NativeSwitchStates.StoppingProcess);
+            processTransitionStarted = true;
+            await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, cancellationToken)
+                .ConfigureAwait(false);
+            stages.Add("SOURCE_PROCESS_STOPPED");
+
             SetState(NativeSwitchStates.ApplyingCredential);
-            credentialWriteAttempted = true;
             bool written = await _winCredWriter.WriteCredentialAsync(targetCredential, cancellationToken)
                 .ConfigureAwait(false);
             if (!written) throw new InvalidOperationException("Credential writer reported failure.");
             await RequireCredentialEqualsAsync(targetCredential, cancellationToken).ConfigureAwait(false);
             stages.Add("CREDENTIAL_APPLIED_AND_VERIFIED");
 
-            SetState(NativeSwitchStates.StoppingProcess);
-            await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, cancellationToken)
-                .ConfigureAwait(false);
-            stages.Add("SOURCE_PROCESS_STOPPED");
-
             SetState(NativeSwitchStates.Restarting);
-            int launchedPid = await _processLifecycle.LaunchAsync(processSnapshot, cancellationToken)
+            replacementGeneration = await _processLifecycle.LaunchAsync(processSnapshot, cancellationToken)
                 .ConfigureAwait(false);
             replacementGeneration = await _processLifecycle.WaitForHealthyReplacementAsync(
                 processSnapshot,
-                launchedPid,
+                replacementGeneration,
                 _verificationTimeout,
                 cancellationToken).ConfigureAwait(false);
             stages.Add("REPLACEMENT_PROCESS_VERIFIED");
@@ -233,29 +262,31 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
             SetState(NativeSwitchStates.Finalizing);
             cancellationToken.ThrowIfCancellationRequested();
-            var updated = await _accountStore.UpdateAccountAsync(target.Id, new UpdateAccountInput(
+            if (!await _processLifecycle.IsGenerationCurrentAsync(replacementGeneration, cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                throw new InvalidOperationException(
+                    "Process generation changed after target verification and before metadata finalization.");
+            }
+            var updated = await _accountStore.TryFinalizeSwitchAsync(previousAccountId, target.Id, new UpdateAccountInput(
                 ValidationStatus: AccountValidationStatus.Valid,
                 HasVaultedSession: true,
                 LastActiveAt: DateTimeOffset.UtcNow.ToString("O")), cancellationToken).ConfigureAwait(false);
-            if (updated == null) throw new InvalidOperationException("Target metadata disappeared during switch finalization.");
-            bool activeCommitted = await _accountStore.CompareExchangeActiveAccountIdAsync(
-                previousAccountId,
-                target.Id,
-                CancellationToken.None).ConfigureAwait(false);
-            if (!activeCommitted) throw new InvalidOperationException("Active-account metadata changed during switch finalization.");
+            if (updated == null)
+                throw new InvalidOperationException("Account metadata changed during atomic switch finalization.");
             stages.Add("METADATA_COMMITTED");
 
             return Terminal(transactionId, true, SwitchResultCodes.Success, NativeSwitchStates.Complete,
                 target.Id, target.Email, previousAccountId, previousEmail,
                 "Target account was activated and verified.", stages, now);
         }
-        catch (SwitchRejectedException ex) when (!credentialWriteAttempted)
+        catch (SwitchRejectedException ex) when (!processTransitionStarted)
         {
             return Terminal(transactionId, false, ex.Code, NativeSwitchStates.Failed,
                 requestedId, target?.Email, previousAccountId, previousEmail,
                 AG2Security.RedactSensitiveText(ex.Message), stages, now);
         }
-        catch (OperationCanceledException) when (!credentialWriteAttempted)
+        catch (OperationCanceledException) when (!processTransitionStarted)
         {
             return Terminal(transactionId, false, SwitchResultCodes.Cancelled, NativeSwitchStates.Failed,
                 requestedId, target?.Email, previousAccountId, previousEmail,
@@ -263,7 +294,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
         catch (Exception switchError)
         {
-            if (!credentialWriteAttempted || originalCredential == null || targetCredential == null || processSnapshot == null)
+            if (!processTransitionStarted || originalCredential == null || targetCredential == null || processSnapshot == null)
             {
                 return Terminal(transactionId, false,
                     switchError is OperationCanceledException ? SwitchResultCodes.Cancelled : SwitchResultCodes.TelemetryUnavailable,
@@ -275,6 +306,13 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             stages.Add("ROLLBACK_STARTED");
             try
             {
+                await _processLifecycle.QuiesceForRollbackAsync(
+                    processSnapshot,
+                    replacementGeneration,
+                    _processTimeout,
+                    CancellationToken.None).ConfigureAwait(false);
+                stages.Add("SWITCH_PROCESS_QUIESCED");
+
                 await RestoreCredentialConditionallyAsync(originalCredential, targetCredential)
                     .ConfigureAwait(false);
                 stages.Add("ORIGINAL_CREDENTIAL_RESTORED");
@@ -456,7 +494,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         var result = new NativeSwitchResult(transactionId, success, code, state,
             targetAccountId, targetEmail, previousAccountId, previousEmail,
             AG2Security.RedactSensitiveText(message), stages.ToArray(), startedAt,
-            DateTimeOffset.UtcNow.ToString("O"));
+            DateTimeOffset.UtcNow.ToString("O"),
+            ManualRecoveryRequired: code == SwitchResultCodes.SwitchFailedRollbackFailed);
         lock (_statusLock)
         {
             _currentState = state;

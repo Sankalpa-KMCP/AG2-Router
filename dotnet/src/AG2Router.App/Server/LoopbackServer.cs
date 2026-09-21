@@ -1,6 +1,9 @@
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using AG2Router.AG2.Accounts;
+using AG2Router.AG2.Security;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
 using Microsoft.AspNetCore.Builder;
@@ -37,6 +40,7 @@ public class LoopbackServer : IAsyncDisposable
         INativeAccountSwitchCoordinator? switchCoordinator = null,
         CancellationToken cancellationToken = default)
     {
+        string switchIntentToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
         var builder = WebApplication.CreateSlimBuilder();
 
         // 1. Enforce strict IPv4 loopback binding on Kestrel
@@ -258,7 +262,7 @@ public class LoopbackServer : IAsyncDisposable
         });
 
         // GET /api/switching/status - Switching state machine status
-        _app.MapGet("/api/switching/status", () =>
+        _app.MapGet("/api/switching/status", (HttpContext context) =>
         {
             if (switchCoordinator == null)
             {
@@ -268,7 +272,22 @@ public class LoopbackServer : IAsyncDisposable
                     LastResult: null
                 )));
             }
-            return Results.Ok(new { status = switchCoordinator.GetStatus() });
+            // Same-origin dashboard clients obtain this per-launch token. A cross-origin form
+            // cannot read it or attach the required custom header.
+            context.Response.Headers["X-AG2-Switch-Token"] = switchIntentToken;
+            var status = switchCoordinator.GetStatus();
+            if (status.LastResult != null)
+            {
+                status = status with
+                {
+                    LastResult = status.LastResult with
+                    {
+                        Message = AG2Security.RedactSensitiveText(
+                            AG2Security.SanitizeCommandLine(status.LastResult.Message))
+                    }
+                };
+            }
+            return Results.Ok(new { status });
         });
 
         // POST /api/accounts/{id}/switch-plan - Dry-run evaluation
@@ -289,13 +308,42 @@ public class LoopbackServer : IAsyncDisposable
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
+            string suppliedToken = context.Request.Headers["X-AG2-Switch-Token"].ToString();
+            if (!FixedTimeEquals(suppliedToken, switchIntentToken))
+            {
+                return Results.Json(new { error = "Explicit switch authorization is required." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            ExplicitSwitchRequest? request;
+            try
+            {
+                request = await context.Request.ReadFromJsonAsync<ExplicitSwitchRequest>(
+                    cancellationToken: context.RequestAborted);
+            }
+            catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+            {
+                return Results.Json(new { error = "A valid explicit switch confirmation is required." },
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+            if (request?.Confirm != true)
+            {
+                return Results.Json(new { error = "Explicit switch confirmation is required." },
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
             var result = await switchCoordinator.SwitchAsync(id, context.RequestAborted);
+            result = result with
+            {
+                Message = AG2Security.RedactSensitiveText(
+                    AG2Security.SanitizeCommandLine(result.Message))
+            };
             int statusCode = result.Code switch
             {
                 SwitchResultCodes.Success => StatusCodes.Status200OK,
                 SwitchResultCodes.TargetNotFound => StatusCodes.Status404NotFound,
                 SwitchResultCodes.TelemetryUnavailable => StatusCodes.Status503ServiceUnavailable,
-                SwitchResultCodes.SwitchFailedRollbackFailed => StatusCodes.Status503ServiceUnavailable,
+                SwitchResultCodes.SwitchFailedRollbackFailed => StatusCodes.Status500InternalServerError,
                 SwitchResultCodes.Cancelled => StatusCodes.Status408RequestTimeout,
                 SwitchResultCodes.SwitchFailedRolledBack => StatusCodes.Status500InternalServerError,
                 SwitchResultCodes.TargetNotVaulted or
@@ -328,6 +376,22 @@ public class LoopbackServer : IAsyncDisposable
         {
             _boundPort = requestedPort;
             _boundUrl = $"http://127.0.0.1:{_boundPort}";
+        }
+    }
+
+    private static bool FixedTimeEquals(string supplied, string expected)
+    {
+        byte[] suppliedBytes = Encoding.UTF8.GetBytes(supplied ?? string.Empty);
+        byte[] expectedBytes = Encoding.UTF8.GetBytes(expected);
+        try
+        {
+            return suppliedBytes.Length == expectedBytes.Length &&
+                CryptographicOperations.FixedTimeEquals(suppliedBytes, expectedBytes);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(suppliedBytes);
+            CryptographicOperations.ZeroMemory(expectedBytes);
         }
     }
 

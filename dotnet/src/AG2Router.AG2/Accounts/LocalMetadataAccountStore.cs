@@ -273,6 +273,48 @@ public class LocalMetadataAccountStore : IAccountStore
         }, cancellationToken);
     }
 
+    public Task<AccountMetadata?> TryFinalizeSwitchAsync(
+        string? expectedActiveId,
+        string targetId,
+        UpdateAccountInput updates,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(updates);
+        if (string.IsNullOrWhiteSpace(targetId)) return Task.FromResult<AccountMetadata?>(null);
+
+        return MutateAsync<AccountMetadata?>(state =>
+        {
+            if (!string.Equals(state.ActiveAccountId, expectedActiveId, StringComparison.Ordinal))
+            {
+                return (state, null);
+            }
+
+            var accounts = state.Accounts.ToList();
+            int index = accounts.FindIndex(account => account.Id == targetId);
+            if (index < 0) return (state, null);
+            var existing = accounts[index];
+            string validationStatus = updates.ValidationStatus ?? existing.ValidationStatus;
+            if (!ValidValidationStatuses.Contains(validationStatus))
+            {
+                throw new ArgumentException($"Unsupported validation status '{validationStatus}'.", nameof(updates));
+            }
+
+            var updated = existing with
+            {
+                Name = updates.Name != null ? updates.Name.Trim() : existing.Name,
+                Priority = updates.Priority ?? existing.Priority,
+                IsReserve = updates.IsReserve ?? existing.IsReserve,
+                ValidationStatus = validationStatus,
+                HasVaultedSession = updates.HasVaultedSession ?? existing.HasVaultedSession,
+                LastActiveAt = updates.LastActiveAt ?? existing.LastActiveAt,
+                Notes = updates.Notes ?? existing.Notes,
+                UpdatedAt = DateTimeOffset.UtcNow.ToString("O")
+            };
+            accounts[index] = updated;
+            return (new StoreState(accounts, targetId), updated);
+        }, cancellationToken);
+    }
+
     private async Task WithCurrentStateAsync(CancellationToken cancellationToken)
     {
         await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);

@@ -20,6 +20,10 @@ public class WindowsWinCredWriter : IWinCredWriter
         ArgumentNullException.ThrowIfNull(entry);
         cancellationToken.ThrowIfCancellationRequested();
 
+        // The paired reader rejects native flags, comments, aliases, and attributes.
+        // Consequently this writer only ever replaces the canonical AG2 generic-credential schema
+        // and cannot silently discard an unsupported native field captured during preflight.
+
         if (string.IsNullOrWhiteSpace(entry.Target))
         {
             throw new WinCredException("Target name cannot be empty");

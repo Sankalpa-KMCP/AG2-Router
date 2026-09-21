@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using AG2Router.AG2.Discovery;
 using AG2Router.AG2.Security;
 
@@ -14,6 +15,7 @@ public sealed record AG2ProcessSnapshot(
     IReadOnlyList<string> SanitizedArguments,
     long ExecutableLength,
     DateTime ExecutableLastWriteUtc,
+    string ExecutableSha256,
     long DetectorGeneration);
 
 public sealed record AG2ProcessGeneration(
@@ -27,10 +29,15 @@ public interface IAG2ProcessLifecycle
     Task<AG2ProcessSnapshot> CaptureVerifiedAsync(CancellationToken cancellationToken = default);
     Task RevalidateAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
     Task StopVerifiedAsync(AG2ProcessSnapshot snapshot, TimeSpan timeout, CancellationToken cancellationToken = default);
-    Task<int> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
+    Task<AG2ProcessGeneration> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
     Task<AG2ProcessGeneration> WaitForHealthyReplacementAsync(
         AG2ProcessSnapshot original,
-        int launchedProcessId,
+        AG2ProcessGeneration launched,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default);
+    Task QuiesceForRollbackAsync(
+        AG2ProcessSnapshot original,
+        AG2ProcessGeneration? transactionOwnedReplacement,
         TimeSpan timeout,
         CancellationToken cancellationToken = default);
     Task<AG2ProcessGeneration> RestoreAsync(
@@ -93,6 +100,7 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
             SanitizeArguments(arguments),
             info.Length,
             info.LastWriteTimeUtc,
+            await ComputeSha256Async(executable, cancellationToken).ConfigureAwait(false),
             _detector.CurrentGeneration);
     }
 
@@ -110,15 +118,27 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         TimeSpan timeout,
         CancellationToken cancellationToken = default)
     {
-        await RevalidateAsync(snapshot, cancellationToken).ConfigureAwait(false);
-        if (!_inspector.IsPidAlive(snapshot.ProcessId, snapshot.StartTimeUtc))
-        {
-            throw new AG2ProcessLifecycleException("Verified process exited before it could be stopped safely.");
-        }
-
         try
         {
             using var process = Process.GetProcessById(snapshot.ProcessId);
+            process.Refresh();
+            DateTime handleStart = process.StartTime.ToUniversalTime();
+            string handlePath = Path.GetFullPath(process.MainModule?.FileName
+                ?? throw new AG2ProcessLifecycleException("Verified process executable path was unavailable."));
+            if (process.HasExited || handleStart != snapshot.StartTimeUtc ||
+                !PathEquals(handlePath, snapshot.ExecutablePath))
+            {
+                throw new AG2ProcessLifecycleException(
+                    "Verified Antigravity process identity changed before termination.");
+            }
+
+            await RevalidateAsync(snapshot, cancellationToken).ConfigureAwait(false);
+            process.Refresh();
+            if (process.HasExited || process.StartTime.ToUniversalTime() != snapshot.StartTimeUtc)
+            {
+                throw new AG2ProcessLifecycleException(
+                    "Verified Antigravity process exited or was replaced before termination.");
+            }
             process.Kill(entireProcessTree: false);
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeoutCts.CancelAfter(timeout);
@@ -140,12 +160,17 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         _detector.PrepareForProcessTransition();
     }
 
-    public Task<int> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default)
+    public async Task<AG2ProcessGeneration> LaunchAsync(
+        AG2ProcessSnapshot snapshot,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var info = new FileInfo(snapshot.ExecutablePath);
         if (!info.Exists || info.Length != snapshot.ExecutableLength ||
-            info.LastWriteTimeUtc != snapshot.ExecutableLastWriteUtc)
+            info.LastWriteTimeUtc != snapshot.ExecutableLastWriteUtc ||
+            !CryptographicOperations.FixedTimeEquals(
+                Convert.FromHexString(await ComputeSha256Async(snapshot.ExecutablePath, cancellationToken).ConfigureAwait(false)),
+                Convert.FromHexString(snapshot.ExecutableSha256)))
         {
             throw new AG2ProcessLifecycleException("Captured Antigravity executable changed after process snapshot.");
         }
@@ -163,9 +188,15 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         {
             var process = Process.Start(startInfo)
                 ?? throw new AG2ProcessLifecycleException("Antigravity process launch returned no process handle.");
-            int pid = process.Id;
-            process.Dispose();
-            return Task.FromResult(pid);
+            using (process)
+            {
+                DateTime start = process.StartTime.ToUniversalTime();
+                return new AG2ProcessGeneration(
+                    process.Id,
+                    start,
+                    snapshot.ExecutablePath,
+                    _detector.CurrentGeneration);
+            }
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
         {
@@ -175,7 +206,7 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
 
     public async Task<AG2ProcessGeneration> WaitForHealthyReplacementAsync(
         AG2ProcessSnapshot original,
-        int launchedProcessId,
+        AG2ProcessGeneration launched,
         TimeSpan timeout,
         CancellationToken cancellationToken = default)
     {
@@ -188,9 +219,9 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
             var session = _detector.GetCachedSession();
             if (discovery.IsRunning && session != null)
             {
-                if (session.Pid != launchedProcessId || session.Pid == original.ProcessId || session.StartTime == null ||
+                if (session.Pid != launched.ProcessId || session.Pid == original.ProcessId || session.StartTime == null ||
                     !PathEquals(session.BinaryPath, original.ExecutablePath) ||
-                    session.StartTime.Value.ToUniversalTime() <= original.StartTimeUtc)
+                    session.StartTime.Value.ToUniversalTime() != launched.StartTimeUtc)
                 {
                     throw new AG2ProcessLifecycleException("Rediscovery selected an unexpected or stale process generation.");
                 }
@@ -206,6 +237,33 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         throw new AG2ProcessLifecycleException("Timed out rediscovering a healthy replacement Antigravity process.");
     }
 
+    public async Task QuiesceForRollbackAsync(
+        AG2ProcessSnapshot original,
+        AG2ProcessGeneration? transactionOwnedReplacement,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        var processes = await _inspector.FindProcessesAsync(cancellationToken).ConfigureAwait(false);
+        var validation = ProcessProvenanceValidator.Validate(processes);
+        if (validation.Status == ProvenanceStatus.NoCandidates) return;
+        if (validation.Status != ProvenanceStatus.Discovered || validation.SelectedProcess == null)
+        {
+            throw new AG2ProcessLifecycleException($"Rollback process discovery is unsafe: {validation.Message}");
+        }
+
+        var current = await CaptureVerifiedAsync(cancellationToken).ConfigureAwait(false);
+        bool isOriginal = SameOsIdentity(current, original);
+        bool isOwnedReplacement = transactionOwnedReplacement != null &&
+            SameOsIdentity(current, transactionOwnedReplacement);
+        if (!isOriginal && !isOwnedReplacement)
+        {
+            throw new AG2ProcessLifecycleException(
+                "Rollback found a process generation not owned by this switch attempt; refusing to stop it.");
+        }
+
+        await StopVerifiedAsync(current, timeout, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<AG2ProcessGeneration> RestoreAsync(
         AG2ProcessSnapshot original,
         TimeSpan timeout,
@@ -213,31 +271,14 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
     {
         var processes = await _inspector.FindProcessesAsync(cancellationToken).ConfigureAwait(false);
         var validation = ProcessProvenanceValidator.Validate(processes);
-        if (validation.Status == ProvenanceStatus.Discovered && validation.SelectedProcess != null)
-        {
-            var selected = validation.SelectedProcess;
-            if (selected.ProcessId == original.ProcessId && selected.StartTime != null &&
-                SameStart(selected.StartTime.Value, original.StartTimeUtc) &&
-                PathEquals(selected.ExecutablePath, original.ExecutablePath))
-            {
-                _detector.PrepareForProcessTransition();
-                await _detector.DiscoverAsync(cancellationToken).ConfigureAwait(false);
-                var same = _detector.GetCachedSession()
-                    ?? throw new AG2ProcessLifecycleException("Original process could not be reconnected during rollback.");
-                return new AG2ProcessGeneration(same.Pid, same.StartTime!.Value, Path.GetFullPath(same.BinaryPath!), same.Generation);
-            }
-
-            var current = await CaptureVerifiedAsync(cancellationToken).ConfigureAwait(false);
-            await StopVerifiedAsync(current, timeout, cancellationToken).ConfigureAwait(false);
-        }
-        else if (validation.Status != ProvenanceStatus.NoCandidates)
+        if (validation.Status != ProvenanceStatus.NoCandidates)
         {
             throw new AG2ProcessLifecycleException($"Rollback process discovery is unsafe: {validation.Message}");
         }
 
         _detector.PrepareForProcessTransition();
-        int launchedPid = await LaunchAsync(original, cancellationToken).ConfigureAwait(false);
-        return await WaitForHealthyReplacementAsync(original, launchedPid, timeout, cancellationToken)
+        var launched = await LaunchAsync(original, cancellationToken).ConfigureAwait(false);
+        return await WaitForHealthyReplacementAsync(original, launched, timeout, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -249,23 +290,39 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         var cached = _detector.GetCachedSession();
         bool current = cached != null && cached.Generation == generation.DetectorGeneration &&
             cached.Pid == generation.ProcessId && cached.StartTime != null &&
-            SameStart(cached.StartTime.Value, generation.StartTimeUtc) &&
+            cached.StartTime.Value.ToUniversalTime() == generation.StartTimeUtc &&
             PathEquals(cached.BinaryPath, generation.ExecutablePath);
         return Task.FromResult(current);
     }
 
     private static bool SameProcess(AG2ProcessSnapshot left, AG2ProcessSnapshot right) =>
-        left.ProcessId == right.ProcessId && SameStart(left.StartTimeUtc, right.StartTimeUtc) &&
+        left.ProcessId == right.ProcessId && left.StartTimeUtc == right.StartTimeUtc &&
         PathEquals(left.ExecutablePath, right.ExecutablePath) &&
+        left.Arguments.SequenceEqual(right.Arguments, StringComparer.Ordinal) &&
         left.ExecutableLength == right.ExecutableLength &&
-        left.ExecutableLastWriteUtc == right.ExecutableLastWriteUtc;
+        left.ExecutableLastWriteUtc == right.ExecutableLastWriteUtc &&
+        string.Equals(left.ExecutableSha256, right.ExecutableSha256, StringComparison.Ordinal) &&
+        left.DetectorGeneration == right.DetectorGeneration;
 
-    private static bool SameStart(DateTime left, DateTime right) =>
-        Math.Abs((left.ToUniversalTime() - right.ToUniversalTime()).TotalSeconds) <= 2;
+    private static bool SameOsIdentity(AG2ProcessSnapshot left, AG2ProcessSnapshot right) =>
+        left.ProcessId == right.ProcessId && left.StartTimeUtc == right.StartTimeUtc &&
+        PathEquals(left.ExecutablePath, right.ExecutablePath);
+
+    private static bool SameOsIdentity(AG2ProcessSnapshot left, AG2ProcessGeneration right) =>
+        left.ProcessId == right.ProcessId && left.StartTimeUtc == right.StartTimeUtc &&
+        PathEquals(left.ExecutablePath, right.ExecutablePath);
 
     private static bool PathEquals(string? left, string? right) =>
         !string.IsNullOrWhiteSpace(left) && !string.IsNullOrWhiteSpace(right) &&
         string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+
+    private static async Task<string> ComputeSha256Async(string path, CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        byte[] digest = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
+        return Convert.ToHexString(digest);
+    }
 
     private static IReadOnlyList<string> ParseWindowsCommandLine(string commandLine, string executablePath)
     {
