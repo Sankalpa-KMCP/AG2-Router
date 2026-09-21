@@ -6,6 +6,7 @@ using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Security;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
+using AG2Router.Windows.Lifecycle;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -38,6 +39,8 @@ public class LoopbackServer : IAsyncDisposable
         ISessionVault? sessionVault = null,
         AccountEnrollmentService? enrollmentService = null,
         INativeAccountSwitchCoordinator? switchCoordinator = null,
+        INativeAutoRouter? autoRouter = null,
+        IAutostartService? autostartService = null,
         CancellationToken cancellationToken = default)
     {
         string switchIntentToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
@@ -106,7 +109,7 @@ public class LoopbackServer : IAsyncDisposable
                     Activity: new ActivityStatusDto("OFFLINE", 0, 0, DateTime.UtcNow.ToString("o")),
                     Message: "Waiting for Antigravity 2"
                 ),
-                Router: new RouterStatusDto(
+                Router: autoRouter?.GetStatus() ?? new RouterStatusDto(
                     State: "IDLE",
                     AutoSwitchEnabled: false,
                     ActiveAccountId: null,
@@ -261,12 +264,6 @@ public class LoopbackServer : IAsyncDisposable
             });
         });
 
-        // GET /api/config - Current configuration
-        _app.MapGet("/api/config", () =>
-        {
-            return Results.Ok(new { config = new RouterConfigDto() });
-        });
-
         // GET /api/switching/status - Switching state machine status
         _app.MapGet("/api/switching/status", (HttpContext context) =>
         {
@@ -367,8 +364,107 @@ public class LoopbackServer : IAsyncDisposable
             return Results.Json(result, statusCode: statusCode);
         });
 
-        _app.MapPost("/api/config", () =>
-            Results.Json(new { error = "Configuration updates are not implemented in native shell foundation." }, statusCode: StatusCodes.Status501NotImplemented));
+        // GET /api/config
+        _app.MapGet("/api/config", () =>
+        {
+            var cfg = autoRouter?.GetConfig() ?? new RouterConfigDto();
+            return Results.Ok(new { config = cfg });
+        });
+
+        // POST /api/config
+        _app.MapPost("/api/config", async (HttpContext context) =>
+        {
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Unauthorized origin." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (autoRouter == null)
+            {
+                return Results.Json(new { error = "Auto-router is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            }
+            try
+            {
+                var body = await context.Request.ReadFromJsonAsync<RouterConfigDto>(cancellationToken: context.RequestAborted);
+                if (body == null)
+                {
+                    return Results.Json(new { error = "Invalid configuration payload." }, statusCode: StatusCodes.Status400BadRequest);
+                }
+                var updated = autoRouter.UpdateConfig(body);
+                return Results.Ok(new { config = updated });
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { error = AG2Security.RedactSensitiveText(ex.Message) }, statusCode: StatusCodes.Status400BadRequest);
+            }
+        });
+
+        // GET /api/router/status
+        _app.MapGet("/api/router/status", () =>
+        {
+            var r = autoRouter?.GetStatus() ?? new RouterStatusDto(
+                State: RoutingSafetyGateState.Idle,
+                AutoSwitchEnabled: false,
+                ActiveAccountId: null,
+                ActiveAccountEmail: null,
+                PendingTargetAccountId: null,
+                LastEvaluatedAt: null,
+                LastDecisionReason: "Router not configured",
+                Config: new RouterConfigDto()
+            );
+            return Results.Ok(new { router = r });
+        });
+
+        // POST /api/router/reset-recovery
+        _app.MapPost("/api/router/reset-recovery", (HttpContext context) =>
+        {
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Unauthorized origin." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (autoRouter == null)
+            {
+                return Results.Json(new { error = "Auto-router is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            }
+            autoRouter.ResetManualRecovery();
+            return Results.Ok(new { success = true, router = autoRouter.GetStatus() });
+        });
+
+        // GET /api/settings/autostart
+        _app.MapGet("/api/settings/autostart", () =>
+        {
+            if (autostartService == null)
+            {
+                return Results.Ok(new { enabled = false, supported = false });
+            }
+            return Results.Ok(new { enabled = autostartService.IsAutostartEnabled(), supported = true });
+        });
+
+        // POST /api/settings/autostart
+        _app.MapPost("/api/settings/autostart", async (HttpContext context) =>
+        {
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Unauthorized origin." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (autostartService == null)
+            {
+                return Results.Json(new { error = "Autostart service is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            }
+            try
+            {
+                var body = await context.Request.ReadFromJsonAsync<AutostartRequest>(cancellationToken: context.RequestAborted);
+                if (body == null)
+                {
+                    return Results.Json(new { error = "Payload required." }, statusCode: StatusCodes.Status400BadRequest);
+                }
+                autostartService.SetAutostartEnabled(body.Enabled);
+                return Results.Ok(new { enabled = autostartService.IsAutostartEnabled(), supported = true });
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { error = AG2Security.RedactSensitiveText(ex.Message) }, statusCode: StatusCodes.Status400BadRequest);
+            }
+        });
 
         // 6. Start Kestrel asynchronously without blocking
         await _app.StartAsync(cancellationToken);
@@ -446,3 +542,5 @@ public class LoopbackServer : IAsyncDisposable
         }
     }
 }
+
+public record AutostartRequest(bool Enabled);
