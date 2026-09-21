@@ -51,59 +51,41 @@ jobs:
         run: dotnet test dotnet/AG2Router.sln -c Release --verbosity normal
 
       - name: Provision Pinned Inno Setup
+        id: inno
         shell: pwsh
         run: |
-          $pinnedVersion = "6.4.0"
-          $innoPath = "C:\Program Files (x86)\Inno Setup 6"
-          $isccPath = Join-Path $innoPath "ISCC.exe"
-
-          $needsInstall = $true
-          if (Test-Path $isccPath) {
-            $verInfo = (Get-Item $isccPath).VersionInfo
-            $currentVer = if ($verInfo.ProductVersion) { $verInfo.ProductVersion.Trim() } else { $verInfo.FileVersion.Trim() }
-            Write-Host "Found existing Inno Setup at $isccPath (Version: $currentVer)"
-            if ($currentVer -like "$pinnedVersion*") {
-              Write-Host "Existing Inno Setup matches pinned version $pinnedVersion. Reusing."
-              $needsInstall = $false
-            } else {
-              Write-Host "Existing Inno Setup version ($currentVer) differs from pinned version ($pinnedVersion). Reinstalling."
-            }
-          } else {
-            Write-Host "Inno Setup not found at $isccPath."
-          }
-
-          if ($needsInstall) {
-            Write-Host "Installing Inno Setup $pinnedVersion via Chocolatey with downgrade support..."
-            choco install innosetup --version $pinnedVersion --allow-downgrade -y --no-progress
-          }
-
-          if (-not (Test-Path $isccPath)) {
-            throw "Inno Setup compiler (ISCC.exe) not found at expected path: $isccPath"
-          }
-
-          $finalVerInfo = (Get-Item $isccPath).VersionInfo
-          $finalVer = if ($finalVerInfo.ProductVersion) { $finalVerInfo.ProductVersion.Trim() } else { $finalVerInfo.FileVersion.Trim() }
-          Write-Host "Verified Inno Setup compiler at $isccPath (Version: $finalVer)"
-
-          if ($finalVer -notlike "$pinnedVersion*") {
-            throw "Inno Setup version mismatch! Expected: $pinnedVersion*, Found: $finalVer"
-          }
-
-          Write-Host "Adding Inno Setup to GITHUB_PATH: $innoPath"
-          "$innoPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          ./scripts/provision-inno.ps1 -PinnedVersion 6.4.0
 
       - name: Run Release Packaging Procedure
         shell: pwsh
         run: |
-          ./scripts/package-release.ps1 -Configuration Release
+          ./scripts/package-release.ps1 `
+            -Configuration Release `
+            -RequireInstaller `
+            -IsccPath '${{ steps.inno.outputs.iscc_path }}'
+
+      - name: Assert Required Release Outputs
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $requiredOutputs = @(
+            "dist/AG2Router-v$version-win-x64.zip",
+            "dist/SHA256SUMS.txt",
+            "dist/AG2Router-Setup-v$version-win-x64.exe"
+          )
+          foreach ($output in $requiredOutputs) {
+            if (-not (Test-Path -LiteralPath $output -PathType Leaf) -or (Get-Item -LiteralPath $output).Length -eq 0) {
+              throw "Required release output is missing: $output"
+            }
+          }
 
       - name: Upload Release Candidate Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: AG2Router-v${{ steps.version.outputs.version }}-win-x64
           path: |
-            dist/*.zip
-            dist/*.exe
+            dist/AG2Router-v${{ steps.version.outputs.version }}-win-x64.zip
+            dist/AG2Router-Setup-v${{ steps.version.outputs.version }}-win-x64.exe
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
