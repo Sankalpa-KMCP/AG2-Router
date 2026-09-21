@@ -74,7 +74,7 @@ public class InMemoryAccountStore : IAccountStore
             }
 
             string now = DateTime.UtcNow.ToString("o");
-            string id = $"acc_{Guid.NewGuid():N[..8]}";
+            string id = $"acc_{Guid.NewGuid().ToString("N")[..8]}";
             int priority = input.Priority ?? (_accounts.Count + 1);
 
             var account = new AccountMetadata(

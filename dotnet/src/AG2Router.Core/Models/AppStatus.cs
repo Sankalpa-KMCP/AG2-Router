@@ -49,10 +49,10 @@ public record TelemetryDto(
 
 public record AccountIdentityDto(
     string Email,
-    string? Name,
-    string? TierId,
-    string? TierName,
-    string? RawStatusTimestamp
+    string? Name = null,
+    string? TierId = null,
+    string? TierName = null,
+    string? RawStatusTimestamp = null
 );
 
 public record QuotaSnapshotDto(

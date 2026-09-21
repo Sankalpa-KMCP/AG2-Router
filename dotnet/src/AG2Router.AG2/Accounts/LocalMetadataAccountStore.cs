@@ -94,7 +94,7 @@ public class LocalMetadataAccountStore : IAccountStore
             string dir = Path.GetDirectoryName(_filePath)!;
             Directory.CreateDirectory(dir);
 
-            string tempFile = $"{_filePath}.{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}.{Guid.NewGuid():N[..6]}.tmp";
+            string tempFile = $"{_filePath}.{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}.{Guid.NewGuid().ToString("N")[..6]}.tmp";
             string json = JsonSerializer.Serialize(data, JsonOptions);
 
             try

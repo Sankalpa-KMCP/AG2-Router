@@ -360,7 +360,7 @@ public class SessionVault : ISessionVault
         };
 
         string serialized = JsonSerializer.Serialize(updatedEnvelope, JsonOptions);
-        string tempPath = $"{_vaultFilePath}.{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}.{Guid.NewGuid():N[..6]}.tmp";
+        string tempPath = $"{_vaultFilePath}.{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}.{Guid.NewGuid().ToString("N")[..6]}.tmp";
 
         try
         {
