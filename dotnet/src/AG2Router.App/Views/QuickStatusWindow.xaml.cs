@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
+using AG2Router.Core.Models;
 using AG2Router.Windows.Tray;
 
 namespace AG2Router.App.Views;
@@ -17,15 +18,47 @@ public partial class QuickStatusWindow : Window
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
     private readonly Action _onOpenDashboard;
+    private readonly Func<SystemStatusDto>? _statusProvider;
 
-    public QuickStatusWindow(Action onOpenDashboard)
+    public QuickStatusWindow(Action onOpenDashboard, Func<SystemStatusDto>? statusProvider = null)
     {
         InitializeComponent();
         _onOpenDashboard = onOpenDashboard;
+        _statusProvider = statusProvider;
+    }
+
+    public void UpdateStatus(SystemStatusDto? status)
+    {
+        if (status == null) return;
+
+        if (status.Ag2.Connected)
+        {
+            TxtStatus.Text = status.Ag2.Activity?.State == "BUSY" ? "Busy" : "Connected";
+            TxtStatus.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(34, 197, 94));
+        }
+        else
+        {
+            TxtStatus.Text = status.Ag2.Status == "DEGRADED" ? "Degraded" : "Not connected";
+            TxtStatus.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 242, 245));
+        }
+
+        TxtAccount.Text = status.Telemetry?.CurrentAccount?.Email ?? "—";
+
+        var (quotaLabel, quotaValue, quotaToolTip) = ModelQuotaFormatter.FormatModelQuota(status.Telemetry?.Quota?.Models);
+        LblQuota.Text = quotaLabel;
+        TxtQuota.Text = quotaValue;
+        TxtQuota.ToolTip = quotaToolTip;
+
+        TxtAutoSwitch.Text = status.Router.AutoSwitchEnabled ? "Active" : "Disabled";
     }
 
     public void ShowNearTray()
     {
+        if (_statusProvider != null)
+        {
+            UpdateStatus(_statusProvider());
+        }
+
         var mousePos = System.Windows.Forms.Cursor.Position;
         var (scaleX, scaleY) = TaskbarPositionHelper.GetMonitorDpiScale(mousePos);
         if (scaleX <= 0) scaleX = 1.0;
@@ -67,5 +100,24 @@ public partial class QuickStatusWindow : Window
     private void Window_Deactivated(object sender, EventArgs e)
     {
         Hide();
+    }
+}
+
+public static class ModelQuotaFormatter
+{
+    public static (string Label, string Value, string? ToolTip) FormatModelQuota(IReadOnlyList<ModelQuotaDto>? models)
+    {
+        if (models is { Count: > 0 })
+        {
+            var first = models[0];
+            var label = string.IsNullOrWhiteSpace(first.Label) ? "Model Quota" : first.Label;
+            var value = $"{Math.Round(first.RemainingFraction * 100)}%";
+            var tooltip = models.Count > 1
+                ? string.Join(Environment.NewLine, models.Select(m => $"{m.Label}: {Math.Round(m.RemainingFraction * 100)}%"))
+                : null;
+            return (label, value, tooltip);
+        }
+
+        return ("Model Quota", "—%", null);
     }
 }

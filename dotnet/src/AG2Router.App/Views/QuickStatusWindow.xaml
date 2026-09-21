@@ -58,7 +58,7 @@
                 <Border Grid.Row="0" Grid.Column="0" Background="#161920" CornerRadius="6" BorderBrush="#272C38" BorderThickness="1" Margin="0,0,4,4" Padding="8">
                     <StackPanel>
                         <TextBlock Text="Antigravity" FontSize="11" Foreground="#9AA2B2"/>
-                        <TextBlock Text="Not connected" FontWeight="SemiBold" FontSize="12" Foreground="#F0F2F5" Margin="0,2,0,0"/>
+                        <TextBlock x:Name="TxtStatus" Text="Not connected" FontWeight="SemiBold" FontSize="12" Foreground="#F0F2F5" Margin="0,2,0,0"/>
                     </StackPanel>
                 </Border>
 
@@ -66,15 +66,15 @@
                 <Border Grid.Row="0" Grid.Column="1" Background="#161920" CornerRadius="6" BorderBrush="#272C38" BorderThickness="1" Margin="4,0,0,4" Padding="8">
                     <StackPanel>
                         <TextBlock Text="Account" FontSize="11" Foreground="#9AA2B2"/>
-                        <TextBlock Text="—" FontWeight="SemiBold" FontSize="12" Foreground="#F0F2F5" Margin="0,2,0,0"/>
+                        <TextBlock x:Name="TxtAccount" Text="—" FontWeight="SemiBold" FontSize="12" Foreground="#F0F2F5" Margin="0,2,0,0"/>
                     </StackPanel>
                 </Border>
 
                 <!-- Quota -->
                 <Border Grid.Row="1" Grid.Column="0" Background="#161920" CornerRadius="6" BorderBrush="#272C38" BorderThickness="1" Margin="0,4,4,0" Padding="8">
                     <StackPanel>
-                        <TextBlock Text="Quota" FontSize="11" Foreground="#9AA2B2"/>
-                        <TextBlock Text="—%" FontWeight="SemiBold" FontSize="12" Foreground="#F0F2F5" Margin="0,2,0,0"/>
+                        <TextBlock x:Name="LblQuota" Text="Model Quota" FontSize="11" Foreground="#9AA2B2" TextTrimming="CharacterEllipsis"/>
+                        <TextBlock x:Name="TxtQuota" Text="—%" FontWeight="SemiBold" FontSize="12" Foreground="#F0F2F5" Margin="0,2,0,0"/>
                     </StackPanel>
                 </Border>
 
@@ -82,7 +82,7 @@
                 <Border Grid.Row="1" Grid.Column="1" Background="#161920" CornerRadius="6" BorderBrush="#272C38" BorderThickness="1" Margin="4,4,0,0" Padding="8">
                     <StackPanel>
                         <TextBlock Text="Auto Switch" FontSize="11" Foreground="#9AA2B2"/>
-                        <TextBlock Text="Not available" FontWeight="SemiBold" FontSize="12" Foreground="#F0F2F5" Margin="0,2,0,0"/>
+                        <TextBlock x:Name="TxtAutoSwitch" Text="Not available" FontWeight="SemiBold" FontSize="12" Foreground="#F0F2F5" Margin="0,2,0,0"/>
                     </StackPanel>
                 </Border>
             </Grid>
