@@ -5,7 +5,7 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <RootNamespace>AG2Router.App</RootNamespace>
-    <AssemblyName>AG2Router.App</AssemblyName>
+    <AssemblyName>AG2Router</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>
@@ -25,6 +25,7 @@
     <Content Include="$(RepoRoot)src\ui\**\*.*">
       <Link>wwwroot\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
   </ItemGroup>
 </Project>

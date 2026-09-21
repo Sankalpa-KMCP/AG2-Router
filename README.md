@@ -1,125 +1,134 @@
 # AG2 Router
 
-A minimal, professional, lightweight local Windows application and service for Antigravity 2 that monitors quota across multiple connected accounts and enables safe, automated routing.
+A lightweight, native Windows desktop application and service for Antigravity 2 that monitors per-model quota across multiple connected accounts and performs safe, automated account routing.
 
 ---
 
 ## 1. What AG2 Router Is
 
-AG2 Router is designed to solve session exhaustion during heavy Antigravity 2 agent workflows. It provides:
+AG2 Router eliminates session and quota exhaustion during heavy Antigravity agent workflows:
 
-* **Real-time Quota Monitoring:** Tracks per-model quotas and prompt/flow credits across connected accounts.
-* **Deterministic Selection:** Evaluates account health and selects the optimal account when the current quota drops below threshold.
-* **Workload-Aware Safety Gating:** Prohibits switching whenever Antigravity 2 is actively executing tasks (`BUSY` or running trajectories $> 0$).
-* **Minimalist Local Dashboard:** A clean, accessible, zero-dependency web interface served exclusively on loopback (`127.0.0.1`).
-* **Zero Runtime Dependencies:** Built strictly on Node.js standard libraries (`node:http`, `node:fs`, `node:crypto`, `node:test`).
-
----
-
-## 2. Current Implementation Status
-
-> [!IMPORTANT]
-> **Stage: Foundation & Setup**  
-> This repository contains the complete, validated architectural foundation, domain models, candidate selection engine, safety gate state machine, local loopback server, and minimal dashboard shell. Real credential capture, WinCred session swapping, process termination/respawn, and live Connect-RPC telemetry are staged for upcoming implementation phases.
-
-| Capability | Current Status | Notes |
-| :--- | :--- | :--- |
-| **Project Architecture & Contracts** | **Operational** | Clean boundary interfaces for AG2, accounts, router, and server |
-| **Candidate Selection Engine** | **Operational** | Deterministic ranking, threshold evaluation, tie-breaking |
-| **Idle Safety Gate** | **Operational** | State machine enforcing `LOW QUOTA → SWITCH PENDING → WAIT FOR IDLE → SWITCH → VERIFY` |
-| **Account Metadata Store** | **Operational** | Non-secret storage (In-memory and atomic local filesystem persistence) |
-| **Local HTTP Server & API** | **Operational** | Loopback-only (`127.0.0.1`), security headers, traversal prevention |
-| **Dashboard Interface** | **Operational** | Responsive vanilla HTML/CSS/JS dashboard shell with truthful empty states |
-| **Automated Test Suite** | **Operational** | 33 comprehensive tests across 6 suites using native `node:test` |
-| **Live Connect-RPC Telemetry** | *Staged (Phase 2)* | Interface defined; real RPC calls reserved for next stage |
-| **DPAPI Session Vault** | *Staged (Phase 3)* | Interface defined; encrypted session capture reserved for next stage |
-| **Cold Account Switching** | *Staged (Phase 4)* | Interface defined; process recycling reserved for next stage |
+* **Real-Time Quota Telemetry:** Continuously polls active Antigravity language server telemetry for model quota and prompt/flow credits.
+* **Autonomous Low-Quota Routing:** Automatically identifies low-quota conditions and switches to the highest-priority eligible candidate account.
+* **Workload-Aware Safety Gating:** Strictly prevents account switching whenever Antigravity is active (`BUSY` or running trajectories $> 0$). Switches occur exclusively during verified `IDLE` states.
+* **Per-User Encrypted Session Vault:** Stores account tokens with native Windows DPAPI (`DataProtectionScope.CurrentUser`), preventing plaintext credential exposure.
+* **Tray-First Windows Desktop Architecture:** Runs quietly in the Windows notification area (system tray) with zero background window overhead and instant quick status tooltips.
+* **In-Process Loopback Dashboard:** Embedded WebView2 dashboard served strictly over loopback (`127.0.0.1`), hardened with security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`).
 
 ---
 
-## 3. Architecture & Domain Boundaries
+## 2. Architecture & Domain Boundaries
 
-The codebase enforces strict separation of concerns to ensure unofficial Antigravity 2 changes never impact the router domain or dashboard:
+The application is built on .NET 10 LTS with modular domain boundaries:
 
 ```
-src/
-├── ag2/         # Antigravity 2 adapter boundary (IAG2Adapter)
-├── accounts/    # Non-sensitive account metadata & storage (IAccountStore)
-├── router/      # Quota assessment, candidate selection, & idle safety gate
-├── server/      # Loopback HTTP server & REST API surface
-├── ui/          # Vanilla HTML/CSS/JavaScript dashboard
-├── config/      # Runtime settings with conservative defaults
-└── index.ts     # Main application entrypoint
+dotnet/src/
+├── AG2Router.Core/       # Canonical domain models, interfaces, and contracts
+├── AG2Router.Windows/    # Native Win32 P/Invoke: WinCred, DPAPI, single-instance mutex & IPC, autostart registry
+├── AG2Router.AG2/        # Antigravity adapter, Connect-RPC telemetry, session vault, auto-router, switch coordinator
+└── AG2Router.App/        # WPF host, tray icon manager, in-process ASP.NET Core Kestrel loopback server, WebView2 dashboard
 ```
 
-* **AG2 Adapter Boundary:** Unofficial and version-sensitive process detection, Connect-RPC calls, and credential operations remain isolated inside `src/ag2/`.
-* **Segregated Quotas:** Prompt and Flow credits are distinct resource pools and are never combined into a single balance.
-* **Safety Gate Contract:** Under no circumstances will a switch execute while Antigravity 2 is busy.
+* **Process & Session Guard:** Single-instance execution enforced via `Local\AG2Router_Session_Mutex` and named-pipe IPC (`AG2Router_Session_IPC_Pipe`).
+* **Persistent Data vs Binaries:**
+  - Binaries are installed per-user to `%LOCALAPPDATA%\Programs\AG2Router\`.
+  - Persistent user metadata is stored in `%LOCALAPPDATA%\AG2-Router\data\accounts.json`.
+  - Encrypted sessions are stored in `%LOCALAPPDATA%\AG2-Router\vault\sessions.dat`.
+  - Application data is **never** deleted or overwritten during upgrades or uninstallation.
 
 ---
 
-## 4. Development & Quick Start
+## 3. Installation & Deployment
 
 ### Prerequisites
+* Windows 10 (1809+) or Windows 11 (64-bit).
+* [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (pre-installed on Windows 11 and modern Windows 10).
+* Antigravity 2 installed.
 
-* Node.js 20.0.0 or higher
-* npm 9.0.0 or higher
-* Windows 10/11 (target production platform)
+### Per-User Installation (Non-Admin)
+1. Download the release archive `AG2Router-v0.1.0-win-x64.zip` from releases.
+2. Extract the archive to a folder of your choice.
+3. Open PowerShell and run the installer:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install.ps1
+   ```
+4. The installer:
+   - Shuts down any existing instance gracefully (`--exit`).
+   - Copies self-contained binaries to `%LOCALAPPDATA%\Programs\AG2Router`.
+   - Creates a Start Menu shortcut: `AG2 Router`.
+   - Registers an Add/Remove Programs entry in Windows Settings.
 
-### Commands
+### Uninstallation
+Run the uninstaller script or uninstall via Windows Settings > Installed Apps:
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\AG2Router\uninstall.ps1"
+```
+**Safety Guarantee:** The uninstaller removes only program binaries, shortcuts, and owned startup entries. It strictly preserves your account metadata, encrypted vault (`%LOCALAPPDATA%\AG2-Router`), and active Windows credentials (`gemini:antigravity`).
 
-```bash
-# Install development dependencies (TypeScript and Node types)
-npm install
+---
 
-# Typecheck source code without emitting files
+## 4. Command-Line Usage & Startup Controls
+
+AG2 Router supports deterministic command-line controls for system startup and automation:
+
+| Command | Description |
+| :--- | :--- |
+| `AG2Router.exe` | Launches the application into the system tray. |
+| `AG2Router.exe --tray` | Explicit silent tray launch (used by Windows autostart). |
+| `AG2Router.exe --open` | Launches or signals the running instance to bring the dashboard window to foreground. |
+| `AG2Router.exe --close` | Signals the running instance to close and hide the dashboard window to the tray. |
+| `AG2Router.exe --exit` | Signals the running instance to perform a graceful shutdown and exit. |
+
+### Windows Autostart Registration
+Autostart can be toggled directly in the Dashboard Settings or via API. It writes a per-user registry key:
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AG2Router` = `"{InstallDir}\AG2Router.exe" --tray`
+
+---
+
+## 5. Development & Building from Source
+
+### Prerequisites
+* .NET SDK 10.0.x (x64)
+* Node.js 20+ / npm 9+ (for UI asset bundling and verification oracle)
+
+### Build Commands
+
+```powershell
+# Restore and run the full .NET test suite
+dotnet test dotnet/AG2Router.sln -c Release
+
+# Run TypeScript typechecks and test oracle
 npm run typecheck
-
-# Build TypeScript and copy UI assets to dist/
-npm run build
-
-# Run automated unit and integration tests
 npm test
 
-# Start the application locally
-npm start
-
-# Development mode (compiles and launches server)
-npm run dev
+# Build and package the self-contained release candidate
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Configuration Release -Version 0.1.0
 ```
 
-Once started, open your browser and navigate to the loopback dashboard:
-```
-http://127.0.0.1:39250
-```
+The packaging script outputs:
+- `dist/AG2Router-v0.1.0-win-x64.zip`: Standalone self-contained release archive.
+- `dist/SHA256SUMS.txt`: SHA-256 checksum manifest for artifact integrity.
+- `dist/AG2Router-Setup-v0.1.0-win-x64.exe`: Inno Setup installer (if `iscc` compiler is present in PATH).
 
 ---
 
-## 5. Security Principles
+## 6. Security Principles
 
-1. **Loopback Only:** AG2 Router binds strictly to `127.0.0.1`. Remote requests outside loopback are blocked with `403 Forbidden`.
-2. **Zero Plaintext Secrets:** Passwords, OAuth tokens, and session secrets are never stored in plaintext or placed in source control.
-3. **No Unrequested Process Interruption:** Account switching requires confirmed `IDLE` state to avoid interrupting long-running agent trajectories.
-4. **Hardened HTTP Surface:** Enforces `nosniff`, `DENY` clickjacking mitigation, `no-store` caching, strict path traversal detection, and tight Content Security Policy (`CSP`).
-
-For full details, see [docs/security.md](docs/security.md).
+1. **Local Loopback Only:** Loopback HTTP server binds strictly to `127.0.0.1` on an ephemeral port. Remote network requests are rejected with `403 Forbidden`.
+2. **DPAPI Protected Sessions:** Sensitive session tokens are encrypted using Windows DPAPI `CurrentUser` scope and never written to logs or transmitted over unauthenticated interfaces.
+3. **Fail-Closed Persistence:** Account metadata and session vaults employ atomic durable file writes (`.tmp` swap with disk flush). Malformed or zero-byte files fail closed and never overwrite intact storage.
+4. **Non-Destructive Operations:** Upgrades and uninstalls never purge user credentials or account databases.
 
 ---
 
-## 6. Current Limitations
+## 7. Troubleshooting & Recovery
 
-* **No Live Credentials Yet:** Accounts registered in the foundation dashboard currently store only non-secret metadata (email, priority, label).
-* **Telemetry Displays Empty State:** Because live Connect-RPC telemetry is not connected in this foundation run, the dashboard truthfully indicates `--%` and `Waiting for Antigravity 2`.
-* **Switching Does Not Restart Process:** The safety gate and router evaluate selection decisions, but halt before mutating credentials or restarting `language_server.exe`.
-
----
-
-## 7. Planned Roadmap
-
-* **Phase 2 &bull; Discovery & Telemetry:** Native `language_server.exe` PID/port resolution, HTTPS Connect-RPC client, live UserStatus telemetry parser.
-* **Phase 3 &bull; Windows Session Vault:** Windows DPAPI encryption via `ProtectedData` for secure session token storage and WinCred generic credential target (`gemini:antigravity`) management.
-* **Phase 4 &bull; Cold Switching Engine:** Safe process termination (`Stop-Process`), WinCred credential swap, binary relaunch, and identity verification.
-* **Phase 5 &bull; Autonomous Routing:** Continuous background evaluation and automated switching on low quota with safety gate enforcement.
+* **Dashboard displays "Waiting for Antigravity":** Antigravity is not currently running. The router will automatically connect when Antigravity starts.
+* **WebView2 runtime missing:** Ensure Microsoft Edge WebView2 Evergreen Runtime is installed. Download from Microsoft's official site.
+* **Resetting / Manual Recovery:** If you ever need to inspect or back up account data, all configuration files reside in:
+  - Account metadata: `%LOCALAPPDATA%\AG2-Router\data\accounts.json`
+  - Encrypted sessions: `%LOCALAPPDATA%\AG2-Router\vault\sessions.dat`
+  - Application diagnostics: `%LOCALAPPDATA%\AG2-Router\app.log`
 
 ---
 
