@@ -121,7 +121,7 @@ try {
         New-Item -Path $UninstallKey -Force | Out-Null
     }
     Set-ItemProperty -Path $UninstallKey -Name "DisplayName" -Value "AG2 Router"
-    Set-ItemProperty -Path $UninstallKey -Name "DisplayVersion" -Value "0.1.0"
+    Set-ItemProperty -Path $UninstallKey -Name "DisplayVersion" -Value "0.2.0"
     Set-ItemProperty -Path $UninstallKey -Name "Publisher" -Value "AG2"
     Set-ItemProperty -Path $UninstallKey -Name "InstallLocation" -Value $InstallDir
     Set-ItemProperty -Path $UninstallKey -Name "DisplayIcon" -Value "$ExePath,0"
