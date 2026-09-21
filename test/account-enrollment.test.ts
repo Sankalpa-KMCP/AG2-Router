@@ -76,6 +76,34 @@ class FailUpdateAccountStore implements IAccountStore {
   }
 }
 
+class BlockingFailUpdateAccountStore implements IAccountStore {
+  public readonly updateEntered: Promise<void>;
+  private signalEntered!: () => void;
+  private readonly release: Promise<void>;
+  private signalRelease!: () => void;
+
+  constructor(private readonly inner: IAccountStore) {
+    this.updateEntered = new Promise((resolve) => { this.signalEntered = resolve; });
+    this.release = new Promise((resolve) => { this.signalRelease = resolve; });
+  }
+  public releaseFailure(): void { this.signalRelease(); }
+  public listAccounts(): Promise<AccountMetadata[]> { return this.inner.listAccounts(); }
+  public getAccount(id: string): Promise<AccountMetadata | null> { return this.inner.getAccount(id); }
+  public getAccountByEmail(email: string): Promise<AccountMetadata | null> { return this.inner.getAccountByEmail(email); }
+  public addAccount(input: CreateAccountInput): Promise<AccountMetadata> { return this.inner.addAccount(input); }
+  public async updateAccount(_id: string, _updates: UpdateAccountInput): Promise<AccountMetadata | null> {
+    this.signalEntered();
+    await this.release;
+    throw new Error('injected delayed metadata commit failure');
+  }
+  public removeAccount(id: string): Promise<boolean> { return this.inner.removeAccount(id); }
+  public getActiveAccountId(): Promise<string | null> { return this.inner.getActiveAccountId(); }
+  public setActiveAccountId(id: string | null): Promise<void> { return this.inner.setActiveAccountId(id); }
+  public compareExchangeActiveAccountId(expectedId: string | null, newId: string | null): Promise<boolean> {
+    return this.inner.compareExchangeActiveAccountId(expectedId, newId);
+  }
+}
+
 describe('AccountEnrollmentService', () => {
   it('should reject enrollment when Antigravity 2 is offline', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-enroll-test-'));
@@ -285,6 +313,37 @@ describe('AccountEnrollmentService', () => {
       assert.equal((await store.listAccounts()).length, 1);
       assert.equal(results.filter((result) => result.isNew).length, 1);
       assert.equal((await vault.listStoredAccountIds()).length, 1);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not overwrite a newer vault session during compensation', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-enroll-vault-race-test-'));
+    try {
+      const store = new InMemoryAccountStore();
+      const account = await store.addAccount({ email: 'vault-race@example.com', hasVaultedSession: true });
+      const vault = new SessionVault({ vaultDir: tempDir, dpapiProvider: new MockDpapiProvider() });
+      await vault.saveSession(account.id, Buffer.from('{"token":"original-synthetic"}'));
+      const blockingStore = new BlockingFailUpdateAccountStore(store);
+      const service = new AccountEnrollmentService({
+        adapter: new MockAG2Adapter({ email: 'vault-race@example.com' }),
+        wincredReader: new MockWinCredReader({
+          target: 'gemini:antigravity', type: 1, userName: 'synthetic', persistence: 2,
+          blob: Buffer.from('{"token":"enrollment-synthetic"}')
+        }),
+        sessionVault: vault,
+        accountStore: blockingStore
+      });
+
+      const enrollment = service.enrollCurrentAccount();
+      await blockingStore.updateEntered;
+      const newer = Buffer.from('{"token":"newer-synthetic"}');
+      await vault.saveSession(account.id, newer);
+      blockingStore.releaseFailure();
+
+      await assert.rejects(() => enrollment);
+      assert.deepEqual(await vault.getSession(account.id), newer);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

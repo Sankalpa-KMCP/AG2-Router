@@ -304,6 +304,19 @@ public class SessionVaultTests : IDisposable
         Assert.Equal(20, (await reloaded.ListStoredAccountIdsAsync()).Count);
     }
 
+    [Fact]
+    public async Task RestoreIfCurrent_DoesNotOverwriteNewerRecord()
+    {
+        var dpapi = new FakeDpapiProvider();
+        var vault = new SessionVault(_tempVaultDir, dpapi);
+        await vault.SaveSessionAsync("acc_receipt", "original"u8.ToArray());
+        var receipt = await vault.SaveSessionWithReceiptAsync("acc_receipt", "candidate"u8.ToArray());
+        await vault.SaveSessionAsync("acc_receipt", "newer"u8.ToArray());
+
+        Assert.False(await vault.RestoreIfCurrentAsync(receipt));
+        Assert.Equal("newer"u8.ToArray(), await vault.GetSessionAsync("acc_receipt"));
+    }
+
     private sealed class ThrowingFileWriter : IDurableFileWriter
     {
         public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken) =>

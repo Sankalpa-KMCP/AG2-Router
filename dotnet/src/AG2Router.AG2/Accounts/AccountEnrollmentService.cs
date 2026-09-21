@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
 using System.Text.Json;
 using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Security;
@@ -120,19 +119,13 @@ public class AccountEnrollmentService
                     Notes: options?.Notes
                 ), cancellationToken).ConfigureAwait(false);
 
-                byte[]? previousSession = null;
+                VaultMutationReceipt? vaultReceipt = null;
                 bool vaultCommitted = false;
                 bool activeCommitted = false;
                 try
                 {
-                    if (!isNew)
-                    {
-                        previousSession = await _sessionVault.GetSessionAsync(pending.Id, cancellationToken)
-                            .ConfigureAwait(false);
-                    }
-
                     // The vault commits first. Metadata cannot truthfully advertise a session before this succeeds.
-                    await _sessionVault.SaveSessionAsync(
+                    vaultReceipt = await _sessionVault.SaveSessionWithReceiptAsync(
                         pending.Id,
                         cred.Blob,
                         cred.Target,
@@ -196,19 +189,9 @@ public class AccountEnrollmentService
                     {
                         try
                         {
-                            if (previousSession != null)
-                            {
-                                await _sessionVault.SaveSessionAsync(
-                                    pending.Id,
-                                    previousSession,
-                                    cred.Target,
-                                    CancellationToken.None).ConfigureAwait(false);
-                            }
-                            else
-                            {
-                                await _sessionVault.RemoveSessionAsync(pending.Id, CancellationToken.None)
-                                    .ConfigureAwait(false);
-                            }
+                            await _sessionVault.RestoreIfCurrentAsync(
+                                vaultReceipt!,
+                                CancellationToken.None).ConfigureAwait(false);
                         }
                         catch { }
                     }
@@ -224,13 +207,6 @@ public class AccountEnrollmentService
                     }
 
                     throw;
-                }
-                finally
-                {
-                    if (previousSession != null)
-                    {
-                        CryptographicOperations.ZeroMemory(previousSession);
-                    }
                 }
                 }
                 finally

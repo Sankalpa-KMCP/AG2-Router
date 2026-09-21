@@ -14,6 +14,7 @@ import { IAG2Adapter } from '../ag2/adapter.js';
 import { redactSensitiveText, sanitizeError } from '../ag2/security.js';
 import { IWinCredReader, DEFAULT_AG2_WINCRED_TARGET } from '../ag2/wincred.js';
 import { SessionVault } from '../vault/session-vault.js';
+import { VaultMutationReceipt } from '../vault/types.js';
 import { withCoordinatedFileAccess } from '../persistence/file-coordination.js';
 import { AccountMetadata, IAccountStore } from './types.js';
 
@@ -126,14 +127,12 @@ export class AccountEnrollmentService {
           notes: options.notes
         });
 
-        let previousSession: Buffer | null = null;
+        let vaultReceipt: VaultMutationReceipt | null = null;
         let vaultCommitted = false;
         let activeCommitted = false;
         try {
-          if (!isNew) previousSession = await this.sessionVault.getSession(pending.id);
-
           // Vault-first: HasVaultedSession remains unchanged/false until this succeeds.
-          await this.sessionVault.saveSession(pending.id, cred.blob, cred.target);
+          vaultReceipt = await this.sessionVault.saveSessionWithReceipt(pending.id, cred.blob, cred.target);
           vaultCommitted = true;
 
           // Commit active selection before the final truth flag so failures remain compensatable.
@@ -168,19 +167,13 @@ export class AccountEnrollmentService {
           }
           if (vaultCommitted) {
             try {
-              if (previousSession) {
-                await this.sessionVault.saveSession(pending.id, previousSession, cred.target);
-              } else {
-                await this.sessionVault.removeSession(pending.id);
-              }
+              await this.sessionVault.restoreIfCurrent(vaultReceipt!);
             } catch {}
           }
           if (isNew) {
             try { await this.accountStore.removeAccount(pending.id); } catch {}
           }
           throw error;
-        } finally {
-          previousSession?.fill(0);
         }
         });
       });

@@ -244,6 +244,30 @@ public class AccountEnrollmentServiceTests : IDisposable
         Assert.Null(await _accountStore.GetAccountByEmailAsync("failing-enrollment@example.com"));
     }
 
+    [Fact]
+    public async Task EnrollmentCompensation_DoesNotOverwriteNewerVaultSession()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("vault-race@example.com", "Synthetic");
+        var account = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: "vault-race@example.com",
+            HasVaultedSession: true));
+        byte[] original = Encoding.UTF8.GetBytes("{\"token\":\"original-synthetic\"}");
+        byte[] enrollment = Encoding.UTF8.GetBytes("{\"token\":\"enrollment-synthetic\"}");
+        byte[] newer = Encoding.UTF8.GetBytes("{\"token\":\"newer-synthetic\"}");
+        await _sessionVault.SaveSessionAsync(account.Id, original);
+        _winCredStore.Seed("gemini:antigravity", "synthetic", enrollment);
+        var blockingStore = new BlockingFailUpdateAccountStore(_accountStore);
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, blockingStore);
+
+        Task<EnrollmentResult> enrollmentTask = service.EnrollCurrentAccountAsync();
+        await blockingStore.UpdateEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await _sessionVault.SaveSessionAsync(account.Id, newer);
+        blockingStore.ReleaseFailure();
+
+        await Assert.ThrowsAsync<AccountEnrollmentException>(() => enrollmentTask);
+        Assert.Equal(newer, await _sessionVault.GetSessionAsync(account.Id));
+    }
+
     private sealed class ThrowingDpapiProvider : IDpapiProvider
     {
         public Task<byte[]> EncryptAsync(byte[] plaintext, CancellationToken cancellationToken = default) =>

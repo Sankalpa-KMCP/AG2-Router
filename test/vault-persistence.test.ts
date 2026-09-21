@@ -226,6 +226,21 @@ describe('SessionVault (Encrypted Multi-Account Session Persistence)', () => {
     }
   });
 
+  it('conditionally restores only when the enrollment write is still current', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-vault-receipt-test-'));
+    try {
+      const vault = new SessionVault({ vaultDir: tempDir, dpapiProvider: new MockDpapiProvider() });
+      await vault.saveSession('acc-receipt', Buffer.from('original'));
+      const receipt = await vault.saveSessionWithReceipt('acc-receipt', Buffer.from('candidate'));
+      await vault.saveSession('acc-receipt', Buffer.from('newer'));
+
+      assert.equal(await vault.restoreIfCurrent(receipt), false);
+      assert.equal((await vault.getSession('acc-receipt'))?.toString(), 'newer');
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('should work with real WindowsDpapiProvider in an isolated directory', { skip: process.platform !== 'win32' ? 'Windows DPAPI is only supported on Windows' : false }, async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-vault-real-test-'));
     try {

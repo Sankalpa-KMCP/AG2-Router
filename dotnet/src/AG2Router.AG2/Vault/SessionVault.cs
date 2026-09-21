@@ -7,6 +7,11 @@ using AG2Router.Core.Models;
 
 namespace AG2Router.AG2.Vault;
 
+internal sealed record VaultMutationReceipt(
+    string AccountId,
+    VaultAccountRecord CommittedRecord,
+    VaultAccountRecord? PreviousRecord);
+
 /// <summary>
 /// Encrypted Multi-Account Session Vault.
 /// Implements persistent, encrypted storage for Antigravity 2 account sessions.
@@ -87,6 +92,16 @@ public class SessionVault : ISessionVault
         string target = VaultConstants.DefaultAg2WinCredTarget,
         CancellationToken cancellationToken = default)
     {
+        _ = await SaveSessionWithReceiptAsync(accountId, sessionBlob, target, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    internal async Task<VaultMutationReceipt> SaveSessionWithReceiptAsync(
+        string accountId,
+        byte[] sessionBlob,
+        string target = VaultConstants.DefaultAg2WinCredTarget,
+        CancellationToken cancellationToken = default)
+    {
         if (string.IsNullOrWhiteSpace(accountId))
         {
             throw new VaultException("accountId is required to save session");
@@ -147,6 +162,44 @@ public class SessionVault : ISessionVault
 
             // 4. Save atomically
             await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            return new VaultMutationReceipt(accountId, record, existing);
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
+    }
+
+    internal async Task<bool> RestoreIfCurrentAsync(
+        VaultMutationReceipt receipt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(receipt);
+
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var lease = await CrossProcessFileLease
+                .AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
+            var envelope = ReadEnvelope();
+            if (!envelope.Records.TryGetValue(receipt.AccountId, out var current) ||
+                current != receipt.CommittedRecord)
+            {
+                return false;
+            }
+
+            if (receipt.PreviousRecord == null)
+            {
+                envelope.Records.Remove(receipt.AccountId);
+            }
+            else
+            {
+                envelope.Records[receipt.AccountId] = receipt.PreviousRecord;
+            }
+
+            await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            return true;
         }
         finally
         {

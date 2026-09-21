@@ -23,9 +23,11 @@ import { IDpapiProvider, WindowsDpapiProvider } from './dpapi.js';
 import {
   VAULT_MAGIC,
   VAULT_SCHEMA_VERSION,
+  VaultAccountRecord,
   VaultCorruptionError,
   VaultError,
   VaultFileEnvelope,
+  VaultMutationReceipt,
   VaultedSessionPlaintext
 } from './types.js';
 
@@ -78,6 +80,14 @@ export class SessionVault {
     sessionBlob: Buffer,
     target: string = 'gemini:antigravity'
   ): Promise<void> {
+    await this.saveSessionWithReceipt(accountId, sessionBlob, target);
+  }
+
+  public async saveSessionWithReceipt(
+    accountId: string,
+    sessionBlob: Buffer,
+    target: string = 'gemini:antigravity'
+  ): Promise<VaultMutationReceipt> {
     if (!accountId || typeof accountId !== 'string') {
       throw new VaultError('accountId is required to save session');
     }
@@ -100,21 +110,43 @@ export class SessionVault {
     const encryptedBuffer = await this.dpapiProvider.encrypt(plaintextBuffer);
     const encryptedPayloadBase64 = encryptedBuffer.toString('base64');
 
-    await withCoordinatedFileAccess(this.vaultFilePath, async () => {
+    return withCoordinatedFileAccess(this.vaultFilePath, async () => {
       // 3. Load current vault envelope (fails closed if existing file is corrupted)
       const envelope = this.readEnvelope();
       const now = new Date().toISOString();
       const existing = envelope.records[accountId];
-      envelope.records[accountId] = {
+      const committedRecord = {
         accountId,
         target,
         encryptedPayloadBase64,
         createdAt: existing ? existing.createdAt : now,
         updatedAt: now
       };
+      envelope.records[accountId] = committedRecord;
 
       // 4. Flush temp content before same-directory replacement.
       await this.writeEnvelope(envelope);
+      return {
+        accountId,
+        committedRecord,
+        previousRecord: existing
+      };
+    });
+  }
+
+  public async restoreIfCurrent(receipt: VaultMutationReceipt): Promise<boolean> {
+    return withCoordinatedFileAccess(this.vaultFilePath, async () => {
+      const envelope = this.readEnvelope();
+      const current = envelope.records[receipt.accountId];
+      if (!current || !this.recordsEqual(current, receipt.committedRecord)) return false;
+
+      if (receipt.previousRecord) {
+        envelope.records[receipt.accountId] = receipt.previousRecord;
+      } else {
+        delete envelope.records[receipt.accountId];
+      }
+      await this.writeEnvelope(envelope);
+      return true;
     });
   }
 
@@ -259,6 +291,14 @@ export class SessionVault {
     }
 
     return envelope as VaultFileEnvelope;
+  }
+
+  private recordsEqual(left: VaultAccountRecord, right: VaultAccountRecord): boolean {
+    return left.accountId === right.accountId &&
+      left.target === right.target &&
+      left.encryptedPayloadBase64 === right.encryptedPayloadBase64 &&
+      left.createdAt === right.createdAt &&
+      left.updatedAt === right.updatedAt;
   }
 
   /**
