@@ -44,7 +44,7 @@ public partial class MainWindow : Window, IDashboardWindow
         try
         {
             var hwnd = new WindowInteropHelper(this).Handle;
-            int useDarkMode = 1;
+            int useDarkMode = 0; // Light title bar matching White Premium UI
             DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDarkMode, sizeof(int));
         }
         catch
@@ -68,6 +68,8 @@ public partial class MainWindow : Window, IDashboardWindow
                 TeardownWebView();
                 return;
             }
+
+            DashboardWebView.DefaultBackgroundColor = System.Drawing.Color.White;
 
             BrowserProcessId = DashboardWebView.CoreWebView2.BrowserProcessId;
 

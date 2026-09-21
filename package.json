@@ -5,9 +5,13 @@
   "type": "module",
   "main": "dist/src/index.js",
   "scripts": {
-    "build": "tsc && node scripts/copy-ui.mjs",
-    "typecheck": "tsc --noEmit",
+    "build:ui": "vite build --config frontend/vite.config.ts",
+    "build:server": "tsc && node scripts/copy-ui.mjs",
+    "build": "npm run build:ui && npm run build:server",
+    "check:ui": "svelte-check --tsconfig frontend/tsconfig.json",
+    "typecheck": "tsc --noEmit && npm run check:ui",
     "start": "node dist/src/index.js",
+    "dev:ui": "vite --config frontend/vite.config.ts",
     "dev": "node scripts/dev.mjs",
     "test": "node scripts/run-tests.mjs"
   },
@@ -23,9 +27,12 @@
   ],
   "author": "",
   "license": "MIT",
-  "dependencies": {},
   "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "@types/node": "^22.10.2",
-    "typescript": "^5.7.2"
+    "svelte": "^5.57.1",
+    "svelte-check": "^4.7.6",
+    "typescript": "^5.7.2",
+    "vite": "^8.3.0"
   }
 }
