@@ -25,6 +25,9 @@ public interface IAG2Adapter
 public interface ISessionVault
 {
     Task<bool> HasSessionAsync(string accountId, CancellationToken cancellationToken = default);
+    Task<byte[]?> GetSessionAsync(string accountId, CancellationToken cancellationToken = default);
+    Task<bool> RemoveSessionAsync(string accountId, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<string>> ListStoredAccountIdsAsync(CancellationToken cancellationToken = default);
     string GetVaultPath();
 }
 

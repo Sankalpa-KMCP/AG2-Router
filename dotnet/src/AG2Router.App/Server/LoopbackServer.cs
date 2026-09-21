@@ -1,5 +1,7 @@
 using System.IO;
 using System.Net;
+using AG2Router.AG2.Accounts;
+using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -26,7 +28,13 @@ public class LoopbackServer : IAsyncDisposable
     public int BoundPort => _boundPort;
     public string BoundUrl => _boundUrl;
 
-    public async Task StartAsync(int requestedPort = 0, Func<SystemStatusDto>? statusProvider = null, CancellationToken cancellationToken = default)
+    public async Task StartAsync(
+        int requestedPort = 0,
+        Func<SystemStatusDto>? statusProvider = null,
+        IAccountStore? accountStore = null,
+        ISessionVault? sessionVault = null,
+        AccountEnrollmentService? enrollmentService = null,
+        CancellationToken cancellationToken = default)
     {
         var builder = WebApplication.CreateSlimBuilder();
 
@@ -102,10 +110,144 @@ public class LoopbackServer : IAsyncDisposable
             return Results.Ok(status);
         });
 
-        // GET /api/accounts - Accounts list
-        _app.MapGet("/api/accounts", () =>
+        // GET /api/accounts - Enriched accounts list
+        _app.MapGet("/api/accounts", async () =>
         {
-            return Results.Ok(new AccountsListDto(Array.Empty<AccountMetadata>()));
+            if (accountStore == null)
+            {
+                return Results.Ok(new AccountsListDto(Array.Empty<AccountMetadata>()));
+            }
+
+            var accounts = await accountStore.ListAccountsAsync();
+            var activeId = await accountStore.GetActiveAccountIdAsync();
+
+            var enriched = new List<AccountMetadata>(accounts.Count);
+            foreach (var acc in accounts)
+            {
+                bool hasVaulted = acc.HasVaultedSession;
+                if (!hasVaulted && sessionVault != null)
+                {
+                    hasVaulted = await sessionVault.HasSessionAsync(acc.Id);
+                }
+
+                enriched.Add(acc with
+                {
+                    HasVaultedSession = hasVaulted,
+                    IsActive = acc.Id == activeId
+                });
+            }
+
+            return Results.Ok(new AccountsListDto(enriched));
+        });
+
+        // POST /api/accounts - Register account metadata
+        _app.MapPost("/api/accounts", async (HttpContext context) =>
+        {
+            if (accountStore == null)
+            {
+                return Results.Json(new { error = "Account store is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            }
+
+            CreateAccountInput? input;
+            try
+            {
+                input = await context.Request.ReadFromJsonAsync<CreateAccountInput>();
+            }
+            catch (Exception)
+            {
+                return Results.Json(new { error = "Invalid JSON payload" }, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            if (input == null || string.IsNullOrWhiteSpace(input.Email) || !input.Email.Contains('@'))
+            {
+                return Results.Json(new { error = "A valid email address is required." }, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            try
+            {
+                var created = await accountStore.AddAccountAsync(input);
+                return Results.Json(new { account = created }, statusCode: StatusCodes.Status201Created);
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
+            }
+        });
+
+        // POST /api/accounts/enroll-current - Safely enroll active account from telemetry and WinCred
+        _app.MapPost("/api/accounts/enroll-current", async (HttpContext context) =>
+        {
+            if (enrollmentService == null)
+            {
+                return Results.Json(new { error = "Account enrollment service is not configured" }, statusCode: StatusCodes.Status501NotImplemented);
+            }
+
+            EnrollmentOptions? options = null;
+            if (context.Request.ContentLength > 0)
+            {
+                try
+                {
+                    options = await context.Request.ReadFromJsonAsync<EnrollmentOptions>();
+                }
+                catch (Exception)
+                {
+                    return Results.Json(new { error = "Invalid JSON payload" }, statusCode: StatusCodes.Status400BadRequest);
+                }
+            }
+
+            try
+            {
+                var result = await enrollmentService.EnrollCurrentAccountAsync(options);
+                return Results.Ok(new
+                {
+                    success = result.Success,
+                    account = result.Account,
+                    isNew = result.IsNew,
+                    message = result.Message
+                });
+            }
+            catch (AccountEnrollmentException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
+            }
+        });
+
+        // DELETE /api/accounts/{id} - Remove account metadata and vaulted session
+        _app.MapDelete("/api/accounts/{id}", async (string id) =>
+        {
+            if (accountStore == null)
+            {
+                return Results.Json(new { error = "Account store is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            }
+
+            if (string.IsNullOrWhiteSpace(id) || id.Contains('/') || id.Contains('\\'))
+            {
+                return Results.Json(new { error = "Account ID required" }, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            var existing = await accountStore.GetAccountAsync(id);
+            if (existing == null)
+            {
+                return Results.Json(new { error = "Account not found" }, statusCode: StatusCodes.Status404NotFound);
+            }
+
+            bool removed = await accountStore.RemoveAccountAsync(id);
+            bool vaultDeleted = false;
+            if (sessionVault != null)
+            {
+                vaultDeleted = await sessionVault.RemoveSessionAsync(id);
+            }
+
+            return Results.Ok(new
+            {
+                success = removed,
+                removedId = id,
+                vaultRecordDeleted = vaultDeleted
+            });
         });
 
         // GET /api/config - Current configuration
@@ -124,18 +266,13 @@ public class LoopbackServer : IAsyncDisposable
             )));
         });
 
-        // Mutation endpoints: Expose explicit safe un-migrated / forbidden behaviors
-        _app.MapPost("/api/accounts/enroll-current", () =>
-            Results.Json(new { error = "Account enrollment is not implemented in native shell foundation." }, statusCode: StatusCodes.Status501NotImplemented));
-
+        // POST /api/accounts/{id}/switch-plan - Dry-run evaluation
         _app.MapPost("/api/accounts/{id}/switch-plan", (string id) =>
-            Results.Json(new { error = "Switch planning is not implemented in native shell foundation." }, statusCode: StatusCodes.Status501NotImplemented));
+            Results.Json(new { error = "Switch planner service is not configured" }, statusCode: StatusCodes.Status501NotImplemented));
 
+        // POST /api/accounts/{id}/switch - Enforced hard safety boundary preventing live mutation
         _app.MapPost("/api/accounts/{id}/switch", (string id) =>
-            Results.Json(new { error = "Live account switching execution is not authorized in this runtime mode." }, statusCode: StatusCodes.Status403Forbidden));
-
-        _app.MapDelete("/api/accounts/{id}", (string id) =>
-            Results.Json(new { error = "Account deletion is not implemented in native shell foundation." }, statusCode: StatusCodes.Status501NotImplemented));
+            Results.Json(new { error = "Live account switching execution is not authorized in this runtime mode. Use switch-plan for dry-run evaluation." }, statusCode: StatusCodes.Status403Forbidden));
 
         _app.MapPost("/api/config", () =>
             Results.Json(new { error = "Configuration updates are not implemented in native shell foundation." }, statusCode: StatusCodes.Status501NotImplemented));
