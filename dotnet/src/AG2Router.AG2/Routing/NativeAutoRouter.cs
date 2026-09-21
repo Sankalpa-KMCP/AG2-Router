@@ -429,6 +429,7 @@ public class NativeAutoRouter : INativeAutoRouter
         catch (Exception ex)
         {
             _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed, $"Switch invocation threw: {AG2Security.RedactSensitiveText(ex.Message)}");
+            _candidateCooldowns[targetAccountId] = DateTime.UtcNow.AddSeconds(60);
             _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after failed switch attempt");
             _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
             return;

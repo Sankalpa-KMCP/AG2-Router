@@ -184,7 +184,7 @@ public class LoopbackServer : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
+                return Results.Json(new { error = AG2Security.RedactSensitiveText(ex.Message) }, statusCode: StatusCodes.Status400BadRequest);
             }
         });
 
@@ -222,11 +222,11 @@ public class LoopbackServer : IAsyncDisposable
             }
             catch (AccountEnrollmentException ex)
             {
-                return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
+                return Results.Json(new { error = AG2Security.RedactSensitiveText(ex.Message) }, statusCode: StatusCodes.Status400BadRequest);
             }
             catch (Exception ex)
             {
-                return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
+                return Results.Json(new { error = AG2Security.RedactSensitiveText(ex.Message) }, statusCode: StatusCodes.Status400BadRequest);
             }
         });
 
