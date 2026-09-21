@@ -6,6 +6,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 jobs:
   build-and-package:
     name: Build & Package Windows Release Candidate
@@ -14,6 +17,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Extract Canonical Version
+        id: version
+        shell: pwsh
+        run: |
+          [xml]$props = Get-Content "dotnet/Directory.Build.props"
+          $canonicalVersion = $props.Project.PropertyGroup.Version
+          Write-Host "Canonical Version: $canonicalVersion"
+          "version=$canonicalVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
@@ -29,7 +41,7 @@ jobs:
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          choco install innosetup --no-progress
+          choco install innosetup --version 6.4.0 --no-progress
           $innoPath = "C:\Program Files (x86)\Inno Setup 6"
           if (Test-Path $innoPath) {
             Write-Host "Adding Inno Setup to GITHUB_PATH: $innoPath"
@@ -51,12 +63,12 @@ jobs:
       - name: Run Release Packaging Procedure
         shell: pwsh
         run: |
-          ./scripts/package-release.ps1 -Configuration Release -Version 0.1.0
+          ./scripts/package-release.ps1 -Configuration Release
 
       - name: Upload Release Candidate Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AG2Router-v0.1.0-win-x64
+          name: AG2Router-v${{ steps.version.outputs.version }}-win-x64
           path: |
             dist/*.zip
             dist/*.exe

@@ -2,11 +2,23 @@
 # Produces self-contained win-x64 release package and checksum manifest
 param(
     [string]$Configuration = "Release",
-    [string]$Version = "0.1.0"
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+
+# Derive canonical version from dotnet/Directory.Build.props if not explicitly specified
+if (-not $Version) {
+    $PropsPath = Join-Path $RepoRoot "dotnet\Directory.Build.props"
+    if (Test-Path $PropsPath) {
+        [xml]$propsXml = Get-Content $PropsPath
+        $Version = $propsXml.Project.PropertyGroup.Version
+    }
+    if (-not $Version) {
+        $Version = "0.1.0"
+    }
+}
 $PublishDir = Join-Path $RepoRoot "publish\win-x64"
 $DistDir = Join-Path $RepoRoot "dist"
 $ProjectFile = Join-Path $RepoRoot "dotnet\src\AG2Router.App\AG2Router.App.csproj"
