@@ -2,6 +2,7 @@ using System.Windows;
 using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Adapter;
 using AG2Router.AG2.Discovery;
+using AG2Router.AG2.Routing;
 using AG2Router.AG2.Switching;
 using AG2Router.AG2.Vault;
 using AG2Router.App.Lifecycle;
@@ -30,6 +31,8 @@ public partial class App : System.Windows.Application
     private WindowsWinCredWriter? _wincredWriter;
     private AccountEnrollmentService? _enrollmentService;
     private NativeAccountSwitchCoordinator? _switchCoordinator;
+    private NativeAutoRouter? _autoRouter;
+    private IAutostartService? _autostartService;
     private bool _isShuttingDown;
 
     private static void Log(string msg)
@@ -109,13 +112,9 @@ public partial class App : System.Windows.Application
 
         try
         {
-            Log("Initializing AG2LiveAdapter and TelemetryPollingCoordinator...");
+            Log("Initializing native vault and account services...");
             var processDetector = new AG2ProcessDetector();
             _ag2Adapter = new AG2LiveAdapter(processDetector);
-            _telemetryCoordinator = new TelemetryPollingCoordinator(_ag2Adapter);
-            _telemetryCoordinator.Start();
-
-            Log("Initializing native vault and account services...");
             _dpapiProvider = new WindowsDpapiProvider();
             _sessionVault = new SessionVault(dpapiProvider: _dpapiProvider);
             _accountStore = new LocalMetadataAccountStore();
@@ -131,6 +130,14 @@ public partial class App : System.Windows.Application
                 _ag2Adapter,
                 processLifecycle);
 
+            Log("Initializing NativeAutoRouter and AutostartService...");
+            _autoRouter = new NativeAutoRouter(_accountStore, _sessionVault, _ag2Adapter, _switchCoordinator);
+            _autostartService = new WindowsRegistryAutostartService(new WindowsRegistryAccessor());
+
+            Log("Initializing TelemetryPollingCoordinator...");
+            _telemetryCoordinator = new TelemetryPollingCoordinator(_ag2Adapter, autoRouter: _autoRouter);
+            _telemetryCoordinator.Start();
+
             Log("Starting loopback server...");
             _loopbackServer = new LoopbackServer();
             await _loopbackServer.StartAsync(
@@ -139,7 +146,9 @@ public partial class App : System.Windows.Application
                 accountStore: _accountStore,
                 sessionVault: _sessionVault,
                 enrollmentService: _enrollmentService,
-                switchCoordinator: _switchCoordinator);
+                switchCoordinator: _switchCoordinator,
+                autoRouter: _autoRouter,
+                autostartService: _autostartService);
 
             var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
             Log($"Loopback server bound to: {dashboardUrl}");
@@ -159,6 +168,8 @@ public partial class App : System.Windows.Application
                     {
                         _quickStatusWindow.UpdateStatus(status);
                     }
+                    var autoStatus = status.Router.AutoSwitchEnabled ? $"Auto: {status.Router.State}" : "Auto: Off";
+                    _trayIconManager?.UpdateTooltip($"AG2 Router - {status.Ag2.Status} ({autoStatus})");
                 });
             };
 
@@ -253,6 +264,16 @@ public partial class App : System.Windows.Application
             }
             catch { }
             _telemetryCoordinator = null;
+        }
+
+        if (_autoRouter != null)
+        {
+            try
+            {
+                await _autoRouter.DisposeAsync();
+            }
+            catch { }
+            _autoRouter = null;
         }
 
         _quickStatusWindow?.Close();

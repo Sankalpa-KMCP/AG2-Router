@@ -28,10 +28,16 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
 
     public event Action<SystemStatusDto>? StatusUpdated;
 
-    public TelemetryPollingCoordinator(IAG2Adapter adapter, TimeSpan? interval = null)
+    private readonly INativeAutoRouter? _autoRouter;
+
+    public TelemetryPollingCoordinator(
+        IAG2Adapter adapter,
+        TimeSpan? interval = null,
+        INativeAutoRouter? autoRouter = null)
     {
         _adapter = adapter;
         _interval = interval ?? TimeSpan.FromSeconds(10);
+        _autoRouter = autoRouter;
 
         _currentStatus = new SystemStatusDto(
             Status: "ok",
@@ -41,7 +47,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 Activity: new ActivityStatusDto("INITIALIZING", 0, 0, DateTime.UtcNow.ToString("o")),
                 Message: "Initializing telemetry coordinator..."
             ),
-            Router: new RouterStatusDto(
+            Router: _autoRouter?.GetStatus() ?? new RouterStatusDto(
                 State: "IDLE",
                 AutoSwitchEnabled: false,
                 ActiveAccountId: null,
@@ -117,6 +123,20 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         {
             var ag2Status = await _adapter.GetStatusAsync(cancellationToken).ConfigureAwait(false);
 
+            if (_autoRouter != null)
+            {
+                try
+                {
+                    await _autoRouter.EvaluateCycleAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Swallowed to prevent telemetry loop abort
+                }
+            }
+
+            var routerDto = _autoRouter?.GetStatus();
+
             SystemStatusDto newStatus;
             if (ag2Status.Connected)
             {
@@ -139,7 +159,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                         Activity: activity,
                         Message: ag2Status.Message
                     ),
-                    Router: new RouterStatusDto(
+                    Router: routerDto ?? new RouterStatusDto(
                         State: "HEALTHY",
                         AutoSwitchEnabled: false,
                         ActiveAccountId: account?.Email,
@@ -163,7 +183,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 newStatus = new SystemStatusDto(
                     Status: "ok",
                     Ag2: ag2Status,
-                    Router: new RouterStatusDto(
+                    Router: routerDto ?? new RouterStatusDto(
                         State: "DEGRADED",
                         AutoSwitchEnabled: false,
                         ActiveAccountId: null,
