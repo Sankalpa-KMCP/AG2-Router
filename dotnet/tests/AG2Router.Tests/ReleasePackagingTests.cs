@@ -283,6 +283,57 @@ public class ReleasePackagingTests
         Assert.Contains("Required packaging output is missing", packageScript);
     }
 
+    [Fact]
+    public void CanonicalVersion_AuthorityAndFallbacks_AreStrictlyAligned()
+    {
+        string repoRoot = FindRepositoryRoot();
+
+        // 1. Primary Authority: dotnet/Directory.Build.props
+        string propsPath = Path.Combine(repoRoot, "dotnet", "Directory.Build.props");
+        Assert.True(File.Exists(propsPath), "Directory.Build.props must exist as primary version authority");
+        string propsContent = File.ReadAllText(propsPath);
+
+        var versionMatch = Regex.Match(propsContent, @"<Version>(?<ver>[^<]+)</Version>");
+        Assert.True(versionMatch.Success, "Directory.Build.props must specify <Version>");
+        string canonicalVersion = versionMatch.Groups["ver"].Value.Trim();
+        Assert.Equal("0.2.0", canonicalVersion);
+
+        // Assembly, File, and Informational versions must match canonical version
+        Assert.Contains($"<AssemblyVersion>{canonicalVersion}</AssemblyVersion>", propsContent);
+        Assert.Contains($"<FileVersion>{canonicalVersion}</FileVersion>", propsContent);
+        Assert.Contains($"<InformationalVersion>{canonicalVersion}</InformationalVersion>", propsContent);
+
+        // 2. package.json and package-lock.json
+        string packageJson = File.ReadAllText(Path.Combine(repoRoot, "package.json"));
+        Assert.Contains($"\"version\": \"{canonicalVersion}\"", packageJson);
+
+        string packageLockJson = File.ReadAllText(Path.Combine(repoRoot, "package-lock.json"));
+        Assert.Contains($"\"version\": \"{canonicalVersion}\"", packageLockJson);
+
+        // 3. installer/AG2Router.iss fallback literal
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+        Assert.Contains($"#define AppVersion \"{canonicalVersion}\"", issContent);
+
+        // 4. scripts/package-release.ps1 fallback literal
+        string packageScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "package-release.ps1"));
+        Assert.Contains($"$Version = \"{canonicalVersion}\"", packageScript);
+
+        // 5. scripts/install.ps1 fallback literal and dynamic derivation
+        string installScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "install.ps1"));
+        Assert.Contains($"$DisplayVersion = \"{canonicalVersion}\"", installScript);
+        Assert.Contains("FileVersionInfo]::GetVersionInfo", installScript);
+
+        // 6. User-facing documentation consistency
+        string readme = File.ReadAllText(Path.Combine(repoRoot, "README.md"));
+        Assert.Contains($"AG2Router-v{canonicalVersion}-win-x64.zip", readme);
+        Assert.Contains($"AG2Router-Setup-v{canonicalVersion}-win-x64.exe", readme);
+
+        string releaseNotesPath = Path.Combine(repoRoot, "docs", $"release-notes-v{canonicalVersion}.md");
+        Assert.True(File.Exists(releaseNotesPath), $"Release notes for v{canonicalVersion} must exist at {releaseNotesPath}");
+        string releaseNotes = File.ReadAllText(releaseNotesPath);
+        Assert.Contains($"**Version:** {canonicalVersion}", releaseNotes);
+    }
+
     #region Inno Setup Upgrade & Safety Semantics (vNext)
 
     [Fact]

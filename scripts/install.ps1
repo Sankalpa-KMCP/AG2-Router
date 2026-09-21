@@ -120,15 +120,32 @@ try {
     if (-not (Test-Path $UninstallKey)) {
         New-Item -Path $UninstallKey -Force | Out-Null
     }
+
+    # Derive DisplayVersion dynamically from the installed executable, falling back to release version
+    $DisplayVersion = $null
+    if (Test-Path $ExePath) {
+        try {
+            $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($ExePath)
+            if ($vi.FileVersion) {
+                $DisplayVersion = $vi.FileVersion
+            }
+        } catch {
+            Write-Warning "Could not read file version from $ExePath: $_"
+        }
+    }
+    if (-not $DisplayVersion) {
+        $DisplayVersion = "0.2.0"
+    }
+
     Set-ItemProperty -Path $UninstallKey -Name "DisplayName" -Value "AG2 Router"
-    Set-ItemProperty -Path $UninstallKey -Name "DisplayVersion" -Value "0.2.0"
+    Set-ItemProperty -Path $UninstallKey -Name "DisplayVersion" -Value $DisplayVersion
     Set-ItemProperty -Path $UninstallKey -Name "Publisher" -Value "AG2"
     Set-ItemProperty -Path $UninstallKey -Name "InstallLocation" -Value $InstallDir
     Set-ItemProperty -Path $UninstallKey -Name "DisplayIcon" -Value "$ExePath,0"
     Set-ItemProperty -Path $UninstallKey -Name "UninstallString" -Value "powershell.exe -ExecutionPolicy Bypass -File `"$InstallDir\uninstall.ps1`""
     Set-ItemProperty -Path $UninstallKey -Name "NoModify" -Value 1 -Type DWord
     Set-ItemProperty -Path $UninstallKey -Name "NoRepair" -Value 1 -Type DWord
-    Write-Host "  [OK] Registered in Add/Remove Programs (HKCU)." -ForegroundColor Green
+    Write-Host "  [OK] Registered in Add/Remove Programs (HKCU) as v$DisplayVersion." -ForegroundColor Green
 } catch {
     Write-Warning "Failed to register Add/Remove programs entry: $_"
 }
