@@ -1,0 +1,130 @@
+# Persistence and concurrency
+
+This document owns durable stores, mutation ownership, synchronization, transaction compensation, and lifecycle sequencing. Domain outcomes are in [domain-rules.md](domain-rules.md); trust assumptions are in [security-and-trust-model.md](security-and-trust-model.md).
+
+## State inventory
+
+| State | Current owner and location | Durability |
+| --- | --- | --- |
+| Account metadata and active account ID | LocalMetadataAccountStore; DATA_DIR/accounts.json when overridden, otherwise per-user LocalAppData/AG2-Router/data/accounts.json | Durable JSON |
+| Vaulted sessions | SessionVault; per-user LocalAppData/AG2-Router/vault/sessions.dat by default | Durable versioned JSON envelope containing DPAPI ciphertext |
+| Live Antigravity credential | Windows Credential Manager canonical target | External OS-managed state |
+| Router configuration | NativeAutoRouter._config | Process memory only |
+| Observed account quotas and cooldowns | NativeAutoRouter | Process memory only |
+| Poll/status snapshot | TelemetryPollingCoordinator | Process memory only |
+| Switch status and last result | NativeAccountSwitchCoordinator | Process memory only |
+| WebView2 browser profile | WebView2EnvironmentCoordinator under per-user LocalAppData/AG2-Router/webview2 | WebView2-managed persistent state |
+| Autostart preference | WindowsRegistryAutostartService | Per-user registry state |
+
+Paths above describe application contracts, not permission to inspect live user data. Tests must redirect storage to task-owned temporary locations.
+
+## File durability
+
+DurableFileWriter implements the shared write primitive for account metadata and vault state:
+
+1. Resolve the full destination and create its directory.
+2. Write a unique temporary sibling using asynchronous write-through.
+3. Flush writer and stream to disk.
+4. Replace an existing destination or move the temporary file into place.
+5. Best-effort remove a temporary file when replacement did not complete.
+
+Readers treat malformed or unsupported persisted data as an error. SessionVault in particular fails closed on empty, truncated, wrong-magic, wrong-version, or identity-mismatched content rather than overwriting it with an empty vault.
+
+Atomic replacement protects the destination snapshot; it does not by itself serialize multiple read-modify-write actors. Locks and rebasing are separate requirements.
+
+## Locking model
+
+- PathLockRegistry returns one in-process SemaphoreSlim per canonical full path.
+- CrossProcessFileLease acquires an exclusive sibling .lock file for cross-process mutation. On Windows it uses delete-on-close behavior.
+- LocalMetadataAccountStore and SessionVault take the path lock, acquire the cross-process lease for mutations, then re-read the latest durable snapshot before applying changes.
+- AccountEnrollmentService adds a normalized-email semaphore and an enrollment-resource cross-process lease.
+- NativeAccountSwitchCoordinator uses a process-wide SwitchGate and a cross-process switch lease derived from the vault path.
+- NativeAutoRouter uses an evaluation gate to prevent overlapping cycles.
+
+Maintain lock acquisition order. Introducing a new caller that acquires these resources in another order requires deadlock analysis and focused contention tests.
+
+## Metadata compare-and-set operations
+
+IAccountStore exposes guarded operations used by recovery paths:
+
+- RemoveAccountIfUnchangedAsync removes only the expected metadata version.
+- CompareExchangeActiveAccountIdAsync changes the active selection only when the expected ID still owns it.
+- TryFinalizeSwitchAsync updates the target and active selection only when the expected source remains active.
+
+These operations prevent a compensation path from erasing a newer concurrent decision. A plain Add, Update, Remove, or SetActive call is not an equivalent substitute.
+
+## Enrollment transaction
+
+CURRENT IMPLEMENTATION in AccountEnrollmentService:
+
+1. Verify connected telemetry and obtain the current account identity.
+2. Read and validate the current WinCred entry.
+3. Serialize enrollment for the normalized identity across in-process and cross-process callers.
+4. Capture prior metadata, vault, and active-account state.
+5. Create or update metadata, save the protected session, and conditionally select the account.
+6. On failure, use RestoreIfCurrent, RemoveAccountIfUnchanged, and active-account compare/exchange so compensation does not overwrite newer state.
+
+Cancellation after mutation begins does not justify abandoning compensation. Recovery uses bounded, explicit operations and must preserve external/concurrent changes.
+
+Evidence: AccountEnrollmentService.cs, AccountEnrollmentServiceTests.cs, SessionVaultTests.cs, and AccountStoreTests.cs.
+
+## Switch transaction
+
+CURRENT IMPLEMENTATION in NativeAccountSwitchCoordinator:
+
+1. Acquire non-overlap gates and validate the target, vaulted session, current identity, activity, and process provenance.
+2. Capture and then refresh the rollback credential around source-process quiescence.
+3. Apply the target credential, restart the verified process generation, and verify target identity.
+4. Finalize metadata with a guarded active-account transition.
+5. On post-mutation failure, quiesce the owned replacement generation, restore the credential only if current state still matches the applied credential, restart, and verify the source identity.
+6. Return explicit rollback or manual-recovery results when restoration cannot be proven.
+
+The order is security- and integrity-sensitive. See NativeAccountSwitchCoordinatorTests and WindowsAG2ProcessLifecycleTests before changing it.
+
+## Polling and stale state
+
+TelemetryPollingCoordinator has a fixed interval chosen at construction, prevents overlapping PollAsync calls, assigns monotonic sequence numbers, and refuses to replace newer status with an older result. Each poll invokes NativeAutoRouter.EvaluateCycleAsync before building the published snapshot.
+
+NativeAutoRouter also contains its own Start/Stop periodic loop using RouterConfigDto.PollingIntervalMs, but App.xaml.cs starts TelemetryPollingCoordinator and does not call NativeAutoRouter.Start. Updating router pollingIntervalMs therefore does not reconfigure the active telemetry timer in the shipped composition. This limitation is tracked in [known-limitations.md](known-limitations.md).
+
+### Dashboard configuration form
+
+App.svelte refreshes status, accounts, and configuration approximately every six seconds. RoutingConfigSection.svelte mirrors each refreshed config prop into local form values through reactive effects and has no dirty-state guard. Unsaved form edits can therefore be replaced by the next refresh.
+
+This is client-side UI concurrency/UX behavior. It does not demonstrate persistent-file corruption or a failed server-side atomic write.
+
+## Interrupted switch consistency
+
+Switch transaction state, including the active transaction and last result, exists only in NativeAccountSwitchCoordinator memory. Applying the WinCred target and finalizing account metadata are separate durable operations. Abrupt process termination between those operations can leave live credential state and account metadata out of sync.
+
+Startup composition currently has no durable switch transaction journal or reconciliation step. Atomic account-metadata replacement protects that file's snapshot; it does not make WinCred plus metadata one atomic cross-store transaction. Repository evidence does not establish automatic or manual recovery behavior for this abrupt-termination case.
+
+## Switch request cancellation
+
+CURRENT IMPLEMENTATION:
+
+- Cancellation before process transition begins returns the CANCELLED result, which the loopback server maps to 408.
+- Once process transition has begun, an exception or cancellation enters rollback using non-request cancellation tokens.
+- The coordinator explicitly checks cancellation after the target identity has been verified but before metadata finalization.
+- A client abort at that late point can roll back an otherwise verified target and return SWITCH_FAILED_ROLLED_BACK rather than CANCELLED/408.
+
+This is transaction/control-flow behavior, not evidence of file corruption. HTTP mappings are summarized in [api-contracts.md](api-contracts.md).
+
+## WebView2 lifecycle
+
+DashboardLifecycleManager owns lazy window creation and reuse. WebView2EnvironmentCoordinator serializes environment creation, keeps closing environments from being handed to new windows, waits for browser-process exit when possible, and retries known lock contention with backoff.
+
+Tests cover concurrent creation, reopen during exit, timeout, lock contention, and late exit events. They do not prove behavior for every installed WebView2 runtime version.
+
+## Change checklist
+
+For any persistent or concurrent mutation, identify:
+
+- the authoritative store and schema;
+- in-process and cross-process ownership;
+- the re-read/rebase point;
+- the commit point;
+- cancellation behavior before and after mutation;
+- compensation preconditions;
+- how newer external state is preserved;
+- fault-injection and contention tests.
