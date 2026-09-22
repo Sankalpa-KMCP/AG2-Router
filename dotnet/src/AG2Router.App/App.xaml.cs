@@ -5,6 +5,7 @@ using AG2Router.AG2.Discovery;
 using AG2Router.AG2.Routing;
 using AG2Router.AG2.Switching;
 using AG2Router.AG2.Vault;
+using AG2Router.App.Diagnostics;
 using AG2Router.App.Lifecycle;
 using AG2Router.App.Server;
 using AG2Router.App.Services;
@@ -305,6 +306,9 @@ public partial class App : System.Windows.Application
             await _singleInstanceGuard.DisposeAsync();
             _singleInstanceGuard = null;
         }
+
+        // Give queued JavaScript diagnostics a short, best-effort drain window.
+        await JsRuntimeDiagnostics.DrainForShutdownAsync(TimeSpan.FromSeconds(1));
 
         Shutdown();
     }
