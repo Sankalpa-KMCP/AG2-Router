@@ -58,6 +58,19 @@ Common routes:
 - Build, generated UI, installer, or release work: build-and-release.md and packaging tests.
 - Test design or live integration: testing.md.
 
+## Derived graph navigation
+
+- Graphify is optional derived navigation only; never project authority. The authority chain remains: source and tests > owning documentation > derived index.
+- Use an existing local graph (`graphify-out/graph.json`) only when its recorded `built_at_commit` exactly equals current `HEAD`.
+- A missing, stale, or malformed graph must never block work; fall back to the deterministic reading path.
+- Verify every material conclusion against owning documentation, source, and tests.
+- Treat `INFERRED` edges as speculative hypotheses, not proof of coupling.
+- Do not treat shortest paths through shared DTOs, namespaces, test fakes/mocks, interfaces, or project dependencies as runtime, control, or data flow.
+- Frontend/backend wire contracts require deterministic inspection of source, schemas, and tests; graph links do not reliably bridge wire contracts.
+- Svelte 5 rune and internal symbol coverage is incomplete; file imports and component hierarchy are more reliable than internal component symbols.
+- Under the current protected-resource policy, do not execute the Graphify CLI to refresh, build, or query the graph, because currently verified tooling (v0.9.65) probes protected user state (`.gemini`) during startup. This prohibition applies to the currently verified tooling and policy; it can be re-evaluated if a future version is independently proven not to probe protected state. Direct read-only inspection of an already-present local graph via standard JSON tooling is permitted when otherwise authorized.
+- Never commit `graphify-out/` or any generated graph artifacts.
+
 ## Protected resources
 
 Repository work must default to synthetic fixtures, fakes, and task-owned temporary directories.
