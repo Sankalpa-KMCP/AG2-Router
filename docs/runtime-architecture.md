@@ -4,7 +4,7 @@ This document owns the current shipped runtime topology and component boundaries
 
 ## Shipped application
 
-AG2 Router v0.2.0 is a per-user Windows desktop application built on .NET 10 and WPF. App.xaml.cs composes the runtime:
+AG2 Router v0.2.1 is a per-user Windows desktop application built on .NET 10 and WPF. App.xaml.cs composes the runtime:
 
 1. SingleInstanceGuard establishes the primary process and named-pipe command path.
 2. AG2ProcessDetector and AG2LiveAdapter provide the Antigravity boundary.

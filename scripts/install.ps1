@@ -195,7 +195,7 @@ try {
         }
     }
     if (-not $DisplayVersion) {
-        $DisplayVersion = "0.2.0"
+        $DisplayVersion = "0.2.1"
     }
 
     Set-ItemProperty -Path $UninstallKey -Name "DisplayName" -Value "AG2 Router"

@@ -18,7 +18,7 @@ if (-not $Version) {
         $Version = $propsXml.Project.PropertyGroup.Version
     }
     if (-not $Version) {
-        $Version = "0.2.0"
+        $Version = "0.2.1"
     }
 }
 $PublishDir = Join-Path $RepoRoot "publish\win-x64"
