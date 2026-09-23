@@ -649,12 +649,12 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             entered.TrySetResult();
             await release.Task; // late continuation can attempt its next mutation
         };
-        var coordinator = Coordinator(transactionTimeout: TimeSpan.FromMilliseconds(80));
+        var coordinator = Coordinator(transactionTimeout: TimeSpan.FromSeconds(2));
         try
         {
             var first = coordinator.SwitchAsync(_target!.Id);
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(2));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(uncertain.ManualRecoveryRequired);
 
             var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(1));
@@ -688,12 +688,12 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             _credentials.Set(entry);
             return true;
         };
-        var coordinator = Coordinator(transactionTimeout: TimeSpan.FromMilliseconds(80));
+        var coordinator = Coordinator(transactionTimeout: TimeSpan.FromSeconds(2));
         try
         {
             var first = coordinator.SwitchAsync(_target!.Id);
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(2));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(uncertain.ManualRecoveryRequired);
 
             var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(1));

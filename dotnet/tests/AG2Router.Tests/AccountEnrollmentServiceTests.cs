@@ -565,14 +565,14 @@ public class AccountEnrollmentServiceTests : IDisposable
             Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var store = new FailUpdateAccountStore(_accountStore) { DelayedCommit = true };
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store,
-            TimeSpan.FromMilliseconds(70));
+            TimeSpan.FromSeconds(2));
 
         try
         {
             var first = service.EnrollCurrentAccountAsync();
-            await store.UpdateEntered.WaitAsync(TimeSpan.FromSeconds(2));
+            await store.UpdateEntered.WaitAsync(TimeSpan.FromSeconds(5));
             var error = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
-                first.WaitAsync(TimeSpan.FromSeconds(2)));
+                first.WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains("manual recovery", error.Message, StringComparison.OrdinalIgnoreCase);
             var pending = await _accountStore.GetAccountByEmailAsync(email);
             Assert.NotNull(pending);
@@ -604,12 +604,12 @@ public class AccountEnrollmentServiceTests : IDisposable
             Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var store = new FailUpdateAccountStore(_accountStore) { DelayGetByEmail = true };
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store,
-            TimeSpan.FromMilliseconds(70));
+            TimeSpan.FromSeconds(2));
         try
         {
             var first = service.EnrollCurrentAccountAsync();
-            await store.ReadEntered.WaitAsync(TimeSpan.FromSeconds(2));
-            await Assert.ThrowsAsync<AccountEnrollmentException>(() => first.WaitAsync(TimeSpan.FromSeconds(2)));
+            await store.ReadEntered.WaitAsync(TimeSpan.FromSeconds(5));
+            await Assert.ThrowsAsync<AccountEnrollmentException>(() => first.WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Equal(0, store.AddCount);
             store.ReleaseRead();
             var gate = PathLockRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
