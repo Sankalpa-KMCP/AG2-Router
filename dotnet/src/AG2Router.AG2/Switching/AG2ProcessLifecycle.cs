@@ -30,7 +30,8 @@ public interface IAG2ProcessLifecycle
     Task RevalidateAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
     Task StopVerifiedAsync(AG2ProcessSnapshot snapshot, TimeSpan timeout,
         CancellationToken cancellationToken = default,
-        Func<CancellationToken, Task>? verifyBeforeKillAsync = null);
+        Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
+        Action? onStopAttempted = null);
     Task<AG2ProcessGeneration> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
     Task<AG2ProcessGeneration> WaitForHealthyReplacementAsync(
         AG2ProcessSnapshot original,
@@ -142,10 +143,11 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         AG2ProcessSnapshot snapshot,
         TimeSpan timeout,
         CancellationToken cancellationToken = default,
-        Func<CancellationToken, Task>? verifyBeforeKillAsync = null)
+        Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
+        Action? onStopAttempted = null)
     {
         await StopExactAsync(snapshot, timeout, requireTelemetryBinding: true, cancellationToken,
-                verifyBeforeKillAsync)
+                verifyBeforeKillAsync, onStopAttempted)
             .ConfigureAwait(false);
     }
 
@@ -154,7 +156,8 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         TimeSpan timeout,
         bool requireTelemetryBinding,
         CancellationToken cancellationToken,
-        Func<CancellationToken, Task>? verifyBeforeKillAsync = null)
+        Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
+        Action? onStopAttempted = null)
     {
         try
         {
@@ -182,6 +185,9 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
                 throw new AG2ProcessLifecycleException(
                     "Verified Antigravity process exited or was replaced before termination.");
             }
+            // This is the first attempted irreversible process mutation. Proof and
+            // process-handle revalidation have both finished before notifying the caller.
+            onStopAttempted?.Invoke();
             process.Kill(entireProcessTree: false);
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeoutCts.CancelAfter(timeout);

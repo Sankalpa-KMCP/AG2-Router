@@ -363,7 +363,6 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             // old generation from racing the transaction by persisting a newer session.
             _shutdownCts.Token.ThrowIfCancellationRequested();
             SetState(NativeSwitchStates.StoppingProcess);
-            processTransitionStarted = true;
 
             // Decouple from caller cancellation token at mutation boundary.
             var mutationTimeout = _processTimeout + _verificationTimeout + TimeSpan.FromSeconds(10);
@@ -371,9 +370,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             mutationCts.CancelAfter(mutationTimeout);
             var mutationToken = mutationCts.Token;
 
-            try
-            {
-                await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken,
+            await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken,
                     async token =>
                     {
                         if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
@@ -397,15 +394,9 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                         if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
                             throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
                                 "Account lifecycle became unresolved at the process-stop boundary.");
-                    })
-                    .ConfigureAwait(false);
-            }
-            catch (SwitchRejectedException)
-            {
-                // The callback runs before Kill. No process or credential mutation began.
-                processTransitionStarted = false;
-                throw;
-            }
+                    },
+                    onStopAttempted: () => processTransitionStarted = true)
+                .ConfigureAwait(false);
             stages.Add("SOURCE_PROCESS_STOPPED");
 
             // The source may have refreshed WinCred after the provisional preflight read.

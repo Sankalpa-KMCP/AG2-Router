@@ -202,6 +202,25 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task ThrowingFinalActivityProofNeverQuiescesOriginalProcess()
+    {
+        await SeedAccountsAsync();
+        _process.BeforeKillBehavior = _ =>
+        {
+            _adapter.ActivityBehavior = _ => throw new IOException("synthetic final activity failure");
+            return Task.CompletedTask;
+        };
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.False(result.Success);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _process.QuiesceCount);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
     public async Task MissingActivityEvidenceFailsBeforeMutation()
     {
         await SeedAccountsAsync();
@@ -824,6 +843,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         public Ag2StatusDto Status { get; set; } =
             new(true, "HEALTHY", new ActivityStatusDto("IDLE", 0, 0, DateTimeOffset.UtcNow.ToString("O")), "synthetic");
         public Func<CancellationToken, Task<AccountIdentityDto?>>? IdentityBehavior { get; set; }
+        public Func<CancellationToken, Task<ActivityStatusDto>>? ActivityBehavior { get; set; }
 
         public Task<Ag2StatusDto> GetStatusAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(Status);
@@ -834,7 +854,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         public Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(new AccountQuotaObservation(Identity, null));
         public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult(Activity);
+            ActivityBehavior?.Invoke(cancellationToken) ?? Task.FromResult(Activity);
     }
 
     private sealed class SwitchProcessLifecycle : IAG2ProcessLifecycle
@@ -856,6 +876,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         public int RevalidateErrorOnCall { get; set; }
         public bool GenerationCurrent { get; set; } = true;
         public int StopCount { get; private set; }
+        public int QuiesceCount { get; private set; }
         public int LaunchCount { get; private set; }
         public int RestoreCount { get; private set; }
         public bool RollbackTokenWasCancelled { get; private set; }
@@ -881,10 +902,12 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             AG2ProcessSnapshot snapshot,
             TimeSpan timeout,
             CancellationToken cancellationToken = default,
-            Func<CancellationToken, Task>? verifyBeforeKillAsync = null)
+            Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
+            Action? onStopAttempted = null)
         {
             if (BeforeKillBehavior != null) await BeforeKillBehavior(cancellationToken);
             if (verifyBeforeKillAsync != null) await verifyBeforeKillAsync(cancellationToken);
+            onStopAttempted?.Invoke();
             StopCount++;
             OnStop?.Invoke();
             if (StopBehavior != null) await StopBehavior(cancellationToken);
@@ -919,6 +942,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
+            QuiesceCount++;
             RollbackTokenWasCancelled = cancellationToken.IsCancellationRequested;
             if (QuiesceBehavior != null) await QuiesceBehavior(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
