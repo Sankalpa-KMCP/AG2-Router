@@ -509,7 +509,7 @@ public class ReleasePackagingTests
         string preparation = issContent.Split("function PrepareToInstall(var NeedsRestart: Boolean): String;")[1]
             .Split("procedure CurStepChanged(CurStep: TSetupStep);")[0];
         Assert.Contains("if DirExists(BackupDir) then", preparation);
-        Assert.Contains("if MoveFileW(AppDir, BackupDir) = 0 then", preparation);
+        Assert.Contains("if not MoveFileW(AppDir, BackupDir) then", preparation);
         Assert.Contains("No application files were overwritten", preparation);
         Assert.Contains(".bak", issContent);
         Assert.Contains("HasBackup := True", issContent);
@@ -525,7 +525,8 @@ public class ReleasePackagingTests
         Assert.Contains("MoveFileW(BackupDir, AppDir)", issContent);
         Assert.Contains("not DelTree(AppDir, True, True, True)", issContent);
         Assert.Contains("if DirExists(BackupDir) then", issContent);
-        Assert.Contains("if MoveFileW(BackupDir, AppDir) = 0 then", issContent);
+        Assert.Contains("if not MoveFileW(BackupDir, AppDir) then", issContent);
+        Assert.DoesNotContain("DirExists(BackupDir) and (not MoveFileW", issContent);
         Assert.Contains("remains in the sibling .bak directory", issContent);
     }
 

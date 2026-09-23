@@ -303,7 +303,7 @@ begin
   end;
   if DirExists(AppDir) then
   begin
-    if MoveFileW(AppDir, BackupDir) = 0 then
+    if not MoveFileW(AppDir, BackupDir) then
     begin
       Result := 'Could not stage the prior installation. No application files were overwritten.';
       Exit;
@@ -358,7 +358,7 @@ begin
 
     if DirExists(BackupDir) then
     begin
-      if MoveFileW(BackupDir, AppDir) = 0 then
+      if not MoveFileW(BackupDir, AppDir) then
         MsgBox('The complete prior installation could not be restored automatically. It remains in the sibling .bak directory for manual recovery.', mbError, MB_OK);
     end;
   end;
