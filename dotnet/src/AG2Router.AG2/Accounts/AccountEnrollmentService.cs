@@ -27,17 +27,21 @@ public class AccountEnrollmentService
     private readonly IWinCredReader _wincredReader;
     private readonly SessionVault _sessionVault;
     private readonly IAccountStore _accountStore;
+    private readonly TimeSpan _completionTimeout;
 
     public AccountEnrollmentService(
         IAG2Adapter adapter,
         IWinCredReader wincredReader,
         SessionVault sessionVault,
-        IAccountStore accountStore)
+        IAccountStore accountStore,
+        TimeSpan? completionTimeout = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _wincredReader = wincredReader ?? throw new ArgumentNullException(nameof(wincredReader));
         _sessionVault = sessionVault ?? throw new ArgumentNullException(nameof(sessionVault));
         _accountStore = accountStore ?? throw new ArgumentNullException(nameof(accountStore));
+        _completionTimeout = completionTimeout ?? TimeSpan.FromSeconds(15);
+        if (_completionTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(completionTimeout));
     }
 
     /// <summary>
@@ -145,6 +149,7 @@ public class AccountEnrollmentService
 
                         // 5. Update account metadata to record vaulted status
                         string now = DateTimeOffset.UtcNow.ToString("O");
+                        using var completion = new CancellationTokenSource(_completionTimeout);
                         var committed = await _accountStore.UpdateAccountAsync(
                             pending.Id,
                             new UpdateAccountInput(
@@ -157,17 +162,27 @@ public class AccountEnrollmentService
                                 Notes: options?.Notes ?? pending.Notes,
                                 Alias: options?.Alias ?? pending.Alias
                             ),
-                            CancellationToken.None).ConfigureAwait(false);
+                            completion.Token).WaitAsync(completion.Token).ConfigureAwait(false);
                         if (committed == null)
                         {
                             throw new AccountEnrollmentException($"Failed to update account record for '{email}'.");
                         }
                         account = committed;
                     }
+                    catch (VaultMutationUncertainException ex)
+                    {
+                        throw new AccountEnrollmentException(
+                            "Vault save outcome is uncertain; manual recovery is required.", ex);
+                    }
+                    catch (OperationCanceledException ex) when (vaultCommitted)
+                    {
+                        throw new AccountEnrollmentException(
+                            "Account metadata commit did not complete within its deadline; manual recovery is required.", ex);
+                    }
                     catch
                     {
                         bool originallyVaulted = existing?.HasVaultedSession == true;
-                        using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                        using var recovery = new CancellationTokenSource(_completionTimeout);
                         AccountMetadata? currentMetadata;
                         try
                         {
@@ -269,14 +284,26 @@ public class AccountEnrollmentService
 
                     if (!liveIdentityStillCurrent)
                     {
-                        using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                        if (!await _sessionVault.RestoreIfCurrentAsync(vaultReceipt!, recovery.Token).ConfigureAwait(false))
-                            throw new AccountEnrollmentException("The active session changed and vault compensation was uncertain; manual recovery is required.");
-                        bool metadataRestored = isNew
-                            ? await _accountStore.RemoveAccountIfUnchangedAsync(account, recovery.Token).ConfigureAwait(false)
-                            : await _accountStore.RestoreAccountIfUnchangedAsync(account, existing!, recovery.Token).ConfigureAwait(false);
-                        if (!metadataRestored)
-                            throw new AccountEnrollmentException("The active session changed and account metadata could not be restored safely; manual recovery is required.");
+                        using var recovery = new CancellationTokenSource(_completionTimeout);
+                        try
+                        {
+                            if (!await _sessionVault.RestoreIfCurrentAsync(vaultReceipt!, recovery.Token)
+                                    .WaitAsync(recovery.Token).ConfigureAwait(false))
+                                throw new AccountEnrollmentException("The active session changed and vault compensation was uncertain; manual recovery is required.");
+                            bool metadataRestored = isNew
+                                ? await _accountStore.RemoveAccountIfUnchangedAsync(account, recovery.Token)
+                                    .WaitAsync(recovery.Token).ConfigureAwait(false)
+                                : await _accountStore.RestoreAccountIfUnchangedAsync(account, existing!, recovery.Token)
+                                    .WaitAsync(recovery.Token).ConfigureAwait(false);
+                            if (!metadataRestored)
+                                throw new AccountEnrollmentException("The active session changed and account metadata could not be restored safely; manual recovery is required.");
+                        }
+                        catch (AccountEnrollmentException) { throw; }
+                        catch (Exception ex)
+                        {
+                            throw new AccountEnrollmentException(
+                                "The active session changed and compensation could not be proven; manual recovery is required.", ex);
+                        }
                         throw new AccountEnrollmentException("The active session changed during capture; current-session enrollment was not committed.");
                     }
 
@@ -284,7 +311,7 @@ public class AccountEnrollmentService
                     bool activeSelectionPreserved = false;
                     if (liveIdentityStillCurrent)
                     {
-                        using var completion = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                        using var completion = new CancellationTokenSource(_completionTimeout);
                         try
                         {
                             activeUpdated = await _accountStore.CompareExchangeActiveAccountIdAsync(
@@ -299,7 +326,7 @@ public class AccountEnrollmentService
                         }
                         if (!activeUpdated)
                         {
-                            using var reconciliation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                            using var reconciliation = new CancellationTokenSource(_completionTimeout);
                             string? authoritativeActiveId;
                             try
                             {
@@ -366,8 +393,22 @@ public sealed record AccountRemovalResult(bool VaultRecordDeleted);
 public sealed class AccountRemovalConflictException(string message) : Exception(message);
 
 /// <summary>Serializes deletion with enrollment and switching and compensates cross-store failure.</summary>
-public sealed class AccountRemovalService(IAccountStore accountStore, SessionVault sessionVault)
+public sealed class AccountRemovalService
 {
+    private readonly IAccountStore accountStore;
+    private readonly SessionVault sessionVault;
+    private readonly TimeSpan completionTimeout;
+
+    public AccountRemovalService(IAccountStore accountStore, SessionVault sessionVault,
+        TimeSpan? completionTimeout = null)
+    {
+        this.accountStore = accountStore;
+        this.sessionVault = sessionVault;
+        this.completionTimeout = completionTimeout ?? TimeSpan.FromSeconds(15);
+        if (this.completionTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(completionTimeout));
+    }
+
     public async Task<AccountRemovalResult> RemoveAsync(string accountId, CancellationToken cancellationToken = default)
     {
         string switchResource = sessionVault.GetVaultPath() + ".switch";
@@ -384,12 +425,28 @@ public sealed class AccountRemovalService(IAccountStore accountStore, SessionVau
             if (string.Equals(activeId, accountId, StringComparison.Ordinal))
                 throw new AccountRemovalConflictException("Cannot delete currently active account. Switch to another account first.");
 
-            var receipt = await sessionVault.RemoveSessionWithReceiptAsync(accountId, cancellationToken)
-                .ConfigureAwait(false);
+            VaultRemovalReceipt? receipt;
+            using (var vaultCompletion = new CancellationTokenSource(completionTimeout))
+            {
+                try
+                {
+                    receipt = await sessionVault.RemoveSessionWithReceiptAsync(accountId, vaultCompletion.Token)
+                        .WaitAsync(vaultCompletion.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException ex) when (vaultCompletion.IsCancellationRequested)
+                {
+                    // The vault operation retains its own file ownership until it actually
+                    // completes. The lifecycle lease can be released without allowing a
+                    // later stale vault write to overtake a new vault mutation.
+                    throw new InvalidOperationException(
+                        "Vault removal did not complete within its deadline; manual recovery is required.", ex);
+                }
+            }
             try
             {
-                using var completion = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                if (!await accountStore.RemoveAccountIfUnchangedAsync(expected, completion.Token).ConfigureAwait(false))
+                using var completion = new CancellationTokenSource(completionTimeout);
+                if (!await accountStore.RemoveAccountIfUnchangedAsync(expected, completion.Token)
+                        .WaitAsync(completion.Token).ConfigureAwait(false))
                     throw new AccountRemovalConflictException("Account metadata changed during removal.");
                 return new AccountRemovalResult(receipt != null);
             }
@@ -401,17 +458,18 @@ public sealed class AccountRemovalService(IAccountStore accountStore, SessionVau
                     // If the metadata writer successfully replaced accounts.json with the account removed,
                     // restoring the vault would create an orphan session without an account.
                     AccountMetadata? currentMetadata = null;
+                    using var recovery = new CancellationTokenSource(completionTimeout);
                     try
                     {
-                        currentMetadata = await accountStore.GetAccountAsync(accountId, CancellationToken.None)
-                            .ConfigureAwait(false);
+                        currentMetadata = await accountStore.GetAccountAsync(accountId, recovery.Token)
+                            .WaitAsync(recovery.Token).ConfigureAwait(false);
                     }
                     catch (Exception readError)
                     {
-                        using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
                         try
                         {
-                            await sessionVault.RestoreRemovedIfAbsentAsync(receipt, recovery.Token).ConfigureAwait(false);
+                            await sessionVault.RestoreRemovedIfAbsentAsync(receipt, recovery.Token)
+                                .WaitAsync(recovery.Token).ConfigureAwait(false);
                         }
                         catch (Exception restoreError)
                         {
@@ -425,9 +483,17 @@ public sealed class AccountRemovalService(IAccountStore accountStore, SessionVau
 
                     if (currentMetadata != null)
                     {
-                        using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                        if (!await sessionVault.RestoreRemovedIfAbsentAsync(receipt, recovery.Token).ConfigureAwait(false))
-                            throw new InvalidOperationException("Account removal compensation could not restore the vaulted session; manual recovery is required.");
+                        try
+                        {
+                            if (!await sessionVault.RestoreRemovedIfAbsentAsync(receipt, recovery.Token)
+                                    .WaitAsync(recovery.Token).ConfigureAwait(false))
+                                throw new InvalidOperationException("Account removal compensation could not restore the vaulted session; manual recovery is required.");
+                        }
+                        catch (Exception restoreError)
+                        {
+                            throw new InvalidOperationException(
+                                "Account removal compensation could not be proven; manual recovery is required.", restoreError);
+                        }
                     }
                 }
                 throw;

@@ -163,7 +163,31 @@ public class SessionVault : ISessionVault
             envelope.Records[accountId] = record;
 
             // 4. Save atomically
-            await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception writeError)
+            {
+                VaultAccountRecord? authoritative;
+                try
+                {
+                    ReadEnvelope().Records.TryGetValue(accountId, out authoritative);
+                }
+                catch (Exception readError)
+                {
+                    throw new VaultMutationUncertainException(
+                        "Vault save outcome could not be read; manual recovery is required.",
+                        new AggregateException(writeError, readError));
+                }
+
+                if (authoritative == record)
+                    return new VaultMutationReceipt(accountId, record, existing);
+                if (authoritative != existing)
+                    throw new VaultMutationUncertainException(
+                        "Vault save outcome changed unexpectedly; manual recovery is required.", writeError);
+                throw;
+            }
             return new VaultMutationReceipt(accountId, record, existing);
         }
         finally
@@ -368,12 +392,20 @@ public class SessionVault : ISessionVault
             {
                 // A failed writer may have replaced the file before surfacing an error.
                 // Restore the preimage under the same vault ownership before reporting failure.
-                using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                var current = ReadEnvelope();
+                VaultFileEnvelope current;
+                try { current = ReadEnvelope(); }
+                catch (Exception readError)
+                {
+                    throw new VaultMutationUncertainException(
+                        "Vault removal outcome could not be read; manual recovery is required.", readError);
+                }
                 if (!current.Records.ContainsKey(accountId))
                 {
                     current.Records.Add(accountId, removed);
-                    try { await WriteEnvelopeAsync(current, recovery.Token).ConfigureAwait(false); }
+                    try
+                    {
+                        await WriteEnvelopeAsync(current, cancellationToken).ConfigureAwait(false);
+                    }
                     catch (Exception ex)
                     {
                         throw new VaultException($"Vault removal outcome is uncertain; manual recovery is required: {ex.Message}");

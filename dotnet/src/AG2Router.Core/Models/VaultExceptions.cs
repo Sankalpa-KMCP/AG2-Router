@@ -27,6 +27,13 @@ public class VaultException : Exception
     public VaultException(string message, Exception innerException) : base(message, innerException) { }
 }
 
+/// <summary>A vault write may have become durable, but its final state could not be proved.</summary>
+public sealed class VaultMutationUncertainException : VaultException
+{
+    public VaultMutationUncertainException(string message, Exception innerException)
+        : base(message, innerException) { }
+}
+
 /// <summary>
 /// Exception thrown when vault file is corrupt, malformed, or has invalid version/framing.
 /// Fails closed: corrupted vault files must NEVER be overwritten.
