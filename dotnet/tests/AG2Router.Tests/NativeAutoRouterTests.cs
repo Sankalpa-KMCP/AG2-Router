@@ -967,6 +967,30 @@ public class NativeAutoRouterTests : IAsyncDisposable
         Assert.Equal(0, _switchCoordinator.CallCount);
     }
 
+    [Fact]
+    public async Task UnclassifiedCoordinatorFailureAfterAdmissionRequiresManualRecovery()
+    {
+        await using var router = CreateRouter();
+        var current = CreateAccount("current", "current@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
+        router.SetObservedQuota(candidate.Id, 0.9);
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto("IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+        _switchCoordinator.SwitchBehavior = (_, _) => throw new IOException("synthetic uncertain cleanup");
+
+        await router.EvaluateCycleAsync();
+
+        Assert.Equal(1, _switchCoordinator.CallCount);
+        Assert.Equal(RoutingSafetyGateState.ManualRecoveryRequired, router.GetStatus().State);
+        Assert.False(router.GetConfig().AutoSwitchEnabled);
+    }
+
     private sealed class FakeDurableFileWriter : IDurableFileWriter
     {
         public Exception? Failure { get; set; }

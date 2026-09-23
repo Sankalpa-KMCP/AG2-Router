@@ -26,6 +26,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     private readonly object _statusLock = new();
     private readonly CancellationTokenSource _shutdownCts = new();
     private volatile bool _isShuttingDown;
+    internal Func<Task>? BeforeLeaseReleaseAsync { get; set; }
 
     private string _currentState = NativeSwitchStates.Idle;
     private string? _activeTransactionId;
@@ -273,6 +274,16 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     SwitchResultCodes.TargetNotVaulted,
                     "Target vaulted session is missing, empty, or outside credential bounds.");
             }
+            // Vault loading is awaitable. Its result does not prove the live source
+            // identity still matches the metadata used for this transaction.
+            var identityAtStop = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
+            var activeAtStop = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+            var identityAfterActiveRead = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
+            if (!SourceIdentityMatches(sourceAccount, identityAtStop) ||
+                !SourceIdentityMatches(sourceAccount, identityAfterActiveRead) ||
+                !string.Equals(activeAtStop, previousAccountId, StringComparison.Ordinal))
+                throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
+                    "Live or active identity changed before process stop.");
             // Quiesce the verified source before changing its credential. This prevents the
             // old generation from racing the transaction by persisting a newer session.
             _shutdownCts.Token.ThrowIfCancellationRequested();
@@ -285,8 +296,27 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             mutationCts.CancelAfter(mutationTimeout);
             var mutationToken = mutationCts.Token;
 
-            await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken,
+                    async token =>
+                    {
+                        string? authoritativeId = await _accountStore.GetActiveAccountIdAsync(token)
+                            .ConfigureAwait(false);
+                        var live = await _adapter.GetCurrentAccountAsync(token).ConfigureAwait(false);
+                        if (!string.Equals(authoritativeId, previousAccountId, StringComparison.Ordinal) ||
+                            !SourceIdentityMatches(sourceAccount, live))
+                            throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
+                                "Live or active identity changed at the process-stop boundary.");
+                    })
+                    .ConfigureAwait(false);
+            }
+            catch (SwitchRejectedException)
+            {
+                // The callback runs before Kill. No process or credential mutation began.
+                processTransitionStarted = false;
+                throw;
+            }
             stages.Add("SOURCE_PROCESS_STOPPED");
 
             // The source may have refreshed WinCred after the provisional preflight read.
@@ -429,14 +459,61 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 ZeroCredential(targetCredential);
             }
             if (targetSession != null) CryptographicOperations.ZeroMemory(targetSession);
+            Exception? cleanupError = null;
             try
             {
+                if (BeforeLeaseReleaseAsync is { } beforeRelease)
+                    await beforeRelease().ConfigureAwait(false);
                 if (switchLease != null) await switchLease.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                cleanupError = ex;
+                // Even an injected/diagnostic release failure must still attempt
+                // to release the actual lease before lifting in-process ownership.
+                if (switchLease != null)
+                {
+                    try { await switchLease.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception releaseError)
+                    {
+                        cleanupError = new AggregateException(ex, releaseError);
+                    }
+                }
             }
             finally
             {
                 switchLock.Release();
                 lock (_statusLock) { _activeTransactionId = null; }
+            }
+            if (cleanupError != null)
+            {
+                lock (_statusLock)
+                {
+                    if (_lastResult?.TransactionId == transactionId && _lastResult.ManualRecoveryRequired)
+                    {
+                        _lastResult = _lastResult with
+                        {
+                            Message = _lastResult.Message + " Cleanup also failed; manual recovery remains required."
+                        };
+                    }
+                    else
+                    {
+                        if (_lastResult?.TransactionId == transactionId)
+                        {
+                            _lastResult = _lastResult with
+                            {
+                                Success = false,
+                                Code = SwitchResultCodes.SwitchFailedRollbackFailed,
+                                State = NativeSwitchStates.Failed,
+                                ManualRecoveryRequired = true,
+                                Message = "Switch cleanup failed; manual recovery is required."
+                            };
+                        }
+                        _currentState = NativeSwitchStates.Failed;
+                        throw new InvalidOperationException(
+                            "Switch cleanup failed; outcome requires manual recovery.", cleanupError);
+                    }
+                }
             }
         }
         }

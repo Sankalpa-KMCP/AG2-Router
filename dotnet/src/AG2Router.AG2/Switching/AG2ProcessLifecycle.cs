@@ -28,7 +28,9 @@ public interface IAG2ProcessLifecycle
 {
     Task<AG2ProcessSnapshot> CaptureVerifiedAsync(CancellationToken cancellationToken = default);
     Task RevalidateAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
-    Task StopVerifiedAsync(AG2ProcessSnapshot snapshot, TimeSpan timeout, CancellationToken cancellationToken = default);
+    Task StopVerifiedAsync(AG2ProcessSnapshot snapshot, TimeSpan timeout,
+        CancellationToken cancellationToken = default,
+        Func<CancellationToken, Task>? verifyBeforeKillAsync = null);
     Task<AG2ProcessGeneration> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
     Task<AG2ProcessGeneration> WaitForHealthyReplacementAsync(
         AG2ProcessSnapshot original,
@@ -139,9 +141,11 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
     public async Task StopVerifiedAsync(
         AG2ProcessSnapshot snapshot,
         TimeSpan timeout,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Func<CancellationToken, Task>? verifyBeforeKillAsync = null)
     {
-        await StopExactAsync(snapshot, timeout, requireTelemetryBinding: true, cancellationToken)
+        await StopExactAsync(snapshot, timeout, requireTelemetryBinding: true, cancellationToken,
+                verifyBeforeKillAsync)
             .ConfigureAwait(false);
     }
 
@@ -149,7 +153,8 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         AG2ProcessSnapshot snapshot,
         TimeSpan timeout,
         bool requireTelemetryBinding,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<CancellationToken, Task>? verifyBeforeKillAsync = null)
     {
         try
         {
@@ -169,6 +174,8 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
             {
                 await RevalidateAsync(snapshot, cancellationToken).ConfigureAwait(false);
             }
+            if (verifyBeforeKillAsync != null)
+                await verifyBeforeKillAsync(cancellationToken).ConfigureAwait(false);
             process.Refresh();
             if (process.HasExited || process.StartTime.ToUniversalTime() != snapshot.StartTimeUtc)
             {

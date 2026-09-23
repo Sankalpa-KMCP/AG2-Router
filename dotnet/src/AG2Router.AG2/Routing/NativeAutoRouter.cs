@@ -767,17 +767,8 @@ public class NativeAutoRouter : INativeAutoRouter
         {
             lock (_stateLock)
             {
-                if (_lastSuccessfulManualEpoch > planEpoch) return;
-                if (_manualSwitchEpoch != planEpoch)
-                {
-                    if (!_manualSwitchPending && _safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
-                        _safetyGate.Reset("Stale automatic plan threw exception; reset to idle.");
-                    return;
-                }
-                _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed, $"Switch invocation threw: {AG2Security.RedactSensitiveText(ex.Message)}");
-                _candidateCooldowns[targetAccountId] = DateTime.UtcNow.AddSeconds(60);
-                _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after failed switch attempt");
-                _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
+                RequireManualRecovery(
+                    $"Automatic switch outcome is uncertain: {AG2Security.RedactSensitiveText(ex.Message)}");
             }
             return;
         }

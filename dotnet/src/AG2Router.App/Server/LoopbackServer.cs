@@ -459,9 +459,10 @@ public class LoopbackServer : IAsyncDisposable
             catch (Exception)
             {
                 var failureResult = new NativeSwitchResult(
-                    null, false, SwitchResultCodes.TelemetryUnavailable, NativeSwitchStates.Failed,
-                    id, null, null, null, "Switch request failed before completion.", [],
-                    DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O"));
+                    null, false, SwitchResultCodes.SwitchFailedRollbackFailed, NativeSwitchStates.Failed,
+                    id, null, null, null, "Switch outcome could not be proven; manual recovery is required.", [],
+                    DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O"),
+                    ManualRecoveryRequired: true);
 
                 if (manualSwitchToken.HasValue)
                     await autoRouter!.NotifyManualSwitchCompletedAsync(manualSwitchToken.Value, failureResult);
