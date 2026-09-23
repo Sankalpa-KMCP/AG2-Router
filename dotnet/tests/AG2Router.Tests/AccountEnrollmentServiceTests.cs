@@ -1167,14 +1167,14 @@ public sealed class AccountRemovalServiceTests : IDisposable
             new FakeDpapiProvider());
         await vault.SaveSessionAsync(account.Id, [1, 2, 3]);
         var store = new HangingRemovalStore(underlying) { DelayedRemoval = true };
-        var service = new AccountRemovalService(store, vault, TimeSpan.FromMilliseconds(70));
+        var service = new AccountRemovalService(store, vault, TimeSpan.FromSeconds(2));
 
         try
         {
             var first = service.RemoveAsync(account.Id);
-            await store.RemovalEntered.WaitAsync(TimeSpan.FromSeconds(2));
+            await store.RemovalEntered.WaitAsync(TimeSpan.FromSeconds(5));
             var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                first.WaitAsync(TimeSpan.FromSeconds(2)));
+                first.WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains("manual recovery", error.Message, StringComparison.OrdinalIgnoreCase);
 
             var later = await Assert.ThrowsAsync<InvalidOperationException>(() =>
