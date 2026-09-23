@@ -526,4 +526,38 @@ public class AG2TelemetryNormalizerTests
         Assert.Equal(300, snapshot.FlowCredits.AvailableCredits);
         Assert.Equal(200, snapshot.FlowCredits.UsedCredits);
     }
+
+    [Fact]
+    public void NormalizeQuotaSnapshot_PartialCreditPool_PreservesNullValuesWithoutCoalescingZero()
+    {
+        var raw = new RawUserStatusResponse
+        {
+            UserStatus = new RawUserStatus
+            {
+                PlanStatus = new RawPlanStatus
+                {
+                    PlanInfo = new RawPlanInfo
+                    {
+                        MonthlyPromptCredits = null,
+                        MonthlyFlowCredits = 500
+                    },
+                    AvailablePromptCredits = 100,
+                    AvailableFlowCredits = null
+                }
+            }
+        };
+
+        var snapshot = AG2TelemetryNormalizer.NormalizeQuotaSnapshot(raw);
+
+        Assert.NotNull(snapshot);
+        Assert.NotNull(snapshot.PromptCredits);
+        Assert.Equal(100, snapshot.PromptCredits.AvailableCredits);
+        Assert.Null(snapshot.PromptCredits.MonthlyCredits);
+        Assert.Null(snapshot.PromptCredits.UsedCredits);
+
+        Assert.NotNull(snapshot.FlowCredits);
+        Assert.Null(snapshot.FlowCredits.AvailableCredits);
+        Assert.Equal(500, snapshot.FlowCredits.MonthlyCredits);
+        Assert.Null(snapshot.FlowCredits.UsedCredits);
+    }
 }

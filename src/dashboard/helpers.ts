@@ -138,3 +138,98 @@ export function formatResetTime(resetTime?: string | null, relativeTo: Date = ne
 export function prepareAliasPayload(input: string): { alias: string } {
   return { alias: input.trim() };
 }
+
+export interface PoolsStatusSummary {
+  badgeText: string;
+  badgeClass: string;
+  metricText: string;
+  metricClass: string;
+}
+
+/**
+ * Derives the truthful status summary for model quota pools.
+ * When activeModelsCount === 0, returns 'No Data' / neutral instead of fabricating 'Nominal' / 'All Healthy'.
+ */
+export function derivePoolsStatusSummary(
+  activeModelsCount: number,
+  exhaustedCount: number,
+  unknownModelsCount: number
+): PoolsStatusSummary {
+  if (activeModelsCount === 0) {
+    return {
+      badgeText: 'No Data',
+      badgeClass: 'badge-neutral',
+      metricText: 'No Data',
+      metricClass: 'text-muted'
+    };
+  }
+
+  if (exhaustedCount > 0) {
+    return {
+      badgeText: `${exhaustedCount} Near Limit`,
+      badgeClass: 'badge-danger',
+      metricText: `${exhaustedCount} Exhausted`,
+      metricClass: 'text-danger'
+    };
+  }
+
+  if (unknownModelsCount > 0) {
+    return {
+      badgeText: `${unknownModelsCount} Unknown`,
+      badgeClass: 'badge-neutral',
+      metricText: 'Quota Unknown',
+      metricClass: 'text-muted'
+    };
+  }
+
+  return {
+    badgeText: 'Nominal',
+    badgeClass: 'badge-healthy',
+    metricText: 'All Healthy',
+    metricClass: 'text-success'
+  };
+}
+
+export interface FormattedCreditPool {
+  hasData: boolean;
+  availableText: string;
+  totalText: string | null;
+  ratioPercent: number | null;
+  isIndeterminate: boolean;
+}
+
+/**
+ * Formats a credit pool truthfully, distinguishing unknown totals from zero and avoiding 100% fabrications.
+ */
+export function formatCreditPool(
+  pool?: { availableCredits?: number | null; monthlyCredits?: number | null; usedCredits?: number | null } | null
+): FormattedCreditPool {
+  if (!pool || (pool.availableCredits == null && pool.monthlyCredits == null)) {
+    return {
+      hasData: false,
+      availableText: '--',
+      totalText: null,
+      ratioPercent: null,
+      isIndeterminate: true
+    };
+  }
+
+  const avail = pool.availableCredits;
+  const monthly = pool.monthlyCredits;
+
+  const availableText = avail != null ? avail.toLocaleString() : '--';
+  const totalText = monthly != null && monthly > 0 ? `/ ${monthly.toLocaleString()} total` : null;
+
+  let ratioPercent: number | null = null;
+  if (avail != null && monthly != null && monthly > 0) {
+    ratioPercent = Math.max(0, Math.min(100, Math.round((avail / monthly) * 100)));
+  }
+
+  return {
+    hasData: true,
+    availableText,
+    totalText,
+    ratioPercent,
+    isIndeterminate: ratioPercent === null
+  };
+}

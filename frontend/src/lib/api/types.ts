@@ -40,9 +40,9 @@ export interface CanonicalModelDto {
 }
 
 export interface CreditPoolDto {
-  availableCredits: number;
-  monthlyCredits: number;
-  usedCredits: number;
+  availableCredits?: number | null;
+  monthlyCredits?: number | null;
+  usedCredits?: number | null;
 }
 
 export interface QuotaSnapshotDto {

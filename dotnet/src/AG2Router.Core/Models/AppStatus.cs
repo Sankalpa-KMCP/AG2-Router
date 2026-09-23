@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AG2Router.Core.Models;
 
 public record SystemStatusDto(
@@ -67,22 +69,29 @@ public record CanonicalModelQuotaDto(
     string Key,
     string Label,
     string? ModelOrTier,
-    double RemainingFraction,
+    double? RemainingFraction,
     string? ResetTime,
     bool IsExhausted,
     IReadOnlyList<string> Modes
-);
+)
+{
+    [JsonPropertyName("canonicalKey")]
+    public string CanonicalKey => Key;
+
+    [JsonPropertyName("displayLabel")]
+    public string DisplayLabel => Label;
+}
 
 public record ModelQuotaDto(
     string Label,
     string? ModelOrTier,
-    double RemainingFraction,
+    double? RemainingFraction,
     string? ResetTime,
     bool IsExhausted
 );
 
 public record CreditPoolDto(
-    long AvailableCredits,
-    long MonthlyCredits,
-    long UsedCredits
+    long? AvailableCredits,
+    long? MonthlyCredits,
+    long? UsedCredits
 );

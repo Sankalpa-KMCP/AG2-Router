@@ -72,20 +72,26 @@ public static class AG2TelemetryNormalizer
 
         if (u.PlanStatus is { } plan)
         {
-            long monthlyPrompt = plan.PlanInfo?.MonthlyPromptCredits ?? 0;
-            long availPrompt = plan.AvailablePromptCredits ?? 0;
+            long? monthlyPrompt = plan.PlanInfo?.MonthlyPromptCredits;
+            long? availPrompt = plan.AvailablePromptCredits;
+            long? usedPrompt = (monthlyPrompt.HasValue && availPrompt.HasValue)
+                ? Math.Max(0, monthlyPrompt.Value - availPrompt.Value)
+                : null;
             promptCredits = new CreditPoolDto(
                 AvailableCredits: availPrompt,
                 MonthlyCredits: monthlyPrompt,
-                UsedCredits: Math.Max(0, monthlyPrompt - availPrompt)
+                UsedCredits: usedPrompt
             );
 
-            long monthlyFlow = plan.PlanInfo?.MonthlyFlowCredits ?? 0;
-            long availFlow = plan.AvailableFlowCredits ?? 0;
+            long? monthlyFlow = plan.PlanInfo?.MonthlyFlowCredits;
+            long? availFlow = plan.AvailableFlowCredits;
+            long? usedFlow = (monthlyFlow.HasValue && availFlow.HasValue)
+                ? Math.Max(0, monthlyFlow.Value - availFlow.Value)
+                : null;
             flowCredits = new CreditPoolDto(
                 AvailableCredits: availFlow,
                 MonthlyCredits: monthlyFlow,
-                UsedCredits: Math.Max(0, monthlyFlow - availFlow)
+                UsedCredits: usedFlow
             );
         }
 
@@ -246,8 +252,9 @@ public static class AG2TelemetryNormalizer
                 }
             }
 
-            double remainingFraction = Math.Clamp(items.Min(m => m.RemainingFraction), 0.0, 1.0);
-            bool isExhausted = items.Any(m => m.IsExhausted) || remainingFraction <= 0.0;
+            var validFractions = items.Where(m => m.RemainingFraction.HasValue).Select(m => m.RemainingFraction!.Value).ToList();
+            double? remainingFraction = validFractions.Count > 0 ? Math.Clamp(validFractions.Min(), 0.0, 1.0) : null;
+            bool isExhausted = items.Any(m => m.IsExhausted) || (remainingFraction.HasValue && remainingFraction.Value <= 0.0);
             string? resetTime = SelectLatestResetTime(items.Select(m => m.ResetTime));
             string? modelOrTier = items.FirstOrDefault(m => !string.IsNullOrWhiteSpace(m.ModelOrTier))?.ModelOrTier?.Trim();
 

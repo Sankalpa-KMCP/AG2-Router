@@ -1,6 +1,6 @@
 <script lang="ts">
   import ProgressRing from './ProgressRing.svelte';
-  import { formatQuotaFraction, formatResetTime } from '../utils/helpers.js';
+  import { formatCreditPool, formatQuotaFraction, formatResetTime } from '../utils/helpers.js';
   import type { QuotaSnapshotDto } from '../api/types.js';
 
   interface Props {
@@ -120,46 +120,58 @@
 
     <!-- Segregated Credit Pools -->
     {#if promptCredits || flowCredits}
+      {@const prompt = formatCreditPool(promptCredits)}
+      {@const flow = formatCreditPool(flowCredits)}
       <div class="credits-section">
         <h3 class="credits-title">CREDIT POOLS (SEGREGATED)</h3>
         <div class="credits-grid">
-          {#if promptCredits}
+          {#if prompt.hasData}
             <div class="credit-card">
               <div class="credit-header">
                 <span class="credit-type">Prompt Credits</span>
                 <span class="credit-ratio">
-                  {Math.round((promptCredits.availableCredits / Math.max(1, promptCredits.monthlyCredits)) * 100)}% Available
+                  {prompt.ratioPercent !== null ? `${prompt.ratioPercent}% Available` : 'Available Pool'}
                 </span>
               </div>
               <div class="credit-values">
-                <strong>{promptCredits.availableCredits.toLocaleString()}</strong>
-                <span class="credit-total">/ {promptCredits.monthlyCredits.toLocaleString()} total</span>
+                <strong>{prompt.availableText}</strong>
+                {#if prompt.totalText}
+                  <span class="credit-total">{prompt.totalText}</span>
+                {:else}
+                  <span class="credit-total">available</span>
+                {/if}
               </div>
               <div class="credit-bar">
                 <div
                   class="credit-fill"
-                  style="width: {Math.min(100, Math.round((promptCredits.availableCredits / Math.max(1, promptCredits.monthlyCredits)) * 100))}%;"
+                  class:is-indeterminate={prompt.isIndeterminate}
+                  style="width: {prompt.ratioPercent !== null ? prompt.ratioPercent : 0}%;"
                 ></div>
               </div>
             </div>
           {/if}
 
-          {#if flowCredits}
+          {#if flow.hasData}
             <div class="credit-card">
               <div class="credit-header">
                 <span class="credit-type">Flow Credits</span>
                 <span class="credit-ratio">
-                  {Math.round((flowCredits.availableCredits / Math.max(1, flowCredits.monthlyCredits)) * 100)}% Available
+                  {flow.ratioPercent !== null ? `${flow.ratioPercent}% Available` : 'Available Pool'}
                 </span>
               </div>
               <div class="credit-values">
-                <strong>{flowCredits.availableCredits.toLocaleString()}</strong>
-                <span class="credit-total">/ {flowCredits.monthlyCredits.toLocaleString()} total</span>
+                <strong>{flow.availableText}</strong>
+                {#if flow.totalText}
+                  <span class="credit-total">{flow.totalText}</span>
+                {:else}
+                  <span class="credit-total">available</span>
+                {/if}
               </div>
               <div class="credit-bar">
                 <div
                   class="credit-fill flow-fill"
-                  style="width: {Math.min(100, Math.round((flowCredits.availableCredits / Math.max(1, flowCredits.monthlyCredits)) * 100))}%;"
+                  class:is-indeterminate={flow.isIndeterminate}
+                  style="width: {flow.ratioPercent !== null ? flow.ratioPercent : 0}%;"
                 ></div>
               </div>
             </div>
@@ -358,6 +370,11 @@
 
   .credit-fill.flow-fill {
     background-color: #8B5CF6;
+  }
+
+  .credit-fill.is-indeterminate {
+    opacity: 0.3;
+    background-color: var(--color-text-muted);
   }
 
   .empty-state {
