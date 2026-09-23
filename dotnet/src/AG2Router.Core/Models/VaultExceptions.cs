@@ -30,6 +30,7 @@ public class VaultException : Exception
 /// <summary>A vault write may have become durable, but its final state could not be proved.</summary>
 public sealed class VaultMutationUncertainException : VaultException
 {
+    public VaultMutationUncertainException(string message) : base(message) { }
     public VaultMutationUncertainException(string message, Exception innerException)
         : base(message, innerException) { }
 }

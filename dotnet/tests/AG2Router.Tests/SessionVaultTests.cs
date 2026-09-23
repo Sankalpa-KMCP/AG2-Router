@@ -328,6 +328,56 @@ public class SessionVaultTests : IDisposable
         Assert.Equal("synthetic-session"u8.ToArray(), await vault.GetSessionAsync("acc_uncertain"));
     }
 
+    [Fact]
+    public async Task NeverSettlingWriterReturnsUncertaintyAndBoundsLaterVaultAdmission()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writer = new DelayedWriter(entered, release);
+        var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider(), writer)
+        {
+            MutationTimeout = TimeSpan.FromMilliseconds(80),
+            AdmissionTimeout = TimeSpan.FromMilliseconds(80)
+        };
+        try
+        {
+            var first = vault.SaveSessionAsync("acc_first", "first"u8.ToArray());
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await Assert.ThrowsAsync<VaultMutationUncertainException>(
+                () => first.WaitAsync(TimeSpan.FromSeconds(2)));
+
+            var later = new SessionVault(_tempVaultDir, new FakeDpapiProvider());
+            await Assert.ThrowsAsync<VaultMutationUncertainException>(
+                () => later.SaveSessionAsync("acc_later", "later"u8.ToArray())
+                    .WaitAsync(TimeSpan.FromSeconds(1)));
+            Assert.Equal(1, writer.WriteCount);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        var gate = PathLockRegistry.Get(vault.GetVaultPath());
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        gate.Release();
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => vault.SaveSessionAsync("acc_after", "after"u8.ToArray()));
+        Assert.Equal(1, writer.WriteCount);
+    }
+
+    private sealed class DelayedWriter(TaskCompletionSource entered, TaskCompletionSource release) : IDurableFileWriter
+    {
+        private readonly DurableFileWriter _inner = new();
+        public int WriteCount { get; private set; }
+        public async Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            WriteCount++;
+            entered.TrySetResult();
+            await release.Task; // deliberately ignores cancellation
+            await _inner.WriteAtomicAsync(destinationPath, content, CancellationToken.None);
+        }
+    }
+
     private sealed class ReplaceThenFailOnceWriter : IDurableFileWriter
     {
         private readonly DurableFileWriter _inner = new();

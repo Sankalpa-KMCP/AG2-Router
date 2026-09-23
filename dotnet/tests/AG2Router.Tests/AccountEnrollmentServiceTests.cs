@@ -527,7 +527,7 @@ public class AccountEnrollmentServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task NonCompletingMetadataCommitReportsManualRecoveryAndReleasesOwnership()
+    public async Task NonCompletingMetadataCommitQuarantinesLaterLifecycleCalls()
     {
         const string email = "metadata-timeout@example.com";
         _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
@@ -541,9 +541,123 @@ public class AccountEnrollmentServiceTests : IDisposable
             () => service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(2)));
 
         Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
+        var second = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
+            service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.Contains("manual recovery", second.Message, StringComparison.OrdinalIgnoreCase);
         var gate = PathLockRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(1)));
-        gate.Release();
+        Assert.False(await gate.WaitAsync(TimeSpan.FromMilliseconds(30)));
+    }
+
+    [Fact]
+    public async Task LateMetadataCommitCannotOverlapNewEnrollmentAfterTimeout()
+    {
+        const string email = "late-metadata@example.com";
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email,
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var store = new FailUpdateAccountStore(_accountStore) { DelayedCommit = true };
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store,
+            TimeSpan.FromMilliseconds(70));
+
+        try
+        {
+            var first = service.EnrollCurrentAccountAsync();
+            await store.UpdateEntered.WaitAsync(TimeSpan.FromSeconds(2));
+            var error = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
+                first.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.Contains("manual recovery", error.Message, StringComparison.OrdinalIgnoreCase);
+            var pending = await _accountStore.GetAccountByEmailAsync(email);
+            Assert.NotNull(pending);
+
+            var later = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
+                service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(1)));
+            Assert.Contains("manual recovery", later.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False((await _accountStore.GetAccountAsync(pending.Id))?.HasVaultedSession);
+
+            store.ReleaseUpdate();
+            await store.UpdateFinished.WaitAsync(TimeSpan.FromSeconds(2));
+            var gate = PathLockRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
+            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+            gate.Release();
+            Assert.True((await _accountStore.GetAccountAsync(pending.Id))?.HasVaultedSession);
+        }
+        finally
+        {
+            store.ReleaseUpdate();
+        }
+    }
+
+    [Fact]
+    public async Task TimedOutReadCannotBeginNewMetadataMutationAfterOwnershipReleases()
+    {
+        const string email = "late-read@example.com";
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email,
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var store = new FailUpdateAccountStore(_accountStore) { DelayGetByEmail = true };
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store,
+            TimeSpan.FromMilliseconds(70));
+        try
+        {
+            var first = service.EnrollCurrentAccountAsync();
+            await store.ReadEntered.WaitAsync(TimeSpan.FromSeconds(2));
+            await Assert.ThrowsAsync<AccountEnrollmentException>(() => first.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.Equal(0, store.AddCount);
+            store.ReleaseRead();
+            var gate = PathLockRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
+            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+            gate.Release();
+            Assert.Equal(0, store.AddCount);
+            Assert.Null(await _accountStore.GetAccountByEmailAsync(email));
+        }
+        finally
+        {
+            store.ReleaseRead();
+        }
+    }
+
+    [Fact]
+    public async Task VaultTimeoutQuarantinePreventsLaterEnrollmentMetadataCreation()
+    {
+        const string email = "vault-quarantine@example.com";
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email,
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var vault = new SessionVault(_tempDir, _fakeDpapi, new DelayedFirstVaultWrite(entered, release))
+        {
+            MutationTimeout = TimeSpan.FromMilliseconds(70)
+        };
+        try
+        {
+            var first = vault.SaveSessionAsync("unrelated", "synthetic"u8.ToArray());
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await Assert.ThrowsAsync<VaultMutationUncertainException>(
+                () => first.WaitAsync(TimeSpan.FromSeconds(2)));
+
+            var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, vault, _accountStore,
+                TimeSpan.FromMilliseconds(200));
+            await Assert.ThrowsAsync<AccountEnrollmentException>(
+                () => service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(1)));
+            Assert.Null(await _accountStore.GetAccountByEmailAsync(email));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+    }
+
+    private sealed class DelayedFirstVaultWrite(TaskCompletionSource entered, TaskCompletionSource release)
+        : IDurableFileWriter
+    {
+        private readonly DurableFileWriter _inner = new();
+        public async Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            entered.TrySetResult();
+            await release.Task;
+            await _inner.WriteAtomicAsync(destinationPath, content, CancellationToken.None);
+        }
     }
 
     [Fact]
@@ -716,6 +830,19 @@ public class AccountEnrollmentServiceTests : IDisposable
         public bool FailReadback { get; init; }
         public bool ReturnFalseOnRemoval { get; init; }
         public bool NeverCompleteUpdate { get; init; }
+        public bool DelayedCommit { get; init; }
+        public bool DelayGetByEmail { get; init; }
+        public int AddCount { get; private set; }
+        private readonly TaskCompletionSource _readEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task ReadEntered => _readEntered.Task;
+        public void ReleaseRead() => _releaseRead.TrySetResult();
+        private readonly TaskCompletionSource _updateEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseUpdate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _updateFinished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task UpdateEntered => _updateEntered.Task;
+        public Task UpdateFinished => _updateFinished.Task;
+        public void ReleaseUpdate() => _releaseUpdate.TrySetResult();
         public Task<bool> RestoreAccountIfUnchangedAsync(AccountMetadata expectedCurrent, AccountMetadata previous, CancellationToken cancellationToken = default) =>
             inner.RestoreAccountIfUnchangedAsync(expectedCurrent, previous, cancellationToken);
         public Task<IReadOnlyList<AccountMetadata>> ListAccountsAsync(CancellationToken cancellationToken = default) =>
@@ -723,14 +850,31 @@ public class AccountEnrollmentServiceTests : IDisposable
         public Task<AccountMetadata?> GetAccountAsync(string id, CancellationToken cancellationToken = default) =>
             FailReadback ? Task.FromException<AccountMetadata?>(new IOException("Injected readback failure.")) :
                 inner.GetAccountAsync(id, cancellationToken);
-        public Task<AccountMetadata?> GetAccountByEmailAsync(string email, CancellationToken cancellationToken = default) =>
-            inner.GetAccountByEmailAsync(email, cancellationToken);
-        public Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default) =>
-            inner.AddAccountAsync(input, cancellationToken);
+        public async Task<AccountMetadata?> GetAccountByEmailAsync(string email, CancellationToken cancellationToken = default)
+        {
+            if (DelayGetByEmail)
+            {
+                _readEntered.TrySetResult();
+                await _releaseRead.Task;
+            }
+            return await inner.GetAccountByEmailAsync(email, cancellationToken);
+        }
+        public Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default)
+        {
+            AddCount++;
+            return inner.AddAccountAsync(input, cancellationToken);
+        }
         public Task<AccountMetadata?> UpdateAccountAsync(string id, UpdateAccountInput updates, CancellationToken cancellationToken = default) =>
-            NeverCompleteUpdate
+            DelayedCommit ? CommitLateAsync(id, updates) : NeverCompleteUpdate
                 ? new TaskCompletionSource<AccountMetadata?>(TaskCreationOptions.RunContinuationsAsynchronously).Task
                 : throw new IOException("Injected metadata commit failure.");
+        private async Task<AccountMetadata?> CommitLateAsync(string id, UpdateAccountInput updates)
+        {
+            _updateEntered.TrySetResult();
+            await _releaseUpdate.Task;
+            try { return await inner.UpdateAccountAsync(id, updates, CancellationToken.None); }
+            finally { _updateFinished.TrySetResult(); }
+        }
         public Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default) =>
             inner.RemoveAccountAsync(id, cancellationToken);
         public Task<bool> RemoveAccountIfUnchangedAsync(
@@ -962,22 +1106,62 @@ public sealed class AccountRemovalServiceTests : IDisposable
             Assert.Contains("manual recovery", error.Message, StringComparison.OrdinalIgnoreCase);
             await writer.RestoreStarted.WaitAsync(TimeSpan.FromSeconds(2));
 
-            // The late writer ignores cancellation. A newer vault mutation must still
-            // wait behind its ownership and win after the stale restoration finishes.
-            var newer = vault.SaveSessionAsync(account.Id, [9, 8, 7]);
-            Assert.False(newer.IsCompleted);
+            // The late writer ignores cancellation. No newer vault mutation may
+            // be admitted while its durable outcome is unresolved.
+            var unavailable = await Assert.ThrowsAsync<VaultMutationUncertainException>(() =>
+                vault.SaveSessionAsync(account.Id, [9, 8, 7]).WaitAsync(TimeSpan.FromSeconds(1)));
+            Assert.Contains("manual recovery", unavailable.Message, StringComparison.OrdinalIgnoreCase);
             writer.Release();
             await writer.RestoreFinished.WaitAsync(TimeSpan.FromSeconds(2));
-            await newer.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.Equal([9, 8, 7], await vault.GetSessionAsync(account.Id));
+            var stillUnavailable = await Assert.ThrowsAsync<VaultMutationUncertainException>(() =>
+                vault.SaveSessionAsync(account.Id, [9, 8, 7]).WaitAsync(TimeSpan.FromSeconds(1)));
+            Assert.Contains("manual recovery", stillUnavailable.Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
             writer.Release();
         }
-        var gate = PathLockRegistry.Get(vault.GetVaultPath() + ".switch");
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(1)));
-        gate.Release();
+        var vaultGate = PathLockRegistry.Get(vault.GetVaultPath());
+        Assert.True(await vaultGate.WaitAsync(TimeSpan.FromSeconds(2)));
+        vaultGate.Release();
+    }
+
+    [Fact]
+    public async Task LateMetadataRemovalCannotRaceCompensationOrLaterLifecycleOperation()
+    {
+        var underlying = new InMemoryAccountStore();
+        var account = await underlying.AddAccountAsync(new CreateAccountInput("late-removal@example.com"));
+        var vault = new SessionVault(Path.Combine(_directory, "late-metadata-removal"),
+            new FakeDpapiProvider());
+        await vault.SaveSessionAsync(account.Id, [1, 2, 3]);
+        var store = new HangingRemovalStore(underlying) { DelayedRemoval = true };
+        var service = new AccountRemovalService(store, vault, TimeSpan.FromMilliseconds(70));
+
+        try
+        {
+            var first = service.RemoveAsync(account.Id);
+            await store.RemovalEntered.WaitAsync(TimeSpan.FromSeconds(2));
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                first.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.Contains("manual recovery", error.Message, StringComparison.OrdinalIgnoreCase);
+
+            var later = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                service.RemoveAsync(account.Id).WaitAsync(TimeSpan.FromSeconds(1)));
+            Assert.Contains("manual recovery", later.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.NotNull(await underlying.GetAccountAsync(account.Id));
+            store.ReleaseRemoval();
+            await store.RemovalFinished.WaitAsync(TimeSpan.FromSeconds(2));
+            var gate = PathLockRegistry.Get(vault.GetVaultPath() + ".switch");
+            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+            gate.Release();
+            Assert.Null(await underlying.GetAccountAsync(account.Id));
+            // No compensation ran concurrently with the original metadata commit.
+            Assert.DoesNotContain(account.Id, await File.ReadAllTextAsync(vault.GetVaultPath()));
+        }
+        finally
+        {
+            store.ReleaseRemoval();
+        }
     }
 
     public void Dispose()
@@ -1056,12 +1240,27 @@ public sealed class AccountRemovalServiceTests : IDisposable
     {
         private int _readCount;
         public bool HangReadback { get; init; }
+        public bool DelayedRemoval { get; init; }
+        private readonly TaskCompletionSource _removalEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseRemoval = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _removalFinished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task RemovalEntered => _removalEntered.Task;
+        public Task RemovalFinished => _removalFinished.Task;
+        public void ReleaseRemoval() => _releaseRemoval.TrySetResult();
         public Task<AccountMetadata?> GetAccountAsync(string id, CancellationToken cancellationToken = default) =>
             HangReadback && Interlocked.Increment(ref _readCount) >= 2
                 ? new TaskCompletionSource<AccountMetadata?>(TaskCreationOptions.RunContinuationsAsynchronously).Task
                 : inner.GetAccountAsync(id, cancellationToken);
         public Task<bool> RemoveAccountIfUnchangedAsync(AccountMetadata expected, CancellationToken cancellationToken = default) =>
-            Task.FromException<bool>(new IOException("synthetic metadata removal failure"));
+            DelayedRemoval ? RemoveLateAsync(expected) :
+                Task.FromException<bool>(new IOException("synthetic metadata removal failure"));
+        private async Task<bool> RemoveLateAsync(AccountMetadata expected)
+        {
+            _removalEntered.TrySetResult();
+            await _releaseRemoval.Task;
+            try { return await inner.RemoveAccountIfUnchangedAsync(expected, CancellationToken.None); }
+            finally { _removalFinished.TrySetResult(); }
+        }
         public Task<IReadOnlyList<AccountMetadata>> ListAccountsAsync(CancellationToken cancellationToken = default) => inner.ListAccountsAsync(cancellationToken);
         public Task<AccountMetadata?> GetAccountByEmailAsync(string email, CancellationToken cancellationToken = default) => inner.GetAccountByEmailAsync(email, cancellationToken);
         public Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default) => inner.AddAccountAsync(input, cancellationToken);

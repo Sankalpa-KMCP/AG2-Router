@@ -35,7 +35,10 @@ public class SessionVault : ISessionVault
     private readonly string _vaultFilePath;
     private readonly IDpapiProvider _dpapiProvider;
     private readonly SemaphoreSlim _pathLock;
+    private readonly RecoveryQuarantine _recoveryQuarantine;
     private readonly IDurableFileWriter _fileWriter;
+    internal TimeSpan AdmissionTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    internal TimeSpan MutationTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
     public SessionVault(string? vaultDir = null, IDpapiProvider? dpapiProvider = null)
         : this(vaultDir, dpapiProvider, new DurableFileWriter())
@@ -71,7 +74,44 @@ public class SessionVault : ISessionVault
         _vaultFilePath = Path.Combine(_vaultDir, "sessions.dat");
         _dpapiProvider = dpapiProvider ?? throw new ArgumentNullException(nameof(dpapiProvider));
         _pathLock = PathLockRegistry.Get(_vaultFilePath);
+        _recoveryQuarantine = RecoveryQuarantineRegistry.Get(_vaultFilePath);
         _fileWriter = fileWriter ?? throw new ArgumentNullException(nameof(fileWriter));
+    }
+
+    internal void QuarantineUnresolvedMutation() => _recoveryQuarantine.Mark();
+    internal bool IsQuarantined => _recoveryQuarantine.IsMarked;
+
+    private async Task<T> ObserveMutationAsync<T>(Task<T> operation)
+    {
+        try
+        {
+            return await operation.WaitAsync(MutationTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            if (operation.IsCompleted) return await operation.ConfigureAwait(false);
+            _recoveryQuarantine.Mark();
+            _ = operation.ContinueWith(static completed => _ = completed.Exception,
+                CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+            throw new VaultMutationUncertainException(
+                "Vault mutation did not settle within its deadline; manual recovery is required.");
+        }
+    }
+
+    private async Task EnterPathAsync(CancellationToken cancellationToken)
+    {
+        if (_recoveryQuarantine.IsMarked)
+            throw new VaultMutationUncertainException(
+                "Vault mutation is unresolved; manual recovery is required before vault access.");
+        if (!await _pathLock.WaitAsync(AdmissionTimeout, cancellationToken).ConfigureAwait(false))
+            throw new VaultMutationUncertainException(
+                "Vault ownership did not become available within its deadline; manual recovery is required.");
+        if (_recoveryQuarantine.IsMarked)
+        {
+            _pathLock.Release();
+            throw new VaultMutationUncertainException(
+                "Vault mutation is unresolved; manual recovery is required before vault access.");
+        }
     }
 
     /// <summary>
@@ -98,7 +138,14 @@ public class SessionVault : ISessionVault
             .ConfigureAwait(false);
     }
 
-    internal async Task<VaultMutationReceipt> SaveSessionWithReceiptAsync(
+    internal Task<VaultMutationReceipt> SaveSessionWithReceiptAsync(
+        string accountId,
+        byte[] sessionBlob,
+        string target = VaultConstants.DefaultAg2WinCredTarget,
+        CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(SaveSessionCoreAsync(accountId, sessionBlob, target, cancellationToken));
+
+    private async Task<VaultMutationReceipt> SaveSessionCoreAsync(
         string accountId,
         byte[] sessionBlob,
         string target = VaultConstants.DefaultAg2WinCredTarget,
@@ -139,7 +186,7 @@ public class SessionVault : ISessionVault
 
         string encryptedPayloadBase64 = Convert.ToBase64String(encryptedBytes);
 
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
@@ -196,13 +243,18 @@ public class SessionVault : ISessionVault
         }
     }
 
-    internal async Task<bool> RestoreIfCurrentAsync(
+    internal Task<bool> RestoreIfCurrentAsync(
+        VaultMutationReceipt receipt,
+        CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(RestoreIfCurrentCoreAsync(receipt, cancellationToken));
+
+    private async Task<bool> RestoreIfCurrentCoreAsync(
         VaultMutationReceipt receipt,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(receipt);
 
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
@@ -245,7 +297,7 @@ public class SessionVault : ISessionVault
         }
 
         VaultAccountRecord? record;
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
@@ -328,7 +380,7 @@ public class SessionVault : ISessionVault
             return false;
         }
 
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
@@ -346,14 +398,17 @@ public class SessionVault : ISessionVault
     /// <summary>
     /// Remove a session from the vault.
     /// </summary>
-    public async Task<bool> RemoveSessionAsync(string accountId, CancellationToken cancellationToken = default)
+    public Task<bool> RemoveSessionAsync(string accountId, CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(RemoveSessionCoreAsync(accountId, cancellationToken));
+
+    private async Task<bool> RemoveSessionCoreAsync(string accountId, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(accountId))
         {
             return false;
         }
 
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
@@ -374,10 +429,14 @@ public class SessionVault : ISessionVault
         }
     }
 
-    internal async Task<VaultRemovalReceipt?> RemoveSessionWithReceiptAsync(
+    internal Task<VaultRemovalReceipt?> RemoveSessionWithReceiptAsync(
+        string accountId, CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(RemoveSessionWithReceiptCoreAsync(accountId, cancellationToken));
+
+    private async Task<VaultRemovalReceipt?> RemoveSessionWithReceiptCoreAsync(
         string accountId, CancellationToken cancellationToken = default)
     {
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease.AcquireAsync(_vaultFilePath, cancellationToken)
@@ -421,10 +480,14 @@ public class SessionVault : ISessionVault
         }
     }
 
-    internal async Task<bool> RestoreRemovedIfAbsentAsync(
+    internal Task<bool> RestoreRemovedIfAbsentAsync(
+        VaultRemovalReceipt receipt, CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(RestoreRemovedIfAbsentCoreAsync(receipt, cancellationToken));
+
+    private async Task<bool> RestoreRemovedIfAbsentCoreAsync(
         VaultRemovalReceipt receipt, CancellationToken cancellationToken = default)
     {
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease.AcquireAsync(_vaultFilePath, cancellationToken)
@@ -446,7 +509,7 @@ public class SessionVault : ISessionVault
     /// </summary>
     public async Task<IReadOnlyList<string>> ListStoredAccountIdsAsync(CancellationToken cancellationToken = default)
     {
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
