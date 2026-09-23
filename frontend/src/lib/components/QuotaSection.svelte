@@ -28,7 +28,7 @@
       <h2 class="quota-title">Quota Overview</h2>
       <p class="quota-subtitle">
         {hasCanonical
-          ? 'Canonical model pools • Reasoning variants deduplicated'
+          ? 'Distinct model capacity rows'
           : 'Live model quota pools'}
       </p>
     </div>

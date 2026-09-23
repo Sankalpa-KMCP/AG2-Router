@@ -69,7 +69,7 @@ Uninstall may remove only owned program binaries, shortcuts, uninstall registrat
 
 Ownership checks are part of the safety contract. Path or registry cleanup must fail/skip safely when ownership cannot be established.
 
-Both PowerShell and Inno uninstall entry points coordinate with the session mutex `Local\AG2Router_Session_Mutex` and fail closed if stopped state cannot be proven. Inno's helper invocation is nonblocking and followed by bounded mutex polling; a query failure or held mutex prevents destructive removal. A missing executable by itself is not proof that the application stopped.
+Both PowerShell and Inno uninstall entry points coordinate with the session mutex `Local\AG2Router_Session_Mutex` and fail closed if stopped state cannot be proven. PowerShell requires a successful process enumeration both before and after its bounded exit request; query failure is unknown, not stopped. Inno's helper invocation is nonblocking and followed by bounded mutex polling; a query failure or held mutex prevents destructive removal. A missing executable by itself is not proof that the application stopped.
 
 Evidence: installer/AG2Router.iss, scripts/install.ps1, scripts/uninstall.ps1, ReleasePackagingTests, and UpgradePreservationTests.
 

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.RegularExpressions;
 using AG2Router.Windows.Lifecycle;
 using Xunit;
@@ -525,6 +526,71 @@ public class ReleasePackagingTests
         Assert.Contains("ewNoWait", uninstall);
         Assert.Contains("if not WaitForSessionMutexRelease(5000) then", uninstall);
         Assert.DoesNotContain("ewWaitUntilTerminated", uninstall);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PowerShellUninstall_ProcessQueryFailureAbortsBeforeDestructiveContinuation(bool failAfterExit)
+    {
+        string script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "scripts", "uninstall.ps1"));
+        string stopFunctions = script.Split("# 2. Graceful Process Shutdown via Named Mutex and Process Check")[1]
+            .Split("Assert-AG2RouterStopped -InstalledExe $ExePath")[0];
+        string scenario = failAfterExit ? "post" : "pre";
+        string command = $$"""
+            $ErrorActionPreference = 'Stop'
+            $script:destructiveCalls = 0
+            function Remove-Item { $script:destructiveCalls++ }
+            {{stopFunctions}}
+            $script:queries = 0
+            $script:exitCalls = 0
+            function Get-Process {
+                param([string]$ErrorAction)
+                $script:queries++
+                if ('{{scenario}}' -eq 'post' -and $script:queries -eq 1) {
+                    return [pscustomobject]@{ ProcessName = 'AG2Router' }
+                }
+                throw 'Synthetic process query failure'
+            }
+            function Get-AG2RouterMutexState { return 'STOPPED' }
+            function Invoke-AG2RouterExitRequest {
+                param([string]$InstalledExe)
+                $script:exitCalls++
+            }
+            $caught = $false
+            try {
+                Assert-AG2RouterStopped -InstalledExe 'X:\synthetic\AG2Router.exe'
+                Remove-Item 'X:\synthetic\programs'
+            } catch {
+                $caught = $true
+                if ($_.Exception.Message -notmatch 'process state.*(could not be verified|became unknown)') { exit 2 }
+            }
+            if (-not $caught -or $script:destructiveCalls -ne 0) { exit 3 }
+            if ('{{scenario}}' -eq 'post') {
+                if ($script:queries -ne 2 -or $script:exitCalls -ne 1) { exit 4 }
+            } elseif ($script:queries -ne 1 -or $script:exitCalls -ne 0) { exit 5 }
+            exit 0
+            """;
+
+        var start = new ProcessStartInfo("powershell.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add("-NoProfile");
+        start.ArgumentList.Add("-NonInteractive");
+        start.ArgumentList.Add("-EncodedCommand");
+        start.ArgumentList.Add(Convert.ToBase64String(Encoding.Unicode.GetBytes(command)));
+        using var child = Process.Start(start) ?? throw new InvalidOperationException("PowerShell test process did not start.");
+        if (!child.WaitForExit(10000))
+        {
+            child.Kill(entireProcessTree: true);
+            throw new TimeoutException("Synthetic uninstall safety check did not complete.");
+        }
+        Assert.True(child.ExitCode == 0,
+            $"Synthetic {scenario} query failure exited {child.ExitCode}: {child.StandardOutput.ReadToEnd()} {child.StandardError.ReadToEnd()}");
     }
 
     #endregion

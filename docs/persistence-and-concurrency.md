@@ -83,7 +83,7 @@ CURRENT IMPLEMENTATION in NativeAccountSwitchCoordinator:
 5. On post-mutation failure, quiesce the owned replacement generation, restore the credential only if current state still matches the applied credential, restart, and verify the source identity.
 6. Return explicit rollback or manual-recovery results when restoration cannot be proven.
 
-Manual and automatic requests share switch ownership. Automatic plans revalidate both router epoch and persisted active identity under that ownership before mutation; manual completion updates the router cache. Router quota observations are attributed only after rechecking epoch and active identity inside that ownership boundary. Successful automatic publication reacquires switch ownership and reads authoritative active identity before updating router state under its state lock. This covers the interval after a manual coordinator commits but before its completion callback. Newer manual success and manual-recovery terminal states cannot be overwritten by an earlier automatic result.
+Manual and automatic requests share switch ownership. Automatic plans revalidate both router epoch and persisted active identity under that ownership before mutation; manual completion reacquires that ownership and publishes success only if its target is still the authoritative active identity. Router quota observations are attributed only after rechecking epoch and active identity inside that ownership boundary. Successful automatic publication likewise reacquires switch ownership before updating router state under its state lock. A delayed automatic rollback failure remains a terminal manual-recovery outcome even after a newer manual success; the operator must explicitly clear it. Newer manual success and manual-recovery terminal states cannot be overwritten by an earlier automatic success.
 
 The order is security- and integrity-sensitive. See NativeAccountSwitchCoordinatorTests and WindowsAG2ProcessLifecycleTests before changing it.
 
@@ -117,7 +117,7 @@ This is transaction/control-flow behavior, not evidence of file corruption. HTTP
 
 DashboardLifecycleManager owns lazy window creation and reuse. WebView2EnvironmentCoordinator serializes environment creation, keeps closing environments from being handed to new windows, waits for browser-process exit when possible, and retries known lock contention with backoff.
 
-MainWindow funnels navigation, initialization, and process failures through a shared bounded recovery budget. Environment creation and control initialization each have wall-clock deadlines even when a callee ignores cancellation. Automatic reload/recreation stops after exhaustion and exposes a stable manual retry overlay; successful navigation resets the budget.
+MainWindow funnels navigation, initialization, and process failures through a shared bounded recovery budget. Environment creation and control initialization each have wall-clock deadlines even when a callee ignores cancellation. Event handlers are detached when a WebView is replaced, and generation checks prevent callbacks or delayed recovery work from an old control from changing the current recovery state. Automatic reload/recreation stops after exhaustion and exposes a stable manual retry overlay; successful current-generation navigation resets the budget.
 
 Tests cover concurrent creation, reopen during exit, timeout, lock contention, and late exit events. They do not prove behavior for every installed WebView2 runtime version.
 

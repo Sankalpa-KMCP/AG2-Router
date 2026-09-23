@@ -535,4 +535,112 @@ public sealed class WebViewRecoveryPolicyTests
         policy.ResetForManualRetry();
         Assert.Equal(WebViewRecoveryAction.Reload, policy.RecordFailure(WebViewFailureKind.Navigation));
     }
+
+    [Fact]
+    public void StaleSuccessCannotClearNewGenerationFailureExhaustion()
+    {
+        var policy = new WebViewRecoveryPolicy(1);
+        long oldGeneration = policy.CurrentGeneration;
+        long currentGeneration = policy.AdvanceGeneration();
+        Assert.Equal(WebViewRecoveryAction.Recreate,
+            policy.RecordFailureIfCurrent(currentGeneration, WebViewFailureKind.Process));
+        Assert.False(policy.RecordSuccessIfCurrent(oldGeneration));
+        Assert.Equal(WebViewRecoveryAction.ManualRetry,
+            policy.RecordFailureIfCurrent(currentGeneration, WebViewFailureKind.Initialization));
+    }
+
+    [Fact]
+    public void StaleFailureCannotConsumeNewGenerationRecoveryBudget()
+    {
+        var policy = new WebViewRecoveryPolicy(1);
+        long oldGeneration = policy.CurrentGeneration;
+        long currentGeneration = policy.AdvanceGeneration();
+        Assert.Null(policy.RecordFailureIfCurrent(oldGeneration, WebViewFailureKind.Process));
+        Assert.True(policy.RecordSuccessIfCurrent(currentGeneration));
+        Assert.Equal(WebViewRecoveryAction.Reload,
+            policy.RecordFailureIfCurrent(currentGeneration, WebViewFailureKind.Navigation));
+    }
+}
+
+public sealed class WebViewRecoveryEventBindingTests
+{
+    [Fact]
+    public void QueuedOldNavigationSuccessCannotHideCurrentFailureOverlayOrResetBudget()
+    {
+        var policy = new WebViewRecoveryPolicy(1);
+        var oldSource = new FakeWebViewRecoveryEventSource();
+        bool overlayVisible = true;
+        long oldGeneration = policy.CurrentGeneration;
+        using var oldBinding = new WebViewRecoveryEventBinding(oldSource, policy, oldGeneration,
+            () => true, () => overlayVisible = false, (_, _, _) => Task.CompletedTask);
+        var queuedOldSuccess = oldSource.CaptureNavigationCallback();
+
+        long currentGeneration = policy.AdvanceGeneration();
+        oldBinding.Dispose();
+        var currentSource = new FakeWebViewRecoveryEventSource();
+        using var currentBinding = new WebViewRecoveryEventBinding(currentSource, policy, currentGeneration,
+            () => true, () => overlayVisible = false, (_, _, _) => Task.CompletedTask);
+        Assert.Equal(WebViewRecoveryAction.Recreate,
+            policy.RecordFailureIfCurrent(currentGeneration, WebViewFailureKind.Process));
+
+        // A callback already queued by the old control can run after detachment.
+        queuedOldSuccess(oldSource, new WebViewNavigationOutcomeEventArgs(true, "Success"));
+        Assert.True(overlayVisible);
+        Assert.Equal(WebViewRecoveryAction.ManualRetry,
+            policy.RecordFailureIfCurrent(currentGeneration, WebViewFailureKind.Initialization));
+
+        currentSource.RaiseNavigationSuccess();
+        Assert.False(overlayVisible);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QueuedOldFailureCannotScheduleRecoveryAgainstHealthyControl(bool processFailure)
+    {
+        var policy = new WebViewRecoveryPolicy(1);
+        var oldSource = new FakeWebViewRecoveryEventSource();
+        int recoveries = 0;
+        long oldGeneration = policy.CurrentGeneration;
+        using var oldBinding = new WebViewRecoveryEventBinding(oldSource, policy, oldGeneration,
+            () => true, () => { }, (_, _, _) => { recoveries++; return Task.CompletedTask; });
+        var queuedNavigation = oldSource.CaptureNavigationCallback();
+        var queuedProcess = oldSource.CaptureProcessCallback();
+
+        long currentGeneration = policy.AdvanceGeneration();
+        oldBinding.Dispose();
+        var currentSource = new FakeWebViewRecoveryEventSource();
+        using var currentBinding = new WebViewRecoveryEventBinding(currentSource, policy, currentGeneration,
+            () => true, () => { }, (_, _, _) => { recoveries++; return Task.CompletedTask; });
+        currentSource.RaiseNavigationSuccess();
+
+        if (processFailure)
+            queuedProcess(oldSource, new WebViewProcessFailureEventArgs("Old process exited"));
+        else
+            queuedNavigation(oldSource, new WebViewNavigationOutcomeEventArgs(false, "Old navigation failed"));
+        Assert.Equal(0, recoveries);
+        Assert.Equal(WebViewRecoveryAction.Reload,
+            policy.RecordFailureIfCurrent(currentGeneration, WebViewFailureKind.Navigation));
+
+        currentSource.RaiseProcessFailure();
+        Assert.Equal(1, recoveries);
+    }
+
+    private sealed class FakeWebViewRecoveryEventSource : IWebViewRecoveryEventSource
+    {
+        public event EventHandler<WebViewNavigationOutcomeEventArgs>? NavigationCompleted;
+        public event EventHandler<WebViewProcessFailureEventArgs>? ProcessFailed;
+
+        public EventHandler<WebViewNavigationOutcomeEventArgs> CaptureNavigationCallback() =>
+            NavigationCompleted ?? throw new InvalidOperationException("No navigation handler attached.");
+
+        public EventHandler<WebViewProcessFailureEventArgs> CaptureProcessCallback() =>
+            ProcessFailed ?? throw new InvalidOperationException("No process handler attached.");
+
+        public void RaiseNavigationSuccess() =>
+            NavigationCompleted?.Invoke(this, new WebViewNavigationOutcomeEventArgs(true, "Success"));
+
+        public void RaiseProcessFailure() =>
+            ProcessFailed?.Invoke(this, new WebViewProcessFailureEventArgs("Current process failed"));
+    }
 }
