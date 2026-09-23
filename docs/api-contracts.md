@@ -12,6 +12,7 @@ Source and tests remain authoritative. The intended contract below is separated 
 - API responses are not cacheable. Common response headers include X-Content-Type-Options: nosniff, X-Frame-Options: DENY, and Cache-Control: no-store.
 - Error bodies generally use { "error": "safe message" }. Callers must also use the HTTP status; error text is not a stable machine code.
 - DTO additions may be tolerated by JavaScript, but renames, type changes, nullability changes, and enum/result-code changes are wire-contract changes.
+- Non-finite quota fractions are emitted as null (unknown) at the status boundary, never as invalid JSON or an endpoint error; observed zero remains zero.
 
 Trust checks and their limits are defined in [security-and-trust-model.md](security-and-trust-model.md).
 
@@ -24,12 +25,13 @@ Trust checks and their limits are defined in [security-and-trust-model.md](secur
 | POST /api/accounts | CreateAccountInput | 201 with { account } | Metadata registration; does not itself capture a live session |
 | POST /api/accounts/enroll-current | optional EnrollmentOptions | { success, account, isNew, message } | Enrolls observed active identity and credential |
 | PATCH /api/accounts/{id} | { alias: string or null } | { success, account } | Whitespace/null clears alias under current storage normalization |
-| DELETE /api/accounts/{id} | none | { success, removedId, vaultRecordDeleted } | Removes metadata, then attempts vault removal |
-| GET /api/switching/status | none | { status } and X-AG2-Switch-Token header | Token is required by explicit switch execution |
-| POST /api/accounts/{id}/switch-plan | none | intended { plan } | CURRENT IMPLEMENTATION always returns 501 |
+| DELETE /api/accounts/{id} | none | { success, removedId, vaultRecordDeleted } | Shared switch ownership; vault-first removal with compensation on metadata failure |
+| GET /api/switching/status | none | { status } | Does not return the switch-intent token |
+| POST /api/switching/intent | X-AG2-Intent-Request: 1 | { ready: true } and X-AG2-Switch-Token header | Same-origin browser bootstrap; foreign Origin/cross-site requests rejected |
+| POST /api/accounts/{id}/switch-plan | none | 501 | Unsupported legacy endpoint; no dashboard Plan Switch workflow |
 | POST /api/accounts/{id}/switch | { confirm: true } plus switch token header | NativeSwitchResult | Status depends on stable string result code |
-| GET /api/config | none | { config: RouterConfigDto } | Current process-memory configuration |
-| POST /api/config | complete RouterConfigDto | { config } | Replaces current router config; not durable across restart |
+| GET /api/config | none | { config: RouterConfigDto } | Persisted configuration loaded at startup |
+| POST /api/config | complete RouterConfigDto | { config } | Durable write precedes runtime update; failure is not success |
 | GET /api/router/status | none | { router: RouterStatusDto } | Detailed router state |
 | POST /api/router/reset-recovery | none | { success, router } | Explicitly clears manual-recovery state when present |
 | GET /api/settings/autostart | none | { enabled, supported } | Native registry-backed capability when configured |
@@ -48,16 +50,12 @@ The following C# records define the backend serialization surface:
 
 Account objects must not expose credential blobs, DPAPI ciphertext, WinCred payloads, RPC tokens, or raw process command lines.
 
-CURRENT IMPLEMENTATION account-field drift: backend AccountMetadata serializes lastActiveAt, while frontend AccountMetadata declares lastUsedAt. Neither field is currently consumed by the account-card/table UI, so this is a wire/type contract mismatch but not evidence of a rendered dashboard failure.
+AccountMetadata uses lastActiveAt on both backend wire and frontend type. Canonical quota rows expose canonicalKey and displayLabel aliases alongside key and label; frontend consumption accepts those wire fields. NativeSwitchResult.code is a string.
 
 ## Mutation semantics
 
-CURRENT IMPLEMENTATION:
-
-- Mutation handlers that call IsAllowedMutationOrigin reject a supplied Origin unless its scheme is HTTP, its host is allowed loopback, and its port matches the server port.
-- Some account mutation handlers also reject Sec-Fetch-Site: cross-site.
-- A missing Origin is accepted by IsAllowedMutationOrigin.
-- Explicit switching additionally requires the per-process X-AG2-Switch-Token obtained from GET /api/switching/status and a body with confirm set to true.
+- API browser requests reject foreign Origin and Sec-Fetch-Site: cross-site. A missing Origin remains accepted for same-user native clients.
+- Explicit switching requires the per-process X-AG2-Switch-Token obtained from POST /api/switching/intent with X-AG2-Intent-Request: 1, plus a body with confirm set to true.
 - Switch token comparison is fixed-time, and returned dependency messages are redacted.
 
 Do not describe loopback binding or Origin checks as user authentication. See [security-and-trust-model.md](security-and-trust-model.md).
@@ -72,25 +70,16 @@ Common meanings in current handlers:
 - 408: the CANCELLED switch result, including cancellation before process mutation, is mapped to request timeout.
 - 409: switch conflict such as busy, already active, missing vaulted target, unsafe process, or switch already in progress.
 - 500: failed switch/rollback categories not mapped more specifically.
-- 501: required service is absent or the switch planner route is not implemented.
+- 501: required service is absent or the unsupported legacy switch planner route is called.
 - 503: switch telemetry unavailable.
 
 Native switch result codes are strings declared by SwitchResultCodes. HTTP status and result code serve different purposes and should both be tested.
 
-After process transition begins, cancellation follows the coordinator rollback path rather than necessarily returning CANCELLED. In particular, an explicit cancellation check occurs after target identity verification and before metadata finalization; a late client abort can therefore produce SWITCH_FAILED_ROLLED_BACK and its current 500 mapping. Transaction detail belongs in [persistence-and-concurrency.md](persistence-and-concurrency.md).
+After process transition begins, caller cancellation is detached; internally bounded forward completion and rollback determine the result. Transaction detail belongs in [persistence-and-concurrency.md](persistence-and-concurrency.md).
 
-## Verified source drift
+## Remaining contract limitation
 
-These are CURRENT IMPLEMENTATION discrepancies, not intended alternatives:
-
-1. CanonicalModelQuotaDto serializes key, label, modelOrTier, remainingFraction, resetTime, isExhausted, and modes. The frontend CanonicalModelDto instead declares canonicalKey, displayLabel, timeUntilReset, and isRollingWindow.
-2. Backend RouterConfigDto includes autoSwitchEnabled; the frontend RouterConfigDto declaration omits it even though saveConfig sends it.
-3. NativeSwitchResult.Code is a string; frontend SwitchStatusDto declares lastResult.code as number.
-4. The frontend expects switch-plan success, while the server route always returns 501.
-5. The frontend executeSwitch return type exposes only a partial result and declares an optional numeric code, while the server returns the full NativeSwitchResult with a string code.
-6. Backend AccountMetadata exposes lastActiveAt, while the frontend declares lastUsedAt. Current account UI components consume neither field.
-
-Until these are reconciled and contract-tested, backend DTOs plus actual serialization define server output, while frontend declarations describe only current compile-time assumptions. See [known-limitations.md](known-limitations.md).
+There is no generated/shared schema or browser end-to-end contract gate. Backend DTO serialization and server tests define the wire; frontend types are maintained alongside them. See [known-limitations.md](known-limitations.md).
 
 ## Evidence and enforcement
 

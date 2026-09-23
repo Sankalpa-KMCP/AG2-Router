@@ -25,20 +25,18 @@ The application does not claim to defend secrets from a fully compromised same-u
 
 ## Loopback and WebView2 boundary
 
-CURRENT IMPLEMENTATION:
-
 - Kestrel listens on IPAddress.Loopback and rejects non-loopback RemoteIpAddress values.
 - Host is restricted to 127.0.0.1 or localhost.
-- Mutation endpoints generally validate a supplied Origin against HTTP, allowed host, and the actual bound port.
-- Several metadata mutations reject an explicit cross-site Sec-Fetch-Site value.
-- Explicit switching requires a per-process token returned in X-AG2-Switch-Token plus confirm: true.
+- API requests reject foreign Origin and Sec-Fetch-Site: cross-site. A missing Origin remains accepted for same-user native callers.
+- Ordinary status and health responses do not issue the switching token. The dedicated POST /api/switching/intent path requires a custom intent-request header and the browser-origin checks before issuing it.
+- Explicit switching requires the per-process token plus confirm: true.
 - WebView2 loads the server URL created by the application.
 
 INTENDED SECURITY PROPERTY:
 
 Only a local, intended dashboard interaction should be able to request sensitive mutation. Loopback reachability alone does not establish intent or user identity.
 
-LIMITATION: IsAllowedMutationOrigin accepts requests without an Origin header, and protection is not uniform across every mutation. The switch token gives the credential-changing route a stronger intent check, but the current server should not be described as a general authenticated API. See [known-limitations.md](known-limitations.md).
+LIMITATION: Missing Origin is accepted for same-user local native callers. The switch token strengthens credential-changing intent but is not general user authentication. See [known-limitations.md](known-limitations.md).
 
 Remote-network exposure is blocked by loopback binding plus remote-address and Host checks. Same-user, non-browser local processes can reach loopback without general API authentication; most mutations do not require the switch-intent token. Cross-Windows-user/session loopback reachability is UNKNOWN from repository evidence. Do not claim either proven cross-user compromise or proven multi-user isolation without targeted OS-level validation.
 
@@ -55,6 +53,8 @@ WinCred is the live Antigravity credential boundary. The current native runtime 
 Therefore, older documentation that calls all WinCred access strictly read-only is stale for the shipped native switching path.
 
 The session vault encrypts each framed account payload through Windows DPAPI CurrentUser. Framing binds the plaintext to account ID, target, and version; mismatches fail closed. DPAPI protects stored bytes but does not prove that an account/process transition is correct—that proof belongs to the transaction and telemetry checks.
+
+Account API hasVaultedSession is derived from successful vault decryption and framing validation, not a metadata flag or ciphertext-record presence. Temporary returned byte buffers are zeroed after this availability check; complete managed-memory erasure remains outside this guarantee.
 
 Primary evidence: WindowsWinCredReader.cs, WindowsWinCredWriter.cs, WindowsDpapiProvider.cs, SessionVault.cs, AccountEnrollmentService.cs, and NativeAccountSwitchCoordinator.cs.
 

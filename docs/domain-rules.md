@@ -24,12 +24,9 @@ INTENDED INVARIANT:
 CURRENT IMPLEMENTATION:
 
 - AG2TelemetryNormalizer clamps observed numeric fractions and preserves prompt and Flow credit records separately.
-- CanonicalizeModelQuotas groups primarily by ModelOrTier and uses the minimum fraction within a group.
-- NativeAutoRouter removes models marked IsExhausted before deriving the current usable fraction from the minimum remaining non-exhausted observation. If at least one healthy model remains, an exhausted model does not lower that account-level value and can be masked for switching assessment.
-
-The unknown and reset-window gaps are documented in [known-limitations.md](known-limitations.md); the current defaults are not the intended contract.
-
-UNRESOLVED REQUIREMENT: the repository does not currently establish an authoritative intended account-level switching policy for a mixed snapshot containing both exhausted and healthy models. Do not infer either “any exhausted model forces switching” or “only all exhausted models force switching” until a domain decision and tests define it.
+- CanonicalizeModelQuotas merges only exact model/tier identity and compatible reset instants. Unknown reset is not compatible with a known instant, and no proximity tolerance or prefix match proves sharing.
+- NativeAutoRouter derives account-level switching pressure from the weakest observed model. Any exhausted model makes that account-level value zero; unknown models never become 100% by default.
+- The dashboard renders missing quota as UNKNOWN, distinct from an observed zero/exhausted quota.
 
 Primary evidence: AG2TelemetryNormalizer, NativeAutoRouter, AG2TelemetryNormalizerTests, and NativeAutoRouterTests.
 

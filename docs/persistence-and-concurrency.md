@@ -9,7 +9,7 @@ This document owns durable stores, mutation ownership, synchronization, transact
 | Account metadata and active account ID | LocalMetadataAccountStore; DATA_DIR/accounts.json when overridden, otherwise per-user LocalAppData/AG2-Router/data/accounts.json | Durable JSON |
 | Vaulted sessions | SessionVault; per-user LocalAppData/AG2-Router/vault/sessions.dat by default | Durable versioned JSON envelope containing DPAPI ciphertext |
 | Live Antigravity credential | Windows Credential Manager canonical target | External OS-managed state |
-| Router configuration | NativeAutoRouter._config | Process memory only |
+| Router configuration | NativeAutoRouter config JSON under per-user app data | Durable; loaded before polling starts |
 | Observed account quotas and cooldowns | NativeAutoRouter | Process memory only |
 | Poll/status snapshot | TelemetryPollingCoordinator | Process memory only |
 | Switch status and last result | NativeAccountSwitchCoordinator | Process memory only |
@@ -37,7 +37,8 @@ Atomic replacement protects the destination snapshot; it does not by itself seri
 - PathLockRegistry returns one in-process SemaphoreSlim per canonical full path.
 - CrossProcessFileLease acquires an exclusive sibling .lock file for cross-process mutation. On Windows it uses delete-on-close behavior.
 - LocalMetadataAccountStore and SessionVault take the path lock, acquire the cross-process lease for mutations, then re-read the latest durable snapshot before applying changes.
-- AccountEnrollmentService adds a normalized-email semaphore and an enrollment-resource cross-process lease.
+- AccountEnrollmentService adds a normalized-email semaphore and an enrollment-resource cross-process lease; enrollment, deletion, and switching share the vault-derived switch ownership boundary.
+- AccountRemovalService rechecks active identity under that boundary, removes the vault record first, and restores it if guarded metadata removal fails.
 - NativeAccountSwitchCoordinator uses a process-wide SwitchGate and a cross-process switch lease derived from the vault path.
 - NativeAutoRouter uses an evaluation gate to prevent overlapping cycles.
 
@@ -79,17 +80,17 @@ CURRENT IMPLEMENTATION in NativeAccountSwitchCoordinator:
 5. On post-mutation failure, quiesce the owned replacement generation, restore the credential only if current state still matches the applied credential, restart, and verify the source identity.
 6. Return explicit rollback or manual-recovery results when restoration cannot be proven.
 
+Manual and automatic requests share switch ownership. Automatic plans revalidate both router epoch and persisted active identity under that ownership before mutation; manual completion updates the router cache.
+
 The order is security- and integrity-sensitive. See NativeAccountSwitchCoordinatorTests and WindowsAG2ProcessLifecycleTests before changing it.
 
 ## Polling and stale state
 
-TelemetryPollingCoordinator has a fixed interval chosen at construction, prevents overlapping PollAsync calls, assigns monotonic sequence numbers, and refuses to replace newer status with an older result. Each poll invokes NativeAutoRouter.EvaluateCycleAsync before building the published snapshot.
-
-NativeAutoRouter also contains its own Start/Stop periodic loop using RouterConfigDto.PollingIntervalMs, but App.xaml.cs starts TelemetryPollingCoordinator and does not call NativeAutoRouter.Start. Updating router pollingIntervalMs therefore does not reconfigure the active telemetry timer in the shipped composition. This limitation is tracked in [known-limitations.md](known-limitations.md).
+TelemetryPollingCoordinator starts from the persisted router polling interval, prevents overlapping PollAsync calls, assigns monotonic sequence numbers, and refuses to replace newer status with an older result. A successful config write dynamically replaces its timer. Each poll invokes NativeAutoRouter.EvaluateCycleAsync before building the published snapshot. A failed durable config write does not report success or change runtime config.
 
 ### Dashboard configuration form
 
-App.svelte refreshes status, accounts, and configuration approximately every six seconds. RoutingConfigSection.svelte mirrors each refreshed config prop into local form values through reactive effects and has no dirty-state guard. Unsaved form edits can therefore be replaced by the next refresh.
+App.svelte refreshes status, accounts, and configuration approximately every six seconds. RoutingConfigSection.svelte protects dirty edits from incoming config refreshes until save or reset.
 
 This is client-side UI concurrency/UX behavior. It does not demonstrate persistent-file corruption or a failed server-side atomic write.
 
@@ -104,15 +105,16 @@ Startup composition currently has no durable switch transaction journal or recon
 CURRENT IMPLEMENTATION:
 
 - Cancellation before process transition begins returns the CANCELLED result, which the loopback server maps to 408.
-- Once process transition has begun, an exception or cancellation enters rollback using non-request cancellation tokens.
-- The coordinator explicitly checks cancellation after the target identity has been verified but before metadata finalization.
-- A client abort at that late point can roll back an otherwise verified target and return SWITCH_FAILED_ROLLED_BACK rather than CANCELLED/408.
+- Once process transition begins, caller cancellation is detached. Forward completion and rollback have internally owned bounded cancellation lifetimes.
+- Shutdown closes switch admission before waiting for the active transaction. It signals the internal forward path, waits within a caller-specified bound, and reports timeout rather than silently exiting while recovery remains active.
 
 This is transaction/control-flow behavior, not evidence of file corruption. HTTP mappings are summarized in [api-contracts.md](api-contracts.md).
 
 ## WebView2 lifecycle
 
 DashboardLifecycleManager owns lazy window creation and reuse. WebView2EnvironmentCoordinator serializes environment creation, keeps closing environments from being handed to new windows, waits for browser-process exit when possible, and retries known lock contention with backoff.
+
+MainWindow funnels navigation, initialization, and process failures through a shared bounded recovery budget. Automatic reload/recreation stops after exhaustion and exposes a stable manual retry overlay; successful navigation resets the budget.
 
 Tests cover concurrent creation, reopen during exit, timeout, lock contention, and late exit events. They do not prove behavior for every installed WebView2 runtime version.
 

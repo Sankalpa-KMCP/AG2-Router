@@ -32,7 +32,7 @@ WindowsDpapiProvider round-trip tests may use synthetic bytes in an isolated tem
 
 UpgradePreservationTests explicitly redirect data and use synthetic/fake inputs. Preserve that isolation when adding lanes.
 
-CURRENT IMPLEMENTATION VIOLATION: the normal .NET suite includes DashboardLifecycleTests.JsRuntimeDiagnostics_RecordsAndClearsErrors. It calls the production JsRuntimeDiagnostics.RecordError implementation, which creates the default per-user AG2-Router directory when needed and may overwrite %LOCALAPPDATA%/AG2-Router/js_runtime_errors.json. The full .NET suite is therefore not currently proven safe against real user app state. Do not represent it as isolated, and do not run that known test under repository-only authorization; the production/test code must first redirect or inject task-owned storage.
+Normal repository .NET tests use synthetic in-memory sinks or task-owned temporary paths for JS runtime diagnostics, avoiding writes to %LOCALAPPDATA%/AG2-Router. When adding or expanding tests, ensure diagnostic logging continues to inject isolated destinations rather than resolving the production per-user path.
 
 ## Live opt-ins
 
@@ -45,10 +45,10 @@ These variables are explicit authorization gates. Do not set them automatically 
 
 - Normalization and canonical quota behavior: AG2TelemetryNormalizerTests and test/ag2-normalizer.test.ts.
 - Candidate selection and safety: CandidateSelectorTests, RoutingSafetyGateTests, NativeAutoRouterTests, selector/safety TypeScript tests.
-- Enrollment and persistence: AccountEnrollmentServiceTests, AccountStoreTests, SessionVaultTests, and matching TypeScript tests.
+- Enrollment and persistence: AccountEnrollmentServiceTests, AccountRemovalServiceTests, AccountStoreTests, SessionVaultTests, and matching TypeScript tests.
 - Switching and process integrity: NativeAccountSwitchCoordinatorTests, WindowsAG2ProcessLifecycleTests, ProcessProvenanceValidatorTests, and TypeScript switch tests.
 - Loopback/API: LoopbackServerTests, LoopbackServerAccountApiTests, LoopbackSwitchApiTests, and LoopbackRouterApiTests.
-- Polling/WebView lifecycle: TelemetryPollingCoordinatorTests, DashboardLifecycleTests, and WebView2EnvironmentCoordinatorTests.
+- Polling/WebView lifecycle: TelemetryPollingCoordinatorTests, DashboardLifecycleTests, WebView2EnvironmentCoordinatorTests, and WebViewRecoveryPolicyTests.
 - Packaging and upgrades: ReleasePackagingTests and UpgradePreservationTests.
 
 Tests should reference the subject contract rather than duplicate prose explanations in their names or setup comments.
@@ -64,9 +64,7 @@ Tests should reference the subject contract rather than duplicate prose explanat
 
 ## Contract gaps
 
-Frontend types are currently checked internally but not generated from or compared with backend serialization. The API discrepancies in [api-contracts.md](api-contracts.md) demonstrate why compilation of both halves is insufficient.
-
-Quota unknown-state and reset-window invariants also lack the required negative tests. Current contradictory behavior is listed in [known-limitations.md](known-limitations.md).
+Frontend types are checked internally but not generated from backend serialization; compilation of both halves remains insufficient proof of a full browser-to-loopback contract. Negative quota reset-window and unknown-state tests cover the normalizer and dashboard helper, but authored Svelte rendering is not mounted in CI.
 
 ## Frontend interaction fidelity
 
@@ -84,4 +82,4 @@ From the repository root:
     npm test
     dotnet test dotnet/AG2Router.sln -c Release
 
-Use focused projects/tests during iteration, then only the applicable safely isolated validation before handoff. Until the diagnostics test is fixed, the full .NET command above is a CI reference rather than a safe default agent command. Packaging is Windows-specific and is described in [build-and-release.md](build-and-release.md).
+Use focused projects/tests during iteration, then only the applicable safely isolated validation before handoff. Normal repository .NET tests may be run through the documented default command based on the current isolated test design; explicitly opt-in live tests continue to require separate authorization. Packaging is Windows-specific and is described in [build-and-release.md](build-and-release.md).

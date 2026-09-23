@@ -41,9 +41,9 @@ The current release workflow uploads build artifacts; it does not itself create 
 
 scripts/package-release.ps1:
 
-1. Publishes AG2Router.App self-contained for win-x64.
-2. Removes PDB files from the release payload.
-3. includes install/uninstall helper scripts for the archive.
+1. Rebuilds frontend/ into generated src/ui and fails if that build fails, including standalone invocations.
+2. Publishes AG2Router.App self-contained for win-x64.
+3. Removes PDB files from the release payload and includes install/uninstall helpers.
 4. Requires core binaries, WebView2 assemblies, and wwwroot assets.
 5. Creates the ZIP and SHA256SUMS.txt.
 6. Compiles installer/AG2Router.iss when ISCC is available or required.
@@ -51,15 +51,15 @@ scripts/package-release.ps1:
 
 ReleasePackagingTests assert important script and installer contracts. They supplement but do not replace executing the packaging workflow on Windows.
 
-CURRENT IMPLEMENTATION: scripts/package-release.ps1 does not run npm run build or otherwise rebuild frontend/ into src/ui. A standalone/local packaging invocation therefore requires fresh src/ui assets to have been produced first. The GitHub release workflow does run npm run build before invoking the packaging script.
-
-This is a provenance/freshness precondition, not evidence that the published v0.2.0 artifacts were stale.
+The release workflow also builds frontend assets before invoking packaging. The packaging script itself enforces freshness, so standalone invocation does not silently reuse stale src/ui.
 
 ## Installer and upgrade boundary
 
-The Inno Setup installer is per-user, uses the stable AppId declared in installer/AG2Router.iss, and targets the per-user Programs/AG2Router directory. It requests graceful application exit before replacement and cleans a legacy script uninstall registration only after ownership checks.
+The Inno Setup installer is per-user, uses the stable AppId declared in installer/AG2Router.iss, and targets the per-user Programs/AG2Router directory. It coordinates with running instances using the session mutex `Local\AG2Router_Session_Mutex` (via Win32 OpenMutexW/CloseHandle), requests graceful application exit (--exit), and polls boundedly (up to 5 seconds) before proceeding. Both Inno Setup and PowerShell installers fail closed if the shutdown request fails, if the executable is missing, or if the mutex remains held.
 
-The PowerShell installer is the archive installation path. It also installs per-user, creates an owned shortcut, and registers an uninstall entry.
+Inno Setup implements atomic staged upgrades: existing installations are staged to `{app}.bak` using Win32 MoveFileW at `ssInstall`, new binaries are extracted, verified at `ssPostInstall` before pruning the backup, and automatically rolled back in `DeinitializeSetup()` if setup is aborted or fails. It cleans legacy script uninstall registrations only after strict ownership checks.
+
+The PowerShell installer is the archive installation path. It also installs per-user, performs atomic directory swaps with backup and rollback, creates an owned shortcut, and registers an uninstall entry.
 
 Persistent application data under the separate AG2-Router user-data directory is outside the binary installation directory. Install and upgrade procedures must not rewrite it.
 
@@ -68,6 +68,8 @@ Persistent application data under the separate AG2-Router user-data directory is
 Uninstall may remove only owned program binaries, shortcuts, uninstall registration, and an autostart value positively matched to this installation. It must preserve account metadata, vault data, WebView/user data unless an explicitly designed future policy says otherwise, and the live Antigravity credential.
 
 Ownership checks are part of the safety contract. Path or registry cleanup must fail/skip safely when ownership cannot be established.
+
+Both PowerShell and Inno uninstall entry points coordinate with the session mutex `Local\AG2Router_Session_Mutex`, verify executable presence, and fail closed if the application exit request fails or if the mutex remains held; destructive removal does not continue after an unsuccessful shutdown signal.
 
 Evidence: installer/AG2Router.iss, scripts/install.ps1, scripts/uninstall.ps1, ReleasePackagingTests, and UpgradePreservationTests.
 
