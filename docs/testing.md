@@ -49,7 +49,7 @@ These variables are explicit authorization gates. Do not set them automatically 
 - Switching and process integrity: NativeAccountSwitchCoordinatorTests, WindowsAG2ProcessLifecycleTests, ProcessProvenanceValidatorTests, and TypeScript switch tests.
 - Loopback/API: LoopbackServerTests, LoopbackServerAccountApiTests, LoopbackSwitchApiTests, and LoopbackRouterApiTests.
 - Polling/WebView lifecycle: TelemetryPollingCoordinatorTests, DashboardLifecycleTests, WebView2EnvironmentCoordinatorTests, and WebViewRecoveryPolicyTests.
-- Packaging and upgrades: ReleasePackagingTests and UpgradePreservationTests.
+- Packaging and upgrades: ReleasePackagingTests and UpgradePreservationTests, including disposable staged replacement/interruption checks. These do not execute the production installer.
 
 Tests should reference the subject contract rather than duplicate prose explanations in their names or setup comments.
 
@@ -64,7 +64,7 @@ Tests should reference the subject contract rather than duplicate prose explanat
 
 ## Contract gaps
 
-Frontend types are checked internally but not generated from backend serialization; compilation of both halves remains insufficient proof of a full browser-to-loopback contract. Negative quota reset-window and unknown-state tests cover the normalizer and dashboard helper, but authored Svelte rendering is not mounted in CI.
+Frontend types are checked internally but not generated from backend serialization; compilation of both halves remains insufficient proof of a full browser-to-loopback contract. Negative quota reset-window and unknown-state tests cover the normalizers and dashboard helper, and request-order/mutation-fence tests cover the helper protocol, but authored Svelte rendering is not mounted in CI.
 
 ## Frontend interaction fidelity
 

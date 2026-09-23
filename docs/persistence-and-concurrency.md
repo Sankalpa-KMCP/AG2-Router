@@ -37,8 +37,8 @@ Atomic replacement protects the destination snapshot; it does not by itself seri
 - PathLockRegistry returns one in-process SemaphoreSlim per canonical full path.
 - CrossProcessFileLease acquires an exclusive sibling .lock file for cross-process mutation. On Windows it uses delete-on-close behavior.
 - LocalMetadataAccountStore and SessionVault take the path lock, acquire the cross-process lease for mutations, then re-read the latest durable snapshot before applying changes.
-- AccountEnrollmentService adds a normalized-email semaphore and an enrollment-resource cross-process lease; enrollment, deletion, and switching share the vault-derived switch ownership boundary.
-- AccountRemovalService rechecks active identity under that boundary, removes the vault record first, and restores it if guarded metadata removal fails.
+- AccountEnrollmentService adds a normalized-email semaphore; enrollment, deletion, switching, and router quota attribution share the vault-derived switch path lock and cross-process lease. Enrollment takes that lease once for its transaction rather than nesting it with a switch operation.
+- AccountRemovalService rechecks active identity under that boundary, removes the vault record first, and restores it if guarded metadata removal fails. An unreadable metadata readback is an explicit manual-attention outcome, not proof of removal.
 - NativeAccountSwitchCoordinator uses a process-wide SwitchGate and a cross-process switch lease derived from the vault path.
 - NativeAutoRouter uses an evaluation gate to prevent overlapping cycles.
 
@@ -49,6 +49,7 @@ Maintain lock acquisition order. Introducing a new caller that acquires these re
 IAccountStore exposes guarded operations used by recovery paths:
 
 - RemoveAccountIfUnchangedAsync removes only the expected metadata version.
+- RestoreAccountIfUnchangedAsync restores the pre-enrollment metadata snapshot only when the written version still matches.
 - CompareExchangeActiveAccountIdAsync changes the active selection only when the expected ID still owns it.
 - TryFinalizeSwitchAsync updates the target and active selection only when the expected source remains active.
 
@@ -63,7 +64,9 @@ CURRENT IMPLEMENTATION in AccountEnrollmentService:
 3. Serialize enrollment for the normalized identity across in-process and cross-process callers.
 4. Capture prior metadata, vault, and active-account state.
 5. Create or update metadata, save the protected session, and conditionally select the account.
-6. On failure, use RestoreIfCurrent, RemoveAccountIfUnchanged, and active-account compare/exchange so compensation does not overwrite newer state.
+6. On failure, use RestoreIfCurrent, RemoveAccountIfUnchanged or RestoreAccountIfUnchanged, and active-account compare/exchange so compensation does not overwrite newer state.
+
+The final live credential read must match the captured material as well as the username. If the same identity's credential rotated during capture, enrollment refuses a successful current-session result and conditionally restores both the vault and the prior metadata snapshot (or removes a newly created record). Uncertain compensation is reported as manual recovery.
 
 Cancellation after mutation begins does not justify abandoning compensation. Recovery uses bounded, explicit operations and must preserve external/concurrent changes.
 
@@ -80,7 +83,7 @@ CURRENT IMPLEMENTATION in NativeAccountSwitchCoordinator:
 5. On post-mutation failure, quiesce the owned replacement generation, restore the credential only if current state still matches the applied credential, restart, and verify the source identity.
 6. Return explicit rollback or manual-recovery results when restoration cannot be proven.
 
-Manual and automatic requests share switch ownership. Automatic plans revalidate both router epoch and persisted active identity under that ownership before mutation; manual completion updates the router cache.
+Manual and automatic requests share switch ownership. Automatic plans revalidate both router epoch and persisted active identity under that ownership before mutation; manual completion updates the router cache. Router quota observations are attributed only after rechecking epoch and active identity inside that ownership boundary. Successful automatic publication reacquires switch ownership and reads authoritative active identity before updating router state under its state lock. This covers the interval after a manual coordinator commits but before its completion callback. Newer manual success and manual-recovery terminal states cannot be overwritten by an earlier automatic result.
 
 The order is security- and integrity-sensitive. See NativeAccountSwitchCoordinatorTests and WindowsAG2ProcessLifecycleTests before changing it.
 
@@ -90,7 +93,7 @@ TelemetryPollingCoordinator starts from the persisted router polling interval, p
 
 ### Dashboard configuration form
 
-App.svelte refreshes status, accounts, and configuration approximately every six seconds. RoutingConfigSection.svelte protects dirty edits from incoming config refreshes until save or reset.
+App.svelte refreshes status, accounts, and configuration approximately every six seconds. Each resource has independent request sequencing, and reads that cross a mutation are discarded; failed reads retain the last good snapshot. RoutingConfigSection.svelte protects dirty edits from incoming config refreshes until save or reset, including edits made while a save is in flight.
 
 This is client-side UI concurrency/UX behavior. It does not demonstrate persistent-file corruption or a failed server-side atomic write.
 
@@ -114,7 +117,7 @@ This is transaction/control-flow behavior, not evidence of file corruption. HTTP
 
 DashboardLifecycleManager owns lazy window creation and reuse. WebView2EnvironmentCoordinator serializes environment creation, keeps closing environments from being handed to new windows, waits for browser-process exit when possible, and retries known lock contention with backoff.
 
-MainWindow funnels navigation, initialization, and process failures through a shared bounded recovery budget. Automatic reload/recreation stops after exhaustion and exposes a stable manual retry overlay; successful navigation resets the budget.
+MainWindow funnels navigation, initialization, and process failures through a shared bounded recovery budget. Environment creation and control initialization each have wall-clock deadlines even when a callee ignores cancellation. Automatic reload/recreation stops after exhaustion and exposes a stable manual retry overlay; successful navigation resets the budget.
 
 Tests cover concurrent creation, reopen during exit, timeout, lock contention, and late exit events. They do not prove behavior for every installed WebView2 runtime version.
 

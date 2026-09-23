@@ -24,8 +24,9 @@ INTENDED INVARIANT:
 CURRENT IMPLEMENTATION:
 
 - AG2TelemetryNormalizer clamps observed numeric fractions and preserves prompt and Flow credit records separately.
-- CanonicalizeModelQuotas merges only exact model/tier identity and compatible reset instants. Unknown reset is not compatible with a known instant, and no proximity tolerance or prefix match proves sharing.
-- NativeAutoRouter derives account-level switching pressure from the weakest observed model. Any exhausted model makes that account-level value zero; unknown models never become 100% by default.
+- AG2TelemetryNormalizer and the TypeScript reference normalizer retain missing and non-finite model fractions as unknown. CanonicalizeModelQuotas preserves each source row because model/tier, presentation labels, and even equal reset instants do not prove shared capacity. No proximity tolerance or prefix match is used.
+- NativeAutoRouter derives account-level switching pressure from the weakest observed model. Any observed exhausted model makes that account-level value zero; unknown models never become 100% by default. Unknown current-account quota does not authorize automatic mutation.
+- CandidateSelector requires known capacity for every pool matching a relevant model key; one healthy row cannot hide another matching unknown or exhausted row.
 - The dashboard renders missing quota as UNKNOWN, distinct from an observed zero/exhausted quota.
 
 Primary evidence: AG2TelemetryNormalizer, NativeAutoRouter, AG2TelemetryNormalizerTests, and NativeAutoRouterTests.

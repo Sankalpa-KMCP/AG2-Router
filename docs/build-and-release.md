@@ -55,9 +55,9 @@ The release workflow also builds frontend assets before invoking packaging. The 
 
 ## Installer and upgrade boundary
 
-The Inno Setup installer is per-user, uses the stable AppId declared in installer/AG2Router.iss, and targets the per-user Programs/AG2Router directory. It coordinates with running instances using the session mutex `Local\AG2Router_Session_Mutex` (via Win32 OpenMutexW/CloseHandle), requests graceful application exit (--exit), and polls boundedly (up to 5 seconds) before proceeding. Both Inno Setup and PowerShell installers fail closed if the shutdown request fails, if the executable is missing, or if the mutex remains held.
+The Inno Setup installer is per-user, uses the stable AppId declared in installer/AG2Router.iss, and targets the per-user Programs/AG2Router directory. It coordinates with running instances using the session mutex `Local\AG2Router_Session_Mutex` (via Win32 OpenMutexW/CloseHandle), launches the graceful --exit helper without an unbounded process wait, and polls stop state for at most five seconds. A mutex query error is unknown and fails closed. Both Inno Setup and PowerShell installers refuse to proceed when stopped state cannot be established.
 
-Inno Setup implements atomic staged upgrades: existing installations are staged to `{app}.bak` using Win32 MoveFileW at `ssInstall`, new binaries are extracted, verified at `ssPostInstall` before pruning the backup, and automatically rolled back in `DeinitializeSetup()` if setup is aborted or fails. It cleans legacy script uninstall registrations only after strict ownership checks.
+Inno Setup stages an existing complete `{app}` directory to `{app}.bak` in the abortable `PrepareToInstall` phase. A failed move or pre-existing backup prevents extraction and an old-file overlay. The backup remains until successful `ssDone`; cancellation or failure attempts checked removal of any partial replacement and checked promotion of the complete backup. If rollback cannot finish, the backup is retained for explicit manual recovery. The successful new directory contains no old-only files. Legacy script uninstall registration is cleaned only after strict ownership checks.
 
 The PowerShell installer is the archive installation path. It also installs per-user, performs atomic directory swaps with backup and rollback, creates an owned shortcut, and registers an uninstall entry.
 
@@ -69,7 +69,7 @@ Uninstall may remove only owned program binaries, shortcuts, uninstall registrat
 
 Ownership checks are part of the safety contract. Path or registry cleanup must fail/skip safely when ownership cannot be established.
 
-Both PowerShell and Inno uninstall entry points coordinate with the session mutex `Local\AG2Router_Session_Mutex`, verify executable presence, and fail closed if the application exit request fails or if the mutex remains held; destructive removal does not continue after an unsuccessful shutdown signal.
+Both PowerShell and Inno uninstall entry points coordinate with the session mutex `Local\AG2Router_Session_Mutex` and fail closed if stopped state cannot be proven. Inno's helper invocation is nonblocking and followed by bounded mutex polling; a query failure or held mutex prevents destructive removal. A missing executable by itself is not proof that the application stopped.
 
 Evidence: installer/AG2Router.iss, scripts/install.ps1, scripts/uninstall.ps1, ReleasePackagingTests, and UpgradePreservationTests.
 
