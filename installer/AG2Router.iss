@@ -45,11 +45,13 @@ Filename: "{app}\AG2Router.exe"; Description: "{cm:LaunchProgram,AG2 Router}"; F
 [Code]
 const
   SYNCHRONIZE = $00100000;
+  ERROR_FILE_NOT_FOUND = 2;
   SessionMutexName = 'Local\AG2Router_Session_Mutex';
 
 var
   HasBackup: Boolean;
   InstallCompleted: Boolean;
+  StagedAppDir: String;
 
 function OpenMutexW(dwDesiredAccess: DWORD; bInheritHandle: BOOL; lpName: String): THandle;
 external 'OpenMutexW@kernel32.dll stdcall';
@@ -60,16 +62,23 @@ external 'CloseHandle@kernel32.dll stdcall';
 function MoveFileW(lpExistingFileName, lpNewFileName: String): BOOL;
 external 'MoveFileW@kernel32.dll stdcall';
 
-function IsSessionMutexHeld(): Boolean;
+// 0 = proven absent, 1 = held, -1 = query failed (unknown).
+function SessionMutexState(): Integer;
 var
   hMutex: THandle;
 begin
-  Result := False;
   hMutex := OpenMutexW(SYNCHRONIZE, False, SessionMutexName);
   if hMutex <> 0 then
   begin
-    Result := True;
+    Result := 1;
     CloseHandle(hMutex);
+  end;
+  if hMutex = 0 then
+  begin
+    if DLLGetLastError = ERROR_FILE_NOT_FOUND then
+      Result := 0
+    else
+      Result := -1;
   end;
 end;
 
@@ -81,7 +90,7 @@ begin
   Elapsed := 0;
   while Elapsed < TimeoutMs do
   begin
-    if not IsSessionMutexHeld() then
+    if SessionMutexState() = 0 then
     begin
       Result := True;
       Exit;
@@ -89,7 +98,7 @@ begin
     Sleep(250);
     Elapsed := Elapsed + 250;
   end;
-  Result := not IsSessionMutexHeld();
+  Result := SessionMutexState() = 0;
 end;
 
 // Prerequisite check for Microsoft Edge WebView2 Evergreen Runtime & per-user validation
@@ -140,8 +149,14 @@ var
   ResultCode: Integer;
 begin
   Result := True;
-  if IsSessionMutexHeld() then
+  if SessionMutexState() <> 0 then
   begin
+    if SessionMutexState() < 0 then
+    begin
+      MsgBox('AG2 Router stop state could not be verified. Uninstall was cancelled.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
     InstalledExe := ExpandConstant('{app}\AG2Router.exe');
     if not FileExists(InstalledExe) then
     begin
@@ -152,18 +167,9 @@ begin
       Exit;
     end;
 
-    if not Exec(InstalledExe, '--exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    if not Exec(InstalledExe, '--exit', '', SW_HIDE, ewNoWait, ResultCode) then
     begin
       MsgBox('AG2 Router shutdown command could not be started.' + #13#10 +
-             'Please exit AG2 Router from the system tray before uninstalling.',
-             mbError, MB_OK);
-      Result := False;
-      Exit;
-    end;
-
-    if ResultCode <> 0 then
-    begin
-      MsgBox('AG2 Router could not be closed safely (exit code ' + IntToStr(ResultCode) + ').' + #13#10 +
              'Please exit AG2 Router from the system tray before uninstalling.',
              mbError, MB_OK);
       Result := False;
@@ -242,11 +248,25 @@ end;
 // Graceful shutdown before installing or upgrading over existing files
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  InstalledExe: String;
+  InstalledExe, AppDir, BackupDir: String;
   ResultCode: Integer;
 begin
   Result := '';
-  if IsSessionMutexHeld() then
+  AppDir := ExpandConstant('{app}');
+  BackupDir := AppDir + '.bak';
+  if StagedAppDir <> '' then
+  begin
+    if CompareText(StagedAppDir, AppDir) <> 0 then
+      Result := 'Install target changed after the prior installation was staged.';
+    Exit;
+  end;
+
+  if SessionMutexState() < 0 then
+  begin
+    Result := 'AG2 Router stop state could not be verified. Installation was cancelled.';
+    Exit;
+  end;
+  if SessionMutexState() = 1 then
   begin
     InstalledExe := ExpandConstant('{app}\AG2Router.exe');
     if not FileExists(InstalledExe) then
@@ -257,16 +277,9 @@ begin
     end;
 
     // Request graceful shutdown and wait boundedly for primary instance termination via AG2Router.exe --exit
-    if not Exec(InstalledExe, '--exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    if not Exec(InstalledExe, '--exit', '', SW_HIDE, ewNoWait, ResultCode) then
     begin
       Result := 'Failed to execute AG2 Router shutdown command (--exit).' + #13#10 +
-                'Please exit AG2 Router from the system tray before proceeding with installation.';
-      Exit;
-    end;
-
-    if ResultCode <> 0 then
-    begin
-      Result := 'AG2 Router shutdown command returned exit code ' + IntToStr(ResultCode) + '.' + #13#10 +
                 'Please exit AG2 Router from the system tray before proceeding with installation.';
       Exit;
     end;
@@ -282,6 +295,22 @@ begin
     // Allow brief pause for OS process handle closure and file unlocks before extraction
     Sleep(250);
   end;
+
+  if DirExists(BackupDir) then
+  begin
+    Result := 'A prior installation backup already exists. Resolve that backup before upgrading.';
+    Exit;
+  end;
+  if DirExists(AppDir) then
+  begin
+    if not MoveFileW(AppDir, BackupDir) then
+    begin
+      Result := 'Could not stage the prior installation. No application files were overwritten.';
+      Exit;
+    end;
+    HasBackup := True;
+    StagedAppDir := AppDir;
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -290,35 +319,25 @@ var
 begin
   if CurStep = ssInstall then
   begin
-    AppDir := ExpandConstant('{app}');
-    BackupDir := AppDir + '.bak';
-    HasBackup := False;
     InstallCompleted := False;
-
-    if DirExists(AppDir) then
-    begin
-      if DirExists(BackupDir) then
-        DelTree(BackupDir, True, True, True);
-
-      if MoveFileW(AppDir, BackupDir) then
-        HasBackup := True;
-    end;
   end
-  else if CurStep = ssPostInstall then
+  else if CurStep = ssDone then
   begin
     AppDir := ExpandConstant('{app}');
     BackupDir := AppDir + '.bak';
 
     if FileExists(AppDir + '\AG2Router.exe') then
     begin
-      if HasBackup and DirExists(BackupDir) then
-      begin
-        DelTree(BackupDir, True, True, True);
-      end;
       InstallCompleted := True;
+      if HasBackup and DirExists(BackupDir) and
+         (not DelTree(BackupDir, True, True, True)) then
+        MsgBox('The new version installed, but the prior installation backup could not be removed. Resolve the sibling .bak directory before the next upgrade.', mbError, MB_OK);
+      CleanLegacyScriptUninstallRegistration();
+    end
+    else
+    begin
+      MsgBox('Installed application validation failed. The prior installation will be restored if possible.', mbError, MB_OK);
     end;
-
-    CleanLegacyScriptUninstallRegistration();
   end;
 end;
 
@@ -331,11 +350,14 @@ begin
 
   if HasBackup and (not InstallCompleted) then
   begin
-    if DirExists(AppDir) then
-      DelTree(AppDir, True, True, True);
+    if DirExists(AppDir) and (not DelTree(AppDir, True, True, True)) then
+    begin
+      MsgBox('Incomplete replacement could not be removed. The complete prior installation remains in the sibling .bak directory for manual recovery.', mbError, MB_OK);
+      Exit;
+    end;
 
-    if DirExists(BackupDir) then
-      MoveFileW(BackupDir, AppDir);
+    if DirExists(BackupDir) and (not MoveFileW(BackupDir, AppDir)) then
+      MsgBox('The complete prior installation could not be restored automatically. It remains in the sibling .bak directory for manual recovery.', mbError, MB_OK);
   end;
 end;
 

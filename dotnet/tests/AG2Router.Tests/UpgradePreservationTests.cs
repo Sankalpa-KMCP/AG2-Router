@@ -26,6 +26,39 @@ namespace AG2Router.Tests;
 /// </summary>
 public class UpgradePreservationTests : IDisposable
 {
+    [Fact]
+    public void StagedReplacementRemovesOldOnlyFilesAndRestoresWholeTreeOnInterruption()
+    {
+        string source = Path.Combine(_testRoot, "synthetic-new");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "AG2Router.exe"), "new-synthetic");
+        File.WriteAllText(Path.Combine(_installDir, "AG2Router.exe"), "old-synthetic");
+        File.WriteAllText(Path.Combine(_installDir, "old-only.dll"), "old-only-synthetic");
+
+        Assert.Throws<IOException>(() => SimulateInstallerBinaryReplacement(source, _installDir,
+            () => throw new IOException("synthetic interruption")));
+        Assert.Equal("old-synthetic", File.ReadAllText(Path.Combine(_installDir, "AG2Router.exe")));
+        Assert.True(File.Exists(Path.Combine(_installDir, "old-only.dll")));
+        Assert.False(Directory.Exists(_installDir + ".bak"));
+
+        SimulateInstallerBinaryReplacement(source, _installDir);
+        Assert.Equal("new-synthetic", File.ReadAllText(Path.Combine(_installDir, "AG2Router.exe")));
+        Assert.False(File.Exists(Path.Combine(_installDir, "old-only.dll")));
+        Assert.False(Directory.Exists(_installDir + ".bak"));
+    }
+
+    [Fact]
+    public void ExistingBackupBlocksStagingWithoutOverlay()
+    {
+        string source = Path.Combine(_testRoot, "synthetic-new");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "AG2Router.exe"), "new-synthetic");
+        File.WriteAllText(Path.Combine(_installDir, "AG2Router.exe"), "old-synthetic");
+        Directory.CreateDirectory(_installDir + ".bak");
+        Assert.Throws<IOException>(() => SimulateInstallerBinaryReplacement(source, _installDir));
+        Assert.Equal("old-synthetic", File.ReadAllText(Path.Combine(_installDir, "AG2Router.exe")));
+    }
+
     public const string CanonicalV010ZipSha256 = "18E72FD661839B3492160D189C43C6F0A1D20D3F08B54E1A50EEB0640CE78714";
 
     private readonly string _testRoot;
@@ -654,26 +687,41 @@ public class UpgradePreservationTests : IDisposable
     }
 
     /// <summary>
-    /// Mirrors the exact file copy semantics of Inno Setup:
-    /// Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-    /// Overwrites existing files in {app} while leaving all files outside {app} untouched.
+    /// Disposable model of the Inno staged directory replacement. Persistent user
+    /// state remains outside this directory and is never part of the stage.
     /// </summary>
-    internal static void SimulateInstallerBinaryReplacement(string sourceDir, string installDir)
+    internal static void SimulateInstallerBinaryReplacement(string sourceDir, string installDir, Action? beforeCommit = null)
     {
-        Directory.CreateDirectory(installDir);
-
-        foreach (string dirPath in Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories))
+        if (!Directory.Exists(sourceDir)) throw new DirectoryNotFoundException(sourceDir);
+        string backupDir = installDir + ".bak";
+        if (Directory.Exists(backupDir)) throw new IOException("Prior installation backup already exists.");
+        bool staged = Directory.Exists(installDir);
+        if (staged) Directory.Move(installDir, backupDir);
+        try
         {
-            string relative = Path.GetRelativePath(sourceDir, dirPath);
-            Directory.CreateDirectory(Path.Combine(installDir, relative));
+            Directory.CreateDirectory(installDir);
+            foreach (string dirPath in Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories))
+            {
+                string relative = Path.GetRelativePath(sourceDir, dirPath);
+                Directory.CreateDirectory(Path.Combine(installDir, relative));
+            }
+            foreach (string filePath in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories))
+            {
+                string relative = Path.GetRelativePath(sourceDir, filePath);
+                File.Copy(filePath, Path.Combine(installDir, relative));
+            }
+            beforeCommit?.Invoke();
         }
-
-        foreach (string filePath in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories))
+        catch
         {
-            string relative = Path.GetRelativePath(sourceDir, filePath);
-            string destFile = Path.Combine(installDir, relative);
-            File.Copy(filePath, destFile, overwrite: true);
+            if (staged)
+            {
+                if (Directory.Exists(installDir)) Directory.Delete(installDir, recursive: true);
+                Directory.Move(backupDir, installDir);
+            }
+            throw;
         }
+        if (staged) Directory.Delete(backupDir, recursive: true);
     }
 
     internal static Dictionary<string, string> ComputeDirectoryFileHashes(string directoryPath)

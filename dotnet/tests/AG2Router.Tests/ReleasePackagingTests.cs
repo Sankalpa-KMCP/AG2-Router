@@ -426,7 +426,7 @@ public class ReleasePackagingTests
         string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
 
         Assert.Contains("procedure CurStepChanged", issContent);
-        Assert.Contains("CurStep = ssPostInstall", issContent);
+        Assert.Contains("CurStep = ssDone", issContent);
         Assert.Contains(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router", issContent);
         Assert.Contains("RegDeleteKeyIncludingSubkeys", issContent);
     }
@@ -460,9 +460,12 @@ public class ReleasePackagingTests
         Assert.Contains("OpenMutexW", issContent);
         Assert.Contains("CloseHandle", issContent);
         Assert.Contains(@"Local\AG2Router_Session_Mutex", issContent);
-        Assert.Contains("function IsSessionMutexHeld(): Boolean", issContent);
+        Assert.Contains("function SessionMutexState(): Integer", issContent);
         Assert.Contains("function WaitForSessionMutexRelease", issContent);
-        Assert.Contains("if IsSessionMutexHeld() then", issContent);
+        Assert.Contains("if SessionMutexState() < 0 then", issContent);
+        Assert.Contains("DLLGetLastError = ERROR_FILE_NOT_FOUND", issContent);
+        Assert.DoesNotContain("ewWaitUntilTerminated", issContent);
+        Assert.Contains("ewNoWait", issContent);
 
         // 2. Inno Setup PrepareToInstall & InitializeUninstall fail-closed guards
         Assert.Contains("function PrepareToInstall", issContent);
@@ -488,19 +491,40 @@ public class ReleasePackagingTests
         // 1. Win32 MoveFileW import for atomic directory moves
         Assert.Contains("MoveFileW", issContent);
 
-        // 2. ssInstall stages existing app to backup
-        Assert.Contains("CurStep = ssInstall", issContent);
+        // 2. Staging occurs in the abortable pre-extraction event.
+        string preparation = issContent.Split("function PrepareToInstall(var NeedsRestart: Boolean): String;")[1]
+            .Split("procedure CurStepChanged(CurStep: TSetupStep);")[0];
+        Assert.Contains("if DirExists(BackupDir) then", preparation);
+        Assert.Contains("if not MoveFileW(AppDir, BackupDir) then", preparation);
+        Assert.Contains("No application files were overwritten", preparation);
         Assert.Contains(".bak", issContent);
         Assert.Contains("HasBackup := True", issContent);
 
-        // 3. ssPostInstall verifies executable and cleans backup
-        Assert.Contains("CurStep = ssPostInstall", issContent);
+        // 3. Backup is retained until the successful terminal event.
+        Assert.Contains("CurStep = ssDone", issContent);
         Assert.Contains("InstallCompleted := True", issContent);
+        Assert.Contains("not DelTree(BackupDir, True, True, True)", issContent);
 
         // 4. DeinitializeSetup restores backup if install was incomplete
         Assert.Contains("procedure DeinitializeSetup()", issContent);
         Assert.Contains("HasBackup and (not InstallCompleted)", issContent);
         Assert.Contains("MoveFileW(BackupDir, AppDir)", issContent);
+        Assert.Contains("not DelTree(AppDir, True, True, True)", issContent);
+        Assert.Contains("not MoveFileW(BackupDir, AppDir)", issContent);
+        Assert.Contains("remains in the sibling .bak directory", issContent);
+    }
+
+    [Fact]
+    public void InnoUninstall_UnknownMutexAndHungExitFailClosedBeforeRemoval()
+    {
+        string issContent = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "installer", "AG2Router.iss"));
+        string uninstall = issContent.Split("function InitializeUninstall(): Boolean;")[1]
+            .Split("// Helper function to strip trailing backslashes")[0];
+        Assert.Contains("if SessionMutexState() < 0 then", uninstall);
+        Assert.Contains("if not FileExists(InstalledExe) then", uninstall);
+        Assert.Contains("ewNoWait", uninstall);
+        Assert.Contains("if not WaitForSessionMutexRelease(5000) then", uninstall);
+        Assert.DoesNotContain("ewWaitUntilTerminated", uninstall);
     }
 
     #endregion
