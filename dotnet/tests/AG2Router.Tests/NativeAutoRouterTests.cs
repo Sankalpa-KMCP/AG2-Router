@@ -18,6 +18,10 @@ public class NativeAutoRouterTests : IAsyncDisposable
     private NativeAutoRouter CreateRouter(RouterConfigDto? config = null)
     {
         _switchCoordinator.CommitSuccess = id => _accountStore.ActiveAccountId = id;
+        _adapter.GetCurrentAccountFunc = _ => Task.FromResult<AccountIdentityDto?>(
+            _accountStore.ActiveAccountId is { } id && _accountStore.Accounts.TryGetValue(id, out var account)
+                ? new AccountIdentityDto(account.Email)
+                : null);
         return new NativeAutoRouter(
             _accountStore,
             _sessionVault,
@@ -798,6 +802,169 @@ public class NativeAutoRouterTests : IAsyncDisposable
         Assert.NotEqual(target.Id, router.GetStatus().ActiveAccountId);
         Assert.Equal(RoutingSafetyGateState.ManualRecoveryRequired, router.GetStatus().State);
         Assert.False(router.GetConfig().AutoSwitchEnabled);
+    }
+
+    [Fact]
+    public async Task OldCooldownProbeCannotClearManualRecovery()
+    {
+        await using var router = CreateRouter();
+        _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Expired synthetic cooldown");
+        var probeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseProbe = new TaskCompletionSource<Ag2StatusDto>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _adapter.GetStatusFunc = _ => { probeEntered.TrySetResult(); return releaseProbe.Task; };
+
+        var evaluation = router.EvaluateCycleAsync();
+        await probeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var token = router.NotifyManualSwitchStarted("manual");
+        await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, false,
+            SwitchResultCodes.SwitchFailedRollbackFailed, NativeSwitchStates.Failed,
+            "manual", "manual@example.com", null, null, "Rollback uncertain", [],
+            DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O"),
+            ManualRecoveryRequired: true));
+        releaseProbe.SetResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        await evaluation.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(RoutingSafetyGateState.ManualRecoveryRequired, router.GetStatus().State);
+        Assert.False(router.GetConfig().AutoSwitchEnabled);
+    }
+
+    [Fact]
+    public async Task OldCooldownProbeCannotClearNewManualSuccessCooldown()
+    {
+        await using var router = CreateRouter();
+        var target = CreateAccount("manual", "manual@example.com");
+        _accountStore.Accounts[target.Id] = target;
+        _accountStore.ActiveAccountId = target.Id;
+        _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Expired synthetic cooldown");
+        var probeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseProbe = new TaskCompletionSource<Ag2StatusDto>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _adapter.GetStatusFunc = _ => { probeEntered.TrySetResult(); return releaseProbe.Task; };
+
+        var evaluation = router.EvaluateCycleAsync();
+        await probeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var token = router.NotifyManualSwitchStarted(target.Id);
+        await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, true,
+            SwitchResultCodes.Success, NativeSwitchStates.Complete, target.Id, target.Email,
+            null, null, "Manual success", [], DateTimeOffset.UtcNow.ToString("O"),
+            DateTimeOffset.UtcNow.ToString("O")));
+        releaseProbe.SetResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        await evaluation.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(RoutingSafetyGateState.Cooldown, router.GetStatus().State);
+        Assert.Contains("cooldown", (await router.EvaluateCycleAsync()).Reason,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ManualFailureBeforeGatePublicationCannotStrandStaleEvaluation()
+    {
+        await using var router = CreateRouter();
+        var current = CreateAccount("current", "current@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
+        router.SetObservedQuota(candidate.Id, 0.9);
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto("IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+        var publicationEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePublication = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        router.BeforeGatePublicationAsync = async () => {
+            publicationEntered.TrySetResult();
+            await releasePublication.Task;
+        };
+
+        var evaluation = router.EvaluateCycleAsync();
+        await publicationEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var token = router.NotifyManualSwitchStarted(current.Id);
+        await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, false,
+            SwitchResultCodes.Cancelled, NativeSwitchStates.Failed, current.Id, current.Email,
+            null, null, "Cancelled before mutation", [], DateTimeOffset.UtcNow.ToString("O"),
+            DateTimeOffset.UtcNow.ToString("O")));
+        releasePublication.TrySetResult();
+        await evaluation.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(RoutingSafetyGateState.Idle, router.GetStatus().State);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task LiveIdentityMismatchCannotAttributeQuotaOrSwitch()
+    {
+        await using var router = CreateRouter();
+        var stored = CreateAccount("stored", "stored@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[stored.Id] = stored;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = stored.Id;
+        _sessionVault.StoredIds.UnionWith([stored.Id, candidate.Id]);
+        router.SetObservedQuota(stored.Id, 0.8);
+        router.SetObservedQuota(candidate.Id, 0.9);
+        _adapter.GetCurrentAccountFunc = _ => Task.FromResult<AccountIdentityDto?>(
+            new AccountIdentityDto("external@example.com"));
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
+
+        Assert.False((await router.EvaluateCycleAsync()).ShouldSwitch);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+        var observed = (Dictionary<string, double>)typeof(NativeAutoRouter)
+            .GetField("_observedQuotas", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(router)!;
+        Assert.Equal(0.8, observed[stored.Id]);
+    }
+
+    [Fact]
+    public async Task QuotaPayloadFromTransientOtherIdentityCannotPassAbaIdentityReads()
+    {
+        await using var router = CreateRouter();
+        var stored = CreateAccount("stored", "stored@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[stored.Id] = stored;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = stored.Id;
+        _sessionVault.StoredIds.UnionWith([stored.Id, candidate.Id]);
+        router.SetObservedQuota(stored.Id, 0.8);
+        router.SetObservedQuota(candidate.Id, 0.9);
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetAccountQuotaObservationFunc = _ => Task.FromResult(new AccountQuotaObservation(
+            new AccountIdentityDto("transient@example.com"),
+            new QuotaSnapshotDto(DateTime.UtcNow.ToString("O"),
+                [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null)));
+        // Separate identity reads both see the original account. Only the
+        // identity carried by the quota RPC reveals the transient account.
+
+        Assert.False((await router.EvaluateCycleAsync()).ShouldSwitch);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+        var observed = (Dictionary<string, double>)typeof(NativeAutoRouter)
+            .GetField("_observedQuotas", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(router)!;
+        Assert.Equal(0.8, observed[stored.Id]);
+    }
+
+    [Fact]
+    public async Task UnknownActivityCannotAuthorizeAutomaticSwitch()
+    {
+        await using var router = CreateRouter();
+        var current = CreateAccount("current", "current@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
+        router.SetObservedQuota(candidate.Id, 0.9);
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(
+            AG2Router.AG2.Normalization.AG2TelemetryNormalizer.NormalizeActivitySnapshot(null));
+
+        await router.EvaluateCycleAsync();
+        Assert.Equal(RoutingSafetyGateState.WaitingForIdle, router.GetStatus().State);
+        Assert.Equal(0, _switchCoordinator.CallCount);
     }
 
     private sealed class FakeDurableFileWriter : IDurableFileWriter

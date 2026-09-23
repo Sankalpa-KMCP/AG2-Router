@@ -21,6 +21,7 @@ public class NativeAutoRouter : INativeAutoRouter
     private readonly Dictionary<string, IReadOnlyList<ModelQuotaDto>> _observedModelQuotas = new(StringComparer.Ordinal);
     private readonly Dictionary<long, string> _activeManualSwitches = new();
     private readonly object _stateLock = new();
+    internal Func<Task>? BeforeGatePublicationAsync { get; set; }
 
     private RouterConfigDto _config;
     private DateTime? _cooldownUntil;
@@ -420,34 +421,61 @@ public class NativeAutoRouter : INativeAutoRouter
                 return new SelectionResult(false, "Automatic switching halted: manual recovery required.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
             }
 
-            // Check stabilization cooldown
-            if (_safetyGate.State == RoutingSafetyGateState.Cooldown)
+            // Check stabilization cooldown. A health probe is only evidence for the
+            // cooldown that launched it, never for a newer manual outcome.
+            DateTime? probedCooldownUntil;
+            lock (_stateLock)
             {
-                if (_cooldownUntil.HasValue && DateTime.UtcNow < _cooldownUntil.Value)
+                probedCooldownUntil = _cooldownUntil;
+                if (_safetyGate.State == RoutingSafetyGateState.Cooldown &&
+                    _cooldownUntil.HasValue && DateTime.UtcNow < _cooldownUntil.Value)
                 {
-                    lock (_stateLock)
-                    {
-                        _lastEvaluatedAt = nowIso;
-                        _lastDecisionReason = $"In cooldown until {_cooldownUntil.Value:O}.";
-                    }
+                    _lastEvaluatedAt = nowIso;
+                    _lastDecisionReason = $"In cooldown until {_cooldownUntil.Value:O}.";
                     return new SelectionResult(false, $"In cooldown until {_cooldownUntil.Value:O}.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
                 }
+            }
 
+            if (_safetyGate.State == RoutingSafetyGateState.Cooldown)
+            {
+                string? probedActiveId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
                 // Cooldown timer elapsed: check telemetry health before returning to IDLE
                 var probeStatus = await _adapter.GetStatusAsync(cancellationToken).ConfigureAwait(false);
-                if (probeStatus.Connected && probeStatus.Status != "DEGRADED" && probeStatus.Status != "ERROR")
+                string cooldownResource = _sessionVault.GetVaultPath() + ".switch";
+                var cooldownLock = PathLockRegistry.Get(cooldownResource);
+                await cooldownLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
                 {
-                    _safetyGate.Transition(RoutingSafetyGateState.Idle, "Cooldown elapsed; returning to monitoring.");
-                    _cooldownUntil = null;
-                }
-                else
-                {
+                    await using var lease = await CrossProcessFileLease.AcquireAsync(cooldownResource, cancellationToken)
+                        .ConfigureAwait(false);
+                    string? activeAfterProbe = await _accountStore.GetActiveAccountIdAsync(cancellationToken)
+                        .ConfigureAwait(false);
                     lock (_stateLock)
                     {
-                        _lastEvaluatedAt = nowIso;
-                        _lastDecisionReason = "Cooldown elapsed but telemetry remains unavailable.";
+                        if (!IsEvaluationCurrentLocked(planEpoch) ||
+                            _safetyGate.State != RoutingSafetyGateState.Cooldown ||
+                            _cooldownUntil != probedCooldownUntil ||
+                            !string.Equals(activeAfterProbe, probedActiveId, StringComparison.Ordinal))
+                            return new SelectionResult(false, "Cooldown probe was superseded.", _lastActiveAccountId,
+                                null, null, Array.Empty<CandidateEvaluation>());
+
+                        if (probeStatus.Connected && probeStatus.Status is not ("DEGRADED" or "OFFLINE" or "ERROR"))
+                        {
+                            _safetyGate.Transition(RoutingSafetyGateState.Idle, "Cooldown elapsed; returning to monitoring.");
+                            _cooldownUntil = null;
+                        }
+                        else
+                        {
+                            _lastEvaluatedAt = nowIso;
+                            _lastDecisionReason = "Cooldown elapsed but telemetry remains unavailable.";
+                            return new SelectionResult(false, "Cooldown elapsed but telemetry remains unavailable.",
+                                _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                        }
                     }
-                    return new SelectionResult(false, "Cooldown elapsed but telemetry remains unavailable.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                }
+                finally
+                {
+                    cooldownLock.Release();
                 }
             }
 
@@ -455,17 +483,16 @@ public class NativeAutoRouter : INativeAutoRouter
             var ag2Status = await _adapter.GetStatusAsync(cancellationToken).ConfigureAwait(false);
             if (!ag2Status.Connected || ag2Status.Status is "DEGRADED" or "OFFLINE" or "ERROR")
             {
-                if (_safetyGate.State == RoutingSafetyGateState.WaitingForIdle)
-                {
-                    _safetyGate.Reset("Antigravity offline or disconnected; pending switch cancelled.");
-                }
-
                 lock (_stateLock)
                 {
+                    if (!IsEvaluationCurrentLocked(planEpoch))
+                        return new SelectionResult(false, "Status observation was superseded.",
+                            _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                    if (_safetyGate.State == RoutingSafetyGateState.WaitingForIdle)
+                        _safetyGate.Reset("Antigravity offline or disconnected; pending switch cancelled.");
                     _lastEvaluatedAt = nowIso;
                     _lastDecisionReason = ag2Status.Message ?? "Antigravity offline or not detected.";
                 }
-
                 return new SelectionResult(false, ag2Status.Message ?? "Antigravity offline or not detected.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
             }
 
@@ -485,13 +512,13 @@ public class NativeAutoRouter : INativeAutoRouter
                 ? await _accountStore.GetAccountAsync(activeAccountId, cancellationToken).ConfigureAwait(false)
                 : null;
 
-            lock (_stateLock)
-            {
-                _lastActiveAccountId = activeAccountId;
-                _lastActiveAccountEmail = activeAccount?.Email;
-            }
-
-            var quotaSnapshot = await _adapter.GetQuotaAsync(cancellationToken).ConfigureAwait(false);
+            var liveBeforeQuota = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
+            if (!IdentityMatches(activeAccount, liveBeforeQuota))
+                return RejectUnprovenActiveIdentity(nowIso, planEpoch);
+            var observation = await _adapter.GetAccountQuotaObservationAsync(cancellationToken).ConfigureAwait(false);
+            if (!IdentityMatches(activeAccount, observation.Account))
+                return RejectUnprovenActiveIdentity(nowIso, planEpoch);
+            var quotaSnapshot = observation.Quota;
 
             // Calculate current account usable quota fraction (weakest-link across models)
             double? currentQuotaFraction = null;
@@ -525,12 +552,20 @@ public class NativeAutoRouter : INativeAutoRouter
                 await using var lease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken)
                     .ConfigureAwait(false);
                 var activeAfterQuota = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+                var activeMetadataAfterQuota = activeAfterQuota == null ? null :
+                    await _accountStore.GetAccountAsync(activeAfterQuota, cancellationToken).ConfigureAwait(false);
+                var liveAfterQuota = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
                 lock (_stateLock)
                 {
                     if (_manualSwitchEpoch != planEpoch || _manualSwitchPending ||
                         !string.Equals(activeAfterQuota, activeAccountId, StringComparison.Ordinal))
                         return new SelectionResult(false, "Active account changed during quota observation.",
                             activeAfterQuota, null, null, Array.Empty<CandidateEvaluation>());
+                    if (!IdentityMatches(activeMetadataAfterQuota, liveAfterQuota) ||
+                        !string.Equals(activeAccount?.Email, activeMetadataAfterQuota?.Email, StringComparison.OrdinalIgnoreCase))
+                        return RejectUnprovenActiveIdentityLocked(nowIso);
+                    _lastActiveAccountId = activeAccountId;
+                    _lastActiveAccountEmail = activeAccount?.Email;
                     if (activeAccountId != null)
                     {
                         if (currentQuotaFraction.HasValue && double.IsFinite(currentQuotaFraction.Value))
@@ -584,84 +619,70 @@ public class NativeAutoRouter : INativeAutoRouter
                 relevantModelKeys
             );
 
+            if (BeforeGatePublicationAsync is { } beforeGatePublication)
+                await beforeGatePublication().ConfigureAwait(false);
+
+            // Publish the plan and gate progression under the same owner as manual
+            // start/completion. A stale selection cannot create a pending switch.
+            bool autoSwitchEnabled;
             lock (_stateLock)
             {
-                if (_manualSwitchEpoch != planEpoch || _manualSwitchPending || _activeManualSwitches.Count > 0)
+                if (!IsEvaluationCurrentLocked(planEpoch))
                     return new SelectionResult(false, "Manual switch superseded evaluation.", _lastActiveAccountId,
                         null, null, Array.Empty<CandidateEvaluation>());
+                autoSwitchEnabled = _config.AutoSwitchEnabled;
                 _lastEvaluatedAt = nowIso;
                 _lastDecisionReason = selection.Reason;
+                if (selection.ShouldSwitch && selection.BestCandidate != null)
+                {
+                    if (_safetyGate.State == RoutingSafetyGateState.Idle)
+                        _safetyGate.Transition(RoutingSafetyGateState.LowQuotaDetected,
+                            selection.Reason, selection.BestCandidate.Account.Id);
+                    if (autoSwitchEnabled && _safetyGate.State == RoutingSafetyGateState.LowQuotaDetected)
+                        _safetyGate.Transition(RoutingSafetyGateState.SwitchPending,
+                            $"Auto-switch queued for candidate {selection.BestCandidate.Account.Email}",
+                            selection.BestCandidate.Account.Id);
+                }
+                else if (_safetyGate.State is RoutingSafetyGateState.WaitingForIdle or
+                         RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.LowQuotaDetected)
+                    _safetyGate.Reset("Quota conditions normalized or no candidates eligible; returning to IDLE.");
             }
 
-            // State Machine Progression
-            if (selection.ShouldSwitch && selection.BestCandidate != null)
+            if (selection.ShouldSwitch && selection.BestCandidate != null && autoSwitchEnabled)
             {
-                if (_safetyGate.State == RoutingSafetyGateState.Idle)
+                var activity = await _adapter.GetActivityStateAsync(cancellationToken).ConfigureAwait(false);
+                var assessment = _safetyGate.AssessActivity(activity);
+                bool execute = false;
+                lock (_stateLock)
                 {
-                    _safetyGate.Transition(
-                        RoutingSafetyGateState.LowQuotaDetected,
-                        selection.Reason,
-                        selection.BestCandidate.Account.Id
-                    );
-                }
-
-                if (configSnapshot.AutoSwitchEnabled)
-                {
-                    if (_safetyGate.State == RoutingSafetyGateState.LowQuotaDetected)
-                    {
-                        _safetyGate.Transition(
-                            RoutingSafetyGateState.SwitchPending,
-                            $"Auto-switch queued for candidate {selection.BestCandidate.Account.Email}",
-                            selection.BestCandidate.Account.Id
-                        );
-                    }
-
-                    var activity = await _adapter.GetActivityStateAsync(cancellationToken).ConfigureAwait(false);
-                    var assessment = _safetyGate.AssessActivity(activity);
+                    if (!IsAutomaticPlanCurrentLocked(planEpoch))
+                        return new SelectionResult(false, "Manual switch superseded activity assessment.",
+                            _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
 
                     if (!assessment.CanProceed)
                     {
                         if (_safetyGate.State == RoutingSafetyGateState.SwitchPending)
-                        {
-                            _safetyGate.Transition(
-                                RoutingSafetyGateState.WaitingForIdle,
-                                assessment.Reason,
-                                selection.BestCandidate.Account.Id
-                            );
-                        }
-                        else if (_safetyGate.State == RoutingSafetyGateState.WaitingForIdle)
-                        {
-                            if (!string.Equals(_safetyGate.TargetAccountId, selection.BestCandidate.Account.Id, StringComparison.Ordinal))
-                            {
-                                _safetyGate.Transition(
-                                    RoutingSafetyGateState.WaitingForIdle,
-                                    $"Target updated to {selection.BestCandidate.Account.Email}",
-                                    selection.BestCandidate.Account.Id
-                                );
-                            }
-                        }
+                            _safetyGate.Transition(RoutingSafetyGateState.WaitingForIdle,
+                                assessment.Reason, selection.BestCandidate.Account.Id);
+                        else if (_safetyGate.State == RoutingSafetyGateState.WaitingForIdle &&
+                                 !string.Equals(_safetyGate.TargetAccountId,
+                                     selection.BestCandidate.Account.Id, StringComparison.Ordinal))
+                            _safetyGate.Transition(RoutingSafetyGateState.WaitingForIdle,
+                                $"Target updated to {selection.BestCandidate.Account.Email}",
+                                selection.BestCandidate.Account.Id);
                     }
-                    else
+                    else if (_safetyGate.State is RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.WaitingForIdle)
                     {
-                        // Confirmed IDLE!
-                        if (_safetyGate.State is RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.WaitingForIdle)
-                        {
-                            _safetyGate.Transition(
-                                RoutingSafetyGateState.SwitchInProgress,
-                                $"Antigravity 2 is confirmed IDLE. Executing automatic switch to {selection.BestCandidate.Account.Email}.",
-                                selection.BestCandidate.Account.Id
-                            );
-
-                            await ExecuteSwitchAsync(selection.BestCandidate.Account.Id, activeAccountId, planEpoch, cancellationToken).ConfigureAwait(false);
-                        }
+                        _safetyGate.Transition(RoutingSafetyGateState.SwitchInProgress,
+                            $"Antigravity 2 is confirmed IDLE. Executing automatic switch to {selection.BestCandidate.Account.Email}.",
+                            selection.BestCandidate.Account.Id);
+                        execute = true;
                     }
                 }
-            }
-            else
-            {
-                if (_safetyGate.State is RoutingSafetyGateState.WaitingForIdle or RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.LowQuotaDetected)
+                if (execute)
                 {
-                    _safetyGate.Reset("Quota conditions normalized or no candidates eligible; returning to IDLE.");
+                    await ExecuteSwitchAsync(selection.BestCandidate.Account.Id, activeAccountId, planEpoch,
+                        cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -676,14 +697,65 @@ public class NativeAutoRouter : INativeAutoRouter
     private bool IsAutomaticPlanCurrent(long epoch)
     {
         lock (_stateLock)
-            return !_manualSwitchPending && _activeManualSwitches.Count == 0 && _manualSwitchEpoch == epoch && _config.AutoSwitchEnabled;
+            return IsAutomaticPlanCurrentLocked(epoch);
+    }
+
+    private bool IsEvaluationCurrentLocked(long epoch) =>
+        !_manualSwitchPending && _activeManualSwitches.Count == 0 &&
+        _manualSwitchEpoch == epoch &&
+        _safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired;
+
+    private bool IsAutomaticPlanCurrentLocked(long epoch) =>
+        IsEvaluationCurrentLocked(epoch) && _config.AutoSwitchEnabled;
+
+    private static bool IdentityMatches(AccountMetadata? account, AccountIdentityDto? live) =>
+        account != null && !string.IsNullOrWhiteSpace(account.Email) &&
+        !string.IsNullOrWhiteSpace(live?.Email) &&
+        string.Equals(account.Email.Trim(), live.Email.Trim(), StringComparison.OrdinalIgnoreCase);
+
+    private SelectionResult RejectUnprovenActiveIdentity(string nowIso, long planEpoch)
+    {
+        lock (_stateLock)
+        {
+            if (!IsEvaluationCurrentLocked(planEpoch))
+                return new SelectionResult(false, "Manual switch superseded identity observation.",
+                    _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+            return RejectUnprovenActiveIdentityLocked(nowIso);
+        }
+    }
+
+    private SelectionResult RejectUnprovenActiveIdentityLocked(string nowIso)
+    {
+        const string reason = "Live identity does not match the active account metadata; routing is paused.";
+        if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
+        {
+            _lastActiveAccountId = null;
+            _lastActiveAccountEmail = null;
+            _lastEvaluatedAt = nowIso;
+            _lastDecisionReason = reason;
+            if (_safetyGate.State is RoutingSafetyGateState.SwitchPending or
+                RoutingSafetyGateState.WaitingForIdle or RoutingSafetyGateState.LowQuotaDetected)
+                _safetyGate.Reset(reason);
+        }
+        return new SelectionResult(false, reason, null, null, null,
+            Array.Empty<CandidateEvaluation>());
     }
 
     private async Task ExecuteSwitchAsync(
         string targetAccountId, string? expectedActiveAccountId, long planEpoch,
         CancellationToken cancellationToken)
     {
-        if (!IsAutomaticPlanCurrent(planEpoch)) return;
+        if (!IsAutomaticPlanCurrent(planEpoch))
+        {
+            lock (_stateLock)
+            {
+                if (!_manualSwitchPending && _activeManualSwitches.Count == 0 &&
+                    _safetyGate.State == RoutingSafetyGateState.SwitchInProgress &&
+                    _switchCoordinator.GetStatus().ActiveTransactionId == null)
+                    _safetyGate.Reset("Stale automatic plan rejected before switch admission.");
+            }
+            return;
+        }
         NativeSwitchResult switchResult;
         try
         {

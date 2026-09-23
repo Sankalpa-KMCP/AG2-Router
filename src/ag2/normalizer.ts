@@ -163,23 +163,25 @@ export function normalizeQuotaSnapshot(raw?: RawUserStatusResponse | null): Quot
  *
  * Invariant:
  * - runningTrajectories > 0 => BUSY
- * - valid response with runningTrajectories === 0 => IDLE
+ * - only an explicit empty collection or known inactive statuses => IDLE
  */
 export function normalizeActivitySnapshot(raw?: RawTrajectoriesResponse | null): ActivitySnapshot {
   if (!raw || !raw.trajectorySummaries || typeof raw.trajectorySummaries !== 'object') {
     return {
-      state: 'IDLE',
+      state: 'UNKNOWN',
       totalTrajectories: 0,
       runningTrajectories: 0,
       timestamp: new Date().toISOString()
     };
   }
 
-  const entries = Object.values(raw.trajectorySummaries).filter((t) => Boolean(t));
+  const entries = Object.values(raw.trajectorySummaries);
   const totalTrajectories = entries.length;
-  const runningTrajectories = entries.filter((t) => t.status === 'CASCADE_RUN_STATUS_RUNNING').length;
+  const runningTrajectories = entries.filter((t) => t?.status === 'CASCADE_RUN_STATUS_RUNNING').length;
 
-  const state: TrajectoryRunState = runningTrajectories > 0 ? 'BUSY' : 'IDLE';
+  const allKnownInactive = entries.every((t) =>
+    t?.status === 'CASCADE_RUN_STATUS_IDLE' || t?.status === 'CASCADE_RUN_STATUS_DONE');
+  const state: TrajectoryRunState = runningTrajectories > 0 ? 'BUSY' : allKnownInactive ? 'IDLE' : 'UNKNOWN';
 
   return {
     state,

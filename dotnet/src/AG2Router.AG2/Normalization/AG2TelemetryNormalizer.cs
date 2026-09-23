@@ -110,7 +110,17 @@ public static class AG2TelemetryNormalizer
 
     public static ActivityStatusDto NormalizeActivitySnapshot(RawTrajectoriesResponse? raw)
     {
-        if (raw?.TrajectorySummaries == null || raw.TrajectorySummaries.Count == 0)
+        if (raw?.TrajectorySummaries == null)
+        {
+            return new ActivityStatusDto(
+                State: "UNKNOWN",
+                TotalTrajectories: 0,
+                RunningTrajectories: 0,
+                Timestamp: DateTime.UtcNow.ToString("o")
+            );
+        }
+
+        if (raw.TrajectorySummaries.Count == 0)
         {
             return new ActivityStatusDto(
                 State: "IDLE",
@@ -120,12 +130,15 @@ public static class AG2TelemetryNormalizer
             );
         }
 
-        var validEntries = raw.TrajectorySummaries.Values.Where(t => t != null).ToList();
-        int total = validEntries.Count;
-        int running = validEntries.Count(t => string.Equals(t.Status, "CASCADE_RUN_STATUS_RUNNING", StringComparison.OrdinalIgnoreCase));
+        var entries = raw.TrajectorySummaries.Values.ToList();
+        int total = entries.Count;
+        int running = entries.Count(t => string.Equals(t?.Status, "CASCADE_RUN_STATUS_RUNNING", StringComparison.OrdinalIgnoreCase));
+        bool allKnownInactive = entries.All(t =>
+            string.Equals(t?.Status, "CASCADE_RUN_STATUS_IDLE", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(t?.Status, "CASCADE_RUN_STATUS_DONE", StringComparison.OrdinalIgnoreCase));
 
         return new ActivityStatusDto(
-            State: running > 0 ? "BUSY" : "IDLE",
+            State: running > 0 ? "BUSY" : allKnownInactive ? "IDLE" : "UNKNOWN",
             TotalTrajectories: total,
             RunningTrajectories: running,
             Timestamp: DateTime.UtcNow.ToString("o")

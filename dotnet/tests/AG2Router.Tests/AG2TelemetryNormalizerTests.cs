@@ -180,7 +180,10 @@ public class AG2TelemetryNormalizerTests
             }
         };
 
-        var emptyTrajectories = new RawTrajectoriesResponse();
+        var emptyTrajectories = new RawTrajectoriesResponse
+        {
+            TrajectorySummaries = new Dictionary<string, RawTrajectorySummary>()
+        };
 
         var busySnap = AG2TelemetryNormalizer.NormalizeActivitySnapshot(runningTrajectories);
         Assert.Equal("BUSY", busySnap.State);
@@ -196,6 +199,33 @@ public class AG2TelemetryNormalizerTests
         Assert.Equal("IDLE", emptySnap.State);
         Assert.Equal(0, emptySnap.TotalTrajectories);
         Assert.Equal(0, emptySnap.RunningTrajectories);
+    }
+
+    [Fact]
+    public void NormalizeActivitySnapshot_MissingPayloadOrSummariesRemainUnknown()
+    {
+        Assert.Equal("UNKNOWN", AG2TelemetryNormalizer.NormalizeActivitySnapshot(null).State);
+        Assert.Equal("UNKNOWN", AG2TelemetryNormalizer.NormalizeActivitySnapshot(new RawTrajectoriesResponse()).State);
+    }
+
+    [Fact]
+    public void NormalizeActivitySnapshot_UnknownEntryCannotProveIdleButRunningEvidenceWins()
+    {
+        var unknown = new RawTrajectoriesResponse
+        {
+            TrajectorySummaries = new Dictionary<string, RawTrajectorySummary>
+            {
+                ["t1"] = new() { Status = "CASCADE_RUN_STATUS_UNRECOGNIZED" },
+                ["t2"] = new() { Status = "CASCADE_RUN_STATUS_IDLE" }
+            }
+        };
+        Assert.Equal("UNKNOWN", AG2TelemetryNormalizer.NormalizeActivitySnapshot(unknown).State);
+
+        unknown.TrajectorySummaries!["t1"] = new RawTrajectorySummary { Status = "CASCADE_RUN_STATUS_RUNNING" };
+        Assert.Equal("BUSY", AG2TelemetryNormalizer.NormalizeActivitySnapshot(unknown).State);
+
+        unknown.TrajectorySummaries["t1"] = new RawTrajectorySummary { Status = "CASCADE_RUN_STATUS_DONE" };
+        Assert.Equal("IDLE", AG2TelemetryNormalizer.NormalizeActivitySnapshot(unknown).State);
     }
 
     [Fact]

@@ -489,16 +489,21 @@ describe('AG2 Normalizer', () => {
       assert.equal(activity.runningTrajectories, 0);
     });
 
-    it('should classify as IDLE when summaries are empty or null', () => {
+    it('should require explicit activity evidence before declaring IDLE', () => {
       const activityEmpty = normalizeActivitySnapshot({ trajectorySummaries: {} });
       assert.equal(activityEmpty.state, 'IDLE');
       assert.equal(activityEmpty.totalTrajectories, 0);
       assert.equal(activityEmpty.runningTrajectories, 0);
 
       const activityNull = normalizeActivitySnapshot(null);
-      assert.equal(activityNull.state, 'IDLE');
+      assert.equal(activityNull.state, 'UNKNOWN');
       assert.equal(activityNull.totalTrajectories, 0);
       assert.equal(activityNull.runningTrajectories, 0);
+
+      assert.equal(normalizeActivitySnapshot({}).state, 'UNKNOWN');
+      assert.equal(normalizeActivitySnapshot({ trajectorySummaries: {
+        'traj-1': { status: 'CASCADE_RUN_STATUS_UNRECOGNIZED' }
+      } }).state, 'UNKNOWN');
     });
   });
 });

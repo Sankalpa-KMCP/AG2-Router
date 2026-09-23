@@ -67,6 +67,49 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         Assert.Equal(0, _credentials.WriteCount);
     }
 
+    [Fact]
+    public async Task StoredSourceAndLiveIdentityMismatchFailsBeforeMutation()
+    {
+        await SeedAccountsAsync();
+        _adapter.Identity = new AccountIdentityDto("external@example.com");
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public async Task SourceIdentityRotationBeforeMutationFailsClosed()
+    {
+        await SeedAccountsAsync();
+        int reads = 0;
+        _adapter.IdentityBehavior = _ => Task.FromResult<AccountIdentityDto?>(
+            new AccountIdentityDto(Interlocked.Increment(ref reads) == 1
+                ? "source@example.com" : "external@example.com"));
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+    }
+
+    [Fact]
+    public async Task MissingActivityEvidenceFailsBeforeMutation()
+    {
+        await SeedAccountsAsync();
+        _adapter.Activity = AG2Router.AG2.Normalization.AG2TelemetryNormalizer.NormalizeActivitySnapshot(null);
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+    }
+
     [Theory]
     [InlineData("BUSY", 1, SwitchResultCodes.Ag2Busy)]
     [InlineData("UNKNOWN", 0, SwitchResultCodes.TelemetryUnavailable)]
@@ -294,9 +337,9 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         _adapter.IdentityBehavior = async ct =>
         {
             int call = Interlocked.Increment(ref calls);
-            if (call == 1)
+            if (call <= 2)
                 return new AccountIdentityDto("source@example.com");
-            if (call > 2) return new AccountIdentityDto("source@example.com");
+            if (call > 3) return new AccountIdentityDto("source@example.com");
             identityEntered.TrySetResult();
             await releaseIdentity.Task.WaitAsync(ct);
             return new AccountIdentityDto("target@example.com");
@@ -540,6 +583,8 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             IdentityBehavior?.Invoke(cancellationToken) ?? Task.FromResult(Identity);
         public Task<QuotaSnapshotDto?> GetQuotaAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult<QuotaSnapshotDto?>(null);
+        public Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new AccountQuotaObservation(Identity, null));
         public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(Activity);
     }

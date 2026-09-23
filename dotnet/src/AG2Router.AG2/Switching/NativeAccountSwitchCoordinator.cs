@@ -173,8 +173,13 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             if (planIsCurrent != null &&
                 (!planIsCurrent() || !string.Equals(previousAccountId, expectedActiveAccountId, StringComparison.Ordinal)))
                 throw new SwitchRejectedException(SwitchResultCodes.Cancelled, "Automatic switch plan became stale.");
+            var sourceAccount = previousAccountId == null ? null :
+                await _accountStore.GetAccountAsync(previousAccountId, cancellationToken).ConfigureAwait(false);
             var currentIdentity = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
             previousEmail = currentIdentity?.Email;
+            if (!SourceIdentityMatches(sourceAccount, currentIdentity))
+                throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
+                    "Live identity does not match the active account metadata.");
             if (previousAccountId == target.Id ||
                 string.Equals(previousEmail, target.Email, StringComparison.OrdinalIgnoreCase))
             {
@@ -249,6 +254,11 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     SwitchResultCodes.TelemetryUnavailable,
                     "Antigravity activity telemetry became unknown before mutation.");
             }
+
+            var finalIdentity = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
+            if (!SourceIdentityMatches(sourceAccount, finalIdentity))
+                throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
+                    "Live identity changed before credential mutation.");
 
             if (planIsCurrent != null &&
                 (!planIsCurrent() || !string.Equals(
@@ -563,6 +573,11 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     {
         if (entry?.Blob is { Length: > 0 }) CryptographicOperations.ZeroMemory(entry.Blob);
     }
+
+    private static bool SourceIdentityMatches(AccountMetadata? source, AccountIdentityDto? live) =>
+        source != null && !string.IsNullOrWhiteSpace(source.Email) &&
+        !string.IsNullOrWhiteSpace(live?.Email) &&
+        string.Equals(source.Email.Trim(), live.Email.Trim(), StringComparison.OrdinalIgnoreCase);
 
     private static string SafeFailure(Exception error) =>
         error is OperationCanceledException

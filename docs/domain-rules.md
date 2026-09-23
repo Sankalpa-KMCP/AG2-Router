@@ -27,6 +27,7 @@ CURRENT IMPLEMENTATION:
 - AG2TelemetryNormalizer clamps observed numeric fractions and preserves prompt and Flow credit records separately.
 - AG2TelemetryNormalizer and the TypeScript reference normalizer retain missing and non-finite model fractions as unknown. CanonicalizeModelQuotas preserves each source row because model/tier, presentation labels, and even equal reset instants do not prove shared capacity. No proximity tolerance or prefix match is used.
 - NativeAutoRouter derives account-level switching pressure from the weakest observed model. Any observed exhausted model makes that account-level value zero; unknown models never become 100% by default. Unknown current-account quota does not authorize automatic mutation.
+- Activity telemetry is IDLE only when an explicitly observed trajectory collection is empty or every observed status is a known inactive status. Missing payloads, missing collections, and unrecognized statuses remain UNKNOWN; RUNNING evidence remains BUSY.
 - CandidateSelector requires known capacity for every pool matching a relevant model key; one healthy row cannot hide another matching unknown or exhausted row.
 - The dashboard renders missing quota as UNKNOWN, distinct from an observed zero/exhausted quota.
 
@@ -42,6 +43,7 @@ INTENDED INVARIANT:
 - A switch is complete only after the restarted, verified process reports the target identity and the metadata commit succeeds.
 - Rollback must not overwrite a credential, vault record, or active selection that changed after the transaction snapshot.
 - Ambiguous or stale process identity fails closed before mutation.
+- The live account email must match the persisted active account before live quota is attributed to that account or a switch is admitted. A mismatch is not an implicit account transition.
 
 Transaction mechanisms and ownership are defined in [persistence-and-concurrency.md](persistence-and-concurrency.md). Threat boundaries are defined in [security-and-trust-model.md](security-and-trust-model.md).
 

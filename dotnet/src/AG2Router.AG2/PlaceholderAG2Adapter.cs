@@ -29,6 +29,11 @@ public class PlaceholderAG2Adapter : IAG2Adapter
         return Task.FromResult<QuotaSnapshotDto?>(null);
     }
 
+    public Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(new AccountQuotaObservation(null, null));
+    }
+
     public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default)
     {
         return Task.FromResult(new ActivityStatusDto(
