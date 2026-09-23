@@ -196,8 +196,7 @@ public sealed class LoopbackRouterApiTests : IAsyncDisposable
         }
 
         public ManualSwitchToken NotifyManualSwitchStarted(string targetAccountId) => new(1);
-        public void NotifyManualSwitchCompleted(ManualSwitchToken token, NativeSwitchResult result) { }
-        public void NotifyManualSwitchCompleted(NativeSwitchResult result) { }
+        public Task NotifyManualSwitchCompletedAsync(ManualSwitchToken token, NativeSwitchResult result) => Task.CompletedTask;
 
         public void Start() { }
         public Task StopAsync() => Task.CompletedTask;

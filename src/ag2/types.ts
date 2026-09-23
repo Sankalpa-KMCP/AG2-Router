@@ -85,9 +85,9 @@ export interface CanonicalModelQuotaInfo {
  * Prompt and flow pools MUST NOT be combined or summed.
  */
 export interface CreditPoolInfo {
-  readonly availableCredits: number;
-  readonly monthlyCredits: number;
-  readonly usedCredits: number;
+  readonly availableCredits: number | null;
+  readonly monthlyCredits: number | null;
+  readonly usedCredits: number | null;
 }
 
 /**

@@ -16,6 +16,7 @@ INTENDED INVARIANT:
 - A numeric remaining fraction is valid only when supported by upstream evidence and normalized to the range 0.0 through 1.0.
 - Exhausted, unknown, unavailable, and stale are distinct states even if a conservative policy makes more than one state ineligible.
 - Prompt credits and Flow credits are separate pools. Do not add them or turn them into one percentage.
+- Missing or non-finite credit fields remain unknown, not observed zero; used credits require both monthly and available values.
 - Per-model quotas remain separate unless there is evidence that variants share a quota bucket.
 - Incompatible reset windows remain distinct unless upstream identity or other evidence proves a shared bucket.
 - Percentages from different accounts are relative measures, not additive absolute capacity. Do not present a cross-account sum as total available quota.

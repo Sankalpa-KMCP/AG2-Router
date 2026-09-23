@@ -130,20 +130,20 @@ export function normalizeQuotaSnapshot(raw?: RawUserStatusResponse | null): Quot
   if (u.planStatus) {
     const planInfo = u.planStatus.planInfo;
 
-    const monthlyPrompt = typeof planInfo?.monthlyPromptCredits === 'number' ? planInfo.monthlyPromptCredits : 0;
-    const availablePrompt = typeof u.planStatus.availablePromptCredits === 'number' ? u.planStatus.availablePromptCredits : 0;
+    const monthlyPrompt = Number.isFinite(planInfo?.monthlyPromptCredits) ? planInfo!.monthlyPromptCredits! : null;
+    const availablePrompt = Number.isFinite(u.planStatus.availablePromptCredits) ? u.planStatus.availablePromptCredits! : null;
     promptCredits = {
       availableCredits: availablePrompt,
       monthlyCredits: monthlyPrompt,
-      usedCredits: Math.max(0, monthlyPrompt - availablePrompt)
+      usedCredits: monthlyPrompt === null || availablePrompt === null ? null : Math.max(0, monthlyPrompt - availablePrompt)
     };
 
-    const monthlyFlow = typeof planInfo?.monthlyFlowCredits === 'number' ? planInfo.monthlyFlowCredits : 0;
-    const availableFlow = typeof u.planStatus.availableFlowCredits === 'number' ? u.planStatus.availableFlowCredits : 0;
+    const monthlyFlow = Number.isFinite(planInfo?.monthlyFlowCredits) ? planInfo!.monthlyFlowCredits! : null;
+    const availableFlow = Number.isFinite(u.planStatus.availableFlowCredits) ? u.planStatus.availableFlowCredits! : null;
     flowCredits = {
       availableCredits: availableFlow,
       monthlyCredits: monthlyFlow,
-      usedCredits: Math.max(0, monthlyFlow - availableFlow)
+      usedCredits: monthlyFlow === null || availableFlow === null ? null : Math.max(0, monthlyFlow - availableFlow)
     };
   }
 

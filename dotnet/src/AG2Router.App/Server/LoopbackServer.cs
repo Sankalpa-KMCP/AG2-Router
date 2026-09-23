@@ -464,23 +464,13 @@ public class LoopbackServer : IAsyncDisposable
                     DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O"));
 
                 if (manualSwitchToken.HasValue)
-                {
-                    autoRouter?.NotifyManualSwitchCompleted(manualSwitchToken.Value, failureResult);
-                }
-                else
-                {
-                    autoRouter?.NotifyManualSwitchCompleted(failureResult);
-                }
+                    await autoRouter!.NotifyManualSwitchCompletedAsync(manualSwitchToken.Value, failureResult);
                 return Results.Json(new { error = "Switch request failed; inspect switching status before retrying." },
                     statusCode: StatusCodes.Status500InternalServerError);
             }
             if (manualSwitchToken.HasValue)
             {
-                autoRouter?.NotifyManualSwitchCompleted(manualSwitchToken.Value, result);
-            }
-            else
-            {
-                autoRouter?.NotifyManualSwitchCompleted(result);
+                await autoRouter!.NotifyManualSwitchCompletedAsync(manualSwitchToken.Value, result);
             }
             result = result with
             {

@@ -8,6 +8,7 @@ import * as http from 'node:http';
 import * as path from 'node:path';
 import { InMemoryAccountStore } from '../src/accounts/account-store.js';
 import { AG2AdapterFoundation } from '../src/ag2/adapter.js';
+import { normalizeQuotaSnapshot, type RawUserStatusResponse } from '../src/ag2/normalizer.js';
 import { AppConfig } from '../src/config/config.js';
 import { QuotaRouter } from '../src/router/router.js';
 import { AppServer } from '../src/server/server.js';
@@ -667,6 +668,48 @@ describe('AppServer (Loopback HTTP & API)', () => {
       assert.deepEqual(quota.canonicalModels[0].modes, ['Standard', 'Thinking']);
       assert.equal(quota.promptCredits.availableCredits, 1000);
       assert.equal(quota.flowCredits.availableCredits, 200);
+    } finally {
+      await quotaServer.stop();
+    }
+  });
+
+  it('preserves missing, partial and observed-zero credits through GET /api/status', async () => {
+    let raw: RawUserStatusResponse = { userStatus: { planStatus: { planInfo: {} } } };
+    const normalizedAdapter: any = {
+      discover: async () => ({ isRunning: true, status: 'CONNECTED' }),
+      getCurrentAccount: async () => null,
+      getQuota: async () => normalizeQuotaSnapshot(raw),
+      getActivityState: async () => ({ state: 'IDLE', totalTrajectories: 0, runningTrajectories: 0, timestamp: '' })
+    };
+    const quotaServer = new AppServer({ ...testConfig, port: testPort + 5 }, accountStore, normalizedAdapter, router);
+    await quotaServer.start();
+    try {
+      async function readCredits() {
+        const body = await new Promise<string>((resolve, reject) => {
+          const req = http.get({ hostname: '127.0.0.1', port: testPort + 5, path: '/api/status' }, res => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => resolve(data));
+          });
+          req.on('error', reject);
+        });
+        return JSON.parse(body).telemetry.quota;
+      }
+
+      let quota = await readCredits();
+      assert.deepEqual(quota.promptCredits, { availableCredits: null, monthlyCredits: null, usedCredits: null });
+      assert.deepEqual(quota.flowCredits, { availableCredits: null, monthlyCredits: null, usedCredits: null });
+
+      raw = { userStatus: { planStatus: { availablePromptCredits: 7, planInfo: { monthlyFlowCredits: 20 } } } };
+      quota = await readCredits();
+      assert.deepEqual(quota.promptCredits, { availableCredits: 7, monthlyCredits: null, usedCredits: null });
+      assert.deepEqual(quota.flowCredits, { availableCredits: null, monthlyCredits: 20, usedCredits: null });
+
+      raw = { userStatus: { planStatus: { availablePromptCredits: 0, availableFlowCredits: 0,
+        planInfo: { monthlyPromptCredits: 0, monthlyFlowCredits: 10 } } } };
+      quota = await readCredits();
+      assert.deepEqual(quota.promptCredits, { availableCredits: 0, monthlyCredits: 0, usedCredits: 0 });
+      assert.deepEqual(quota.flowCredits, { availableCredits: 0, monthlyCredits: 10, usedCredits: 10 });
     } finally {
       await quotaServer.stop();
     }

@@ -11,6 +11,5 @@ public interface INativeAutoRouter : IRouterState, IAsyncDisposable
     RouterConfigDto UpdateConfig(RouterConfigDto updates);
     void ResetManualRecovery();
     ManualSwitchToken NotifyManualSwitchStarted(string targetAccountId);
-    void NotifyManualSwitchCompleted(ManualSwitchToken token, NativeSwitchResult result);
-    void NotifyManualSwitchCompleted(NativeSwitchResult result);
+    Task NotifyManualSwitchCompletedAsync(ManualSwitchToken token, NativeSwitchResult result);
 }

@@ -129,41 +129,78 @@ public class NativeAutoRouter : INativeAutoRouter
         }
     }
 
-    public void NotifyManualSwitchCompleted(ManualSwitchToken token, NativeSwitchResult result)
+    public async Task NotifyManualSwitchCompletedAsync(ManualSwitchToken token, NativeSwitchResult result)
     {
         ArgumentNullException.ThrowIfNull(result);
-        lock (_stateLock)
+        if (!result.Success)
         {
-            if (!_activeManualSwitches.Remove(token.Id))
+            lock (_stateLock)
             {
-                // Stale token or not an active owner
-                return;
+                if (!_activeManualSwitches.Remove(token.Id)) return;
+                _manualSwitchEpoch++;
+                _manualSwitchPending = _activeManualSwitches.Count > 0;
+                ApplyManualSwitchResult(result, _manualSwitchPending);
             }
+            return;
+        }
 
-            _manualSwitchEpoch++;
-            bool hasRemaining = _activeManualSwitches.Count > 0;
-            _manualSwitchPending = hasRemaining;
-
-            ApplyManualSwitchResult(result, hasRemaining);
+        // The coordinator releases this lease before the HTTP callback runs. A second
+        // manual transaction may have committed in that gap, so publish only the
+        // identity that is still authoritative while owning the same switch resource.
+        string resource = _sessionVault.GetVaultPath() + ".switch";
+        var switchLock = PathLockRegistry.Get(resource);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        bool lockHeld = false;
+        try
+        {
+            await switchLock.WaitAsync(deadline.Token).ConfigureAwait(false);
+            lockHeld = true;
+            await using var lease = await CrossProcessFileLease.AcquireAsync(resource, deadline.Token)
+                .ConfigureAwait(false);
+            string? activeId = await _accountStore.GetActiveAccountIdAsync(deadline.Token).ConfigureAwait(false);
+            AccountMetadata? activeAccount = activeId == null ? null :
+                await _accountStore.GetAccountAsync(activeId, deadline.Token).ConfigureAwait(false);
+            lock (_stateLock)
+            {
+                if (!_activeManualSwitches.Remove(token.Id)) return;
+                _manualSwitchEpoch++;
+                _manualSwitchPending = _activeManualSwitches.Count > 0;
+                if (!string.Equals(activeId, result.TargetAccountId, StringComparison.Ordinal))
+                {
+                    _lastActiveAccountId = activeId;
+                    _lastActiveAccountEmail = activeAccount?.Email;
+                    _lastDecisionReason = "Manual completion superseded by authoritative active identity.";
+                    return;
+                }
+                ApplyManualSwitchResult(result, _manualSwitchPending);
+            }
+        }
+        catch (Exception ex)
+        {
+            lock (_stateLock)
+            {
+                if (!_activeManualSwitches.Remove(token.Id)) return;
+                _manualSwitchEpoch++;
+                _manualSwitchPending = _activeManualSwitches.Count > 0;
+                RequireManualRecovery($"Manual completion ownership could not be verified: {AG2Security.RedactSensitiveText(ex.Message)}");
+            }
+        }
+        finally
+        {
+            if (lockHeld) switchLock.Release();
         }
     }
 
-    public void NotifyManualSwitchCompleted(NativeSwitchResult result)
+    private void RequireManualRecovery(string reason)
     {
-        ArgumentNullException.ThrowIfNull(result);
-        lock (_stateLock)
+        if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
         {
-            if (_activeManualSwitches.Count > 0)
-            {
-                long firstKey = _activeManualSwitches.Keys.First();
-                _activeManualSwitches.Remove(firstKey);
-            }
-            _manualSwitchEpoch++;
-            bool hasRemaining = _activeManualSwitches.Count > 0;
-            _manualSwitchPending = hasRemaining;
-
-            ApplyManualSwitchResult(result, hasRemaining);
+            if (_safetyGate.State != RoutingSafetyGateState.Idle)
+                _safetyGate.Reset("Switch outcome requires manual recovery.");
+            _safetyGate.Transition(RoutingSafetyGateState.ManualRecoveryRequired, reason);
         }
+        _config = _config with { AutoSwitchEnabled = false };
+        _lastDecisionReason = reason;
     }
 
     private void ApplyManualSwitchResult(NativeSwitchResult result, bool hasRemaining)
@@ -696,23 +733,13 @@ public class NativeAutoRouter : INativeAutoRouter
             // Manual completion and automatic terminal publication use the same state owner.
             lock (_stateLock)
             {
-            if (_lastSuccessfulManualEpoch > planEpoch) return;
-            if (_safetyGate.State == RoutingSafetyGateState.ManualRecoveryRequired) return;
-
             if (switchResult.ManualRecoveryRequired)
             {
-                if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
-                    _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed, $"Switch failed: {switchResult.Message}");
-                else if (_safetyGate.State != RoutingSafetyGateState.Idle &&
-                         _safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
-                    _safetyGate.Reset("Automatic switch failed; manual recovery required.");
-                if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
-                    _safetyGate.Transition(RoutingSafetyGateState.ManualRecoveryRequired,
-                        $"Manual recovery required: {switchResult.Message}");
-                _config = _config with { AutoSwitchEnabled = false };
-                _lastDecisionReason = $"Automatic switching halted: manual recovery required ({switchResult.Message}).";
+                RequireManualRecovery($"Automatic switching halted: manual recovery required ({switchResult.Message}).");
                 return;
             }
+            if (_lastSuccessfulManualEpoch > planEpoch) return;
+            if (_safetyGate.State == RoutingSafetyGateState.ManualRecoveryRequired) return;
 
             if (switchResult.Success)
             {

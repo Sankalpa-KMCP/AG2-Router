@@ -50,6 +50,34 @@ describe('AG2 Normalizer', () => {
   });
 
   describe('normalizeQuotaSnapshot', () => {
+    it('keeps missing, partial and non-finite credits unknown while preserving observed zero', () => {
+      const missing = normalizeQuotaSnapshot({ userStatus: { planStatus: { planInfo: {} } } });
+      assert.deepEqual(missing?.promptCredits,
+        { availableCredits: null, monthlyCredits: null, usedCredits: null });
+      assert.deepEqual(missing?.flowCredits,
+        { availableCredits: null, monthlyCredits: null, usedCredits: null });
+
+      const partial = normalizeQuotaSnapshot({ userStatus: { planStatus: {
+        availablePromptCredits: 7,
+        availableFlowCredits: Infinity,
+        planInfo: { monthlyFlowCredits: 20, monthlyPromptCredits: NaN }
+      } } });
+      assert.deepEqual(partial?.promptCredits,
+        { availableCredits: 7, monthlyCredits: null, usedCredits: null });
+      assert.deepEqual(partial?.flowCredits,
+        { availableCredits: null, monthlyCredits: 20, usedCredits: null });
+
+      const zero = normalizeQuotaSnapshot({ userStatus: { planStatus: {
+        availablePromptCredits: 0,
+        availableFlowCredits: 0,
+        planInfo: { monthlyPromptCredits: 0, monthlyFlowCredits: 10 }
+      } } });
+      assert.deepEqual(zero?.promptCredits,
+        { availableCredits: 0, monthlyCredits: 0, usedCredits: 0 });
+      assert.deepEqual(zero?.flowCredits,
+        { availableCredits: 0, monthlyCredits: 10, usedCredits: 10 });
+    });
+
     it('preserves absent and non-finite model capacity as unknown rather than 100%', () => {
       const values = [undefined, NaN, Infinity, -Infinity, 0, 0.42];
       const result = normalizeQuotaSnapshot({ userStatus: { cascadeModelConfigData: {
