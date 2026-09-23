@@ -12,6 +12,34 @@ public class MockTestEnvironment
 public class WebView2EnvironmentCoordinatorTests
 {
     [Fact]
+    public async Task NeverCompletingEnsureOperationExitsAtDeadline()
+    {
+        var never = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await Assert.ThrowsAsync<TimeoutException>(() => WebViewAttemptDeadline.RunAsync(
+            () => never.Task, TimeSpan.FromMilliseconds(25)).WaitAsync(TimeSpan.FromSeconds(2)));
+        never.TrySetResult();
+    }
+
+    [Fact]
+    public async Task NeverCompletingFactoryConsumesBoundedAttemptsAndReachesFailure()
+    {
+        int attempts = 0;
+        var coordinator = new WebView2EnvironmentCoordinatorCore<MockTestEnvironment>(
+            environmentFactory: _ => {
+                Interlocked.Increment(ref attempts);
+                return new TaskCompletionSource<MockTestEnvironment>().Task;
+            },
+            subscribeProcessExited: (_, _) => { },
+            maxRetries: 2,
+            creationTimeout: TimeSpan.FromMilliseconds(25),
+            delayFunc: (_, _) => Task.CompletedTask);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => coordinator.GetOrCreateEnvironmentAsync().WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.IsType<TimeoutException>(error.InnerException);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
     public async Task GetOrCreateEnvironment_FirstCall_CreatesEnvironment()
     {
         int factoryCalls = 0;

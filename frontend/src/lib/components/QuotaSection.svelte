@@ -53,8 +53,9 @@
       {#if hasCanonical && canonicalModels}
         {#each canonicalModels as model (model.canonicalKey)}
           {@const pct = formatQuotaFraction(model.remainingFraction)}
-          {@const isLow = pct <= lowThresholdPercent}
-          <div class="model-pool-card {model.isExhausted ? 'exhausted' : isLow ? 'warning' : 'healthy'}">
+          {@const isUnknown = pct === null && !model.isExhausted}
+          {@const isLow = pct !== null && pct <= lowThresholdPercent}
+          <div class="model-pool-card {model.isExhausted ? 'exhausted' : isUnknown ? 'unknown' : isLow ? 'warning' : 'healthy'}">
             <div class="model-pool-top">
               <div class="model-info">
                 <h3 class="model-label">{model.displayLabel}</h3>
@@ -64,13 +65,12 @@
                   {/each}
                 </div>
               </div>
-              <ProgressRing
-                percent={pct}
-                size={58}
-                strokeWidth={6}
-                isExhausted={model.isExhausted}
-                label={model.displayLabel}
-              />
+              {#if pct !== null}
+                <ProgressRing percent={pct} size={58} strokeWidth={6}
+                  isExhausted={model.isExhausted} label={model.displayLabel} />
+              {:else}
+                <span class="unknown-quota" aria-label="Quota unknown">--%</span>
+              {/if}
             </div>
 
             <div class="model-pool-bottom">
@@ -78,8 +78,8 @@
                 <span class="reset-icon" aria-hidden="true">⏱</span>
                 <span class="reset-text">{formatResetTime(model.resetTime)}</span>
               </div>
-              <span class="badge {model.isExhausted ? 'badge-danger' : isLow ? 'badge-warning' : 'badge-healthy'}">
-                {model.isExhausted ? 'EXHAUSTED' : isLow ? 'LOW QUOTA' : 'HEALTHY'}
+              <span class="badge {model.isExhausted ? 'badge-danger' : isUnknown ? 'badge-neutral' : isLow ? 'badge-warning' : 'badge-healthy'}">
+                {model.isExhausted ? 'EXHAUSTED' : isUnknown ? 'UNKNOWN' : isLow ? 'LOW QUOTA' : 'HEALTHY'}
               </span>
             </div>
           </div>
@@ -88,20 +88,20 @@
         <!-- Graceful fallback to raw models if canonical grouping is absent -->
         {#each rawModels as model, idx (model.modelOrTier + idx)}
           {@const pct = formatQuotaFraction(model.remainingFraction)}
-          {@const isLow = pct <= lowThresholdPercent}
-          <div class="model-pool-card {model.isExhausted ? 'exhausted' : isLow ? 'warning' : 'healthy'}">
+          {@const isUnknown = pct === null && !model.isExhausted}
+          {@const isLow = pct !== null && pct <= lowThresholdPercent}
+          <div class="model-pool-card {model.isExhausted ? 'exhausted' : isUnknown ? 'unknown' : isLow ? 'warning' : 'healthy'}">
             <div class="model-pool-top">
               <div class="model-info">
                 <h3 class="model-label">{model.label}</h3>
                 <span class="mode-pill">Direct Pool</span>
               </div>
-              <ProgressRing
-                percent={pct}
-                size={58}
-                strokeWidth={6}
-                isExhausted={model.isExhausted}
-                label={model.label}
-              />
+              {#if pct !== null}
+                <ProgressRing percent={pct} size={58} strokeWidth={6}
+                  isExhausted={model.isExhausted} label={model.label} />
+              {:else}
+                <span class="unknown-quota" aria-label="Quota unknown">--%</span>
+              {/if}
             </div>
 
             <div class="model-pool-bottom">
@@ -109,8 +109,8 @@
                 <span class="reset-icon" aria-hidden="true">⏱</span>
                 <span class="reset-text">{formatResetTime(model.resetTime)}</span>
               </div>
-              <span class="badge {model.isExhausted ? 'badge-danger' : isLow ? 'badge-warning' : 'badge-healthy'}">
-                {model.isExhausted ? 'EXHAUSTED' : isLow ? 'LOW QUOTA' : 'HEALTHY'}
+              <span class="badge {model.isExhausted ? 'badge-danger' : isUnknown ? 'badge-neutral' : isLow ? 'badge-warning' : 'badge-healthy'}">
+                {model.isExhausted ? 'EXHAUSTED' : isUnknown ? 'UNKNOWN' : isLow ? 'LOW QUOTA' : 'HEALTHY'}
               </span>
             </div>
           </div>

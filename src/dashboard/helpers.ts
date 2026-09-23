@@ -41,21 +41,21 @@ export function getAccountSubtitle(account?: AccountDisplayNameInput | null): st
  * Formats a fractional quota [0.0, 1.0] into a clean integer percentage [0, 100].
  * Clamps strictly to [0, 100].
  */
-export function formatQuotaFraction(fraction: number): number {
-  if (typeof fraction !== 'number' || isNaN(fraction)) return 0;
+export function formatQuotaFraction(fraction: number | null | undefined): number | null {
+  if (typeof fraction !== 'number' || !Number.isFinite(fraction)) return null;
   const clamped = Math.max(0, Math.min(1, fraction));
   return Math.round(clamped * 100);
 }
 
 export interface LowestQuotaSummary {
-  fraction: number;
-  percent: number;
+  fraction: number | null;
+  percent: number | null;
   label: string;
   isExhausted: boolean;
 }
 
 export interface ModelQuotaLike {
-  remainingFraction: number;
+  remainingFraction: number | null;
   isExhausted?: boolean;
   label?: string;
   displayLabel?: string;
@@ -71,12 +71,26 @@ export function deriveLowestModelQuota(
 ): LowestQuotaSummary | null {
   if (!models || models.length === 0) return null;
 
+  const exhausted = models.find(item => item.isExhausted ||
+    (typeof item.remainingFraction === 'number' && Number.isFinite(item.remainingFraction) && item.remainingFraction <= 0));
+  if (exhausted) {
+    const fraction = Number.isFinite(exhausted.remainingFraction) ? exhausted.remainingFraction : null;
+    return {
+      fraction,
+      percent: formatQuotaFraction(fraction),
+      label: exhausted.displayLabel || exhausted.label || exhausted.modelOrTier || 'Model',
+      isExhausted: true
+    };
+  }
+
+  if (models.some(item => item.remainingFraction === null || !Number.isFinite(item.remainingFraction))) return null;
+
   let lowestItem: ModelQuotaLike | null = null;
   let minFraction = Infinity;
 
   for (const item of models) {
     const fraction = item.remainingFraction;
-    if (fraction < minFraction) {
+    if (fraction !== null && fraction < minFraction) {
       minFraction = fraction;
       lowestItem = item;
     }
@@ -196,6 +210,36 @@ export interface FormattedCreditPool {
   totalText: string | null;
   ratioPercent: number | null;
   isIndeterminate: boolean;
+}
+
+export type RefreshResource = 'status' | 'accounts' | 'config';
+export interface RefreshTicket { resource: RefreshResource; sequence: number; mutationVersion: number }
+
+/** Rejects out-of-order reads and every read crossing a mutating request. */
+export class DashboardRefreshGate {
+  private readonly sequences: Record<RefreshResource, number> = { status: 0, accounts: 0, config: 0 };
+  private mutationVersion = 0;
+  private mutationsInFlight = 0;
+
+  beginRead(resource: RefreshResource): RefreshTicket {
+    return { resource, sequence: ++this.sequences[resource], mutationVersion: this.mutationVersion };
+  }
+
+  canPublish(ticket: RefreshTicket): boolean {
+    return this.mutationsInFlight === 0 && ticket.mutationVersion === this.mutationVersion &&
+      ticket.sequence === this.sequences[ticket.resource];
+  }
+
+  beginMutation(): void {
+    this.mutationVersion++;
+    this.mutationsInFlight++;
+  }
+
+  endMutation(): void {
+    if (this.mutationsInFlight === 0) throw new Error('No dashboard mutation is in flight');
+    this.mutationsInFlight--;
+    this.mutationVersion++;
+  }
 }
 
 /**

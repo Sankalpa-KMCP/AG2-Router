@@ -63,22 +63,22 @@
     <div class="metric-top">
       <span class="metric-label">Lowest Model Quota</span>
       {#if lowestQuota}
-        <span class="badge {lowestQuota.isExhausted ? 'badge-danger' : lowestQuota.percent <= lowThresholdPercent ? 'badge-warning' : 'badge-healthy'}">
-          {lowestQuota.isExhausted ? 'Exhausted' : lowestQuota.percent <= lowThresholdPercent ? 'Low' : 'Healthy'}
+        <span class="badge {lowestQuota.isExhausted ? 'badge-danger' : lowestQuota.percent === null ? 'badge-neutral' : lowestQuota.percent <= lowThresholdPercent ? 'badge-warning' : 'badge-healthy'}">
+          {lowestQuota.isExhausted ? 'Exhausted' : lowestQuota.percent === null ? 'Unknown' : lowestQuota.percent <= lowThresholdPercent ? 'Low' : 'Healthy'}
         </span>
       {:else}
-        <span class="badge badge-neutral">Offline</span>
+        <span class="badge badge-neutral">{unknownModelsCount > 0 ? 'Unknown' : 'No Data'}</span>
       {/if}
     </div>
     <div class="metric-body-with-ring">
       <div class="metric-details">
         <span class="metric-model-name" title={lowestQuota?.label || 'Waiting for telemetry'}>
-          {lowestQuota?.label || 'Telemetry Offline'}
+          {lowestQuota?.label || (unknownModelsCount > 0 ? 'Quota Unknown' : 'No Model Data')}
         </span>
         <span class="metric-subtext">Conservative model floor</span>
       </div>
       <div class="metric-ring-wrap">
-        {#if lowestQuota}
+        {#if lowestQuota && lowestQuota.percent !== null}
           <ProgressRing
             percent={lowestQuota.percent}
             size={46}

@@ -5,6 +5,15 @@ using Microsoft.Web.WebView2.Core;
 
 namespace AG2Router.App.Services;
 
+public static class WebViewAttemptDeadline
+{
+    public static async Task RunAsync(Func<Task> operation, TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        await operation().WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+    }
+}
+
 /// <summary>
 /// Generic coordinator core managing the lifecycle, concurrency, and process exit synchronization
 /// of WebView2 environments. Fully decoupled from native COM runtimes for unit testability.
@@ -20,6 +29,7 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
     private readonly TimeSpan _exitWaitTimeout;
     private readonly int _maxRetries;
     private readonly TimeSpan _initialRetryDelay;
+    private readonly TimeSpan _creationTimeout;
 
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private readonly object _stateLock = new();
@@ -38,7 +48,8 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
         Action<string, Exception?>? logger = null,
         TimeSpan? exitWaitTimeout = null,
         int maxRetries = 4,
-        TimeSpan? initialRetryDelay = null)
+        TimeSpan? initialRetryDelay = null,
+        TimeSpan? creationTimeout = null)
     {
         _environmentFactory = environmentFactory ?? throw new ArgumentNullException(nameof(environmentFactory));
         _subscribeProcessExited = subscribeProcessExited ?? throw new ArgumentNullException(nameof(subscribeProcessExited));
@@ -49,6 +60,7 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
         _exitWaitTimeout = exitWaitTimeout ?? TimeSpan.FromSeconds(5);
         _maxRetries = maxRetries;
         _initialRetryDelay = initialRetryDelay ?? TimeSpan.FromMilliseconds(200);
+        _creationTimeout = creationTimeout ?? TimeSpan.FromSeconds(10);
     }
 
     public async Task<TEnv> GetOrCreateEnvironmentAsync(CancellationToken ct = default)
@@ -107,9 +119,27 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
                 try
                 {
                     using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
-                    createdEnv = await _environmentFactory(timeoutCts.Token).ConfigureAwait(false);
+                    timeoutCts.CancelAfter(_creationTimeout);
+                    var creation = _environmentFactory(timeoutCts.Token);
+                    try
+                    {
+                        createdEnv = await creation.WaitAsync(_creationTimeout, ct).ConfigureAwait(false);
+                    }
+                    catch (TimeoutException)
+                    {
+                        timeoutCts.Cancel();
+                        _ = creation.ContinueWith(task => _ = task.Exception,
+                            TaskContinuationOptions.OnlyOnFaulted);
+                        throw;
+                    }
                     break;
+                }
+                catch (TimeoutException ex)
+                {
+                    lastException = ex;
+                    _logger?.Invoke($"WebView2 environment creation timed out on attempt {attempt}/{_maxRetries}.", ex);
+                    if (attempt < _maxRetries)
+                        await _delayFunc(_initialRetryDelay, ct).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (_isLockContentionException(ex))
                 {

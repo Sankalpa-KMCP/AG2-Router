@@ -67,7 +67,8 @@ public partial class MainWindow : Window, IDashboardWindow
             var env = await WebView2EnvironmentCoordinator.GetOrCreateEnvironmentAsync();
             if (_isDisposed) return;
 
-            await DashboardWebView.EnsureCoreWebView2Async(env);
+            await WebViewAttemptDeadline.RunAsync(
+                () => DashboardWebView.EnsureCoreWebView2Async(env), TimeSpan.FromSeconds(10));
             if (_isDisposed)
             {
                 TeardownWebView();
