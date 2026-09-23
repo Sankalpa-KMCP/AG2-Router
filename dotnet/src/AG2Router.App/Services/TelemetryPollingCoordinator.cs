@@ -16,7 +16,8 @@ namespace AG2Router.App.Services;
 public class TelemetryPollingCoordinator : IAsyncDisposable
 {
     private readonly IAG2Adapter _adapter;
-    private readonly TimeSpan _interval;
+    private TimeSpan _interval;
+    private PeriodicTimer? _timer;
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private readonly object _stateLock = new();
 
@@ -61,6 +62,23 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         );
     }
 
+    public void UpdateInterval(TimeSpan newInterval)
+    {
+        if (newInterval <= TimeSpan.Zero) return;
+        lock (_stateLock)
+        {
+            _interval = newInterval;
+            if (_timer != null)
+            {
+                try
+                {
+                    _timer.Period = newInterval;
+                }
+                catch { }
+            }
+        }
+    }
+
     public SystemStatusDto CurrentStatus => Volatile.Read(ref _currentStatus);
 
     public void Start()
@@ -86,24 +104,44 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 // Swallowed to prevent crashing background thread
             }
 
-            using var timer = new PeriodicTimer(_interval);
-            while (!token.IsCancellationRequested)
+            PeriodicTimer timer;
+            lock (_stateLock)
             {
-                try
+                _timer = new PeriodicTimer(_interval);
+                timer = _timer;
+            }
+
+            try
+            {
+                while (!token.IsCancellationRequested)
                 {
-                    if (!await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+                    try
+                    {
+                        if (!await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+                        {
+                            break;
+                        }
+                        await PollAsync(token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
                     {
                         break;
                     }
-                    await PollAsync(token).ConfigureAwait(false);
+                    catch
+                    {
+                        // Swallowed to prevent crashing background thread
+                    }
                 }
-                catch (OperationCanceledException)
+            }
+            finally
+            {
+                lock (_stateLock)
                 {
-                    break;
-                }
-                catch
-                {
-                    // Swallowed to prevent crashing background thread
+                    timer.Dispose();
+                    if (ReferenceEquals(_timer, timer))
+                    {
+                        _timer = null;
+                    }
                 }
             }
         }, token);

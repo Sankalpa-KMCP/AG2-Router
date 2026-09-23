@@ -33,6 +33,17 @@ export function selectBestCandidate(input: SelectionInput): SelectionResult {
   const lowThresholdFraction = config.lowQuotaThresholdPercent / 100;
   const minCandidateFraction = config.minimumCandidateQuotaPercent / 100;
 
+  if (currentAccountId === null || currentQuotaFraction === null || !Number.isFinite(currentQuotaFraction)) {
+    return {
+      shouldSwitch: false,
+      reason: 'Current account quota is unknown; automatic switching requires observed low quota.',
+      currentAccountId,
+      currentQuotaFraction: null,
+      bestCandidate: null,
+      candidates: []
+    };
+  }
+
   // 1. Check if current account quota is healthy
   if (currentAccountId !== null && currentQuotaFraction !== null) {
     if (currentQuotaFraction > lowThresholdFraction) {

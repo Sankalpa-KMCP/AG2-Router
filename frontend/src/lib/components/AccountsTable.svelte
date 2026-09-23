@@ -6,7 +6,6 @@
     accounts: AccountMetadata[];
     onSaveCurrent: () => void;
     onOpenConnect: () => void;
-    onPlanSwitch: (account: AccountMetadata) => void;
     onExecuteSwitch: (account: AccountMetadata) => void;
     onDeleteAccount: (account: AccountMetadata) => void;
     onUpdateAlias: (id: string, newAlias: string) => Promise<void>;
@@ -18,7 +17,6 @@
     accounts = [],
     onSaveCurrent,
     onOpenConnect,
-    onPlanSwitch,
     onExecuteSwitch,
     onDeleteAccount,
     onUpdateAlias,
@@ -228,14 +226,6 @@
                   {#if acc.isActive}
                     <span class="badge badge-healthy active-indicator">ACTIVE</span>
                   {:else}
-                    <button
-                      type="button"
-                      class="btn btn-secondary btn-sm"
-                      onclick={() => onPlanSwitch(acc)}
-                      title="Check switch readiness (preflight safety)"
-                    >
-                      Plan Switch
-                    </button>
                     {#if acc.hasVaultedSession}
                       <button
                         type="button"

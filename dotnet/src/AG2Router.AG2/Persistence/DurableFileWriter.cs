@@ -51,6 +51,9 @@ internal sealed class DurableFileWriter : IDurableFileWriter
                 stream.Flush(flushToDisk: true);
             }
 
+            // A timed-out owner may have released its lock while the asynchronous write
+            // was pending. Do not let that stale snapshot replace a newer one afterward.
+            cancellationToken.ThrowIfCancellationRequested();
             // No cancellation point is allowed after replacement: callers must be able to
             // publish the same committed snapshot to memory without an ambiguous outcome.
             if (File.Exists(fullPath))

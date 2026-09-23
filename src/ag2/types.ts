@@ -59,7 +59,7 @@ export interface ModelQuotaInfo {
   /**
    * Remaining quota fraction between 0.0 (0%) and 1.0 (100%).
    */
-  readonly remainingFraction: number;
+  readonly remainingFraction: number | null;
   /**
    * ISO 8601 UTC timestamp string for when quota resets.
    */
@@ -74,7 +74,7 @@ export interface CanonicalModelQuotaInfo {
   readonly key: string;
   readonly label: string;
   readonly modelOrTier?: string;
-  readonly remainingFraction: number;
+  readonly remainingFraction: number | null;
   readonly resetTime?: string;
   readonly isExhausted: boolean;
   readonly modes: readonly string[];
@@ -85,9 +85,9 @@ export interface CanonicalModelQuotaInfo {
  * Prompt and flow pools MUST NOT be combined or summed.
  */
 export interface CreditPoolInfo {
-  readonly availableCredits: number;
-  readonly monthlyCredits: number;
-  readonly usedCredits: number;
+  readonly availableCredits: number | null;
+  readonly monthlyCredits: number | null;
+  readonly usedCredits: number | null;
 }
 
 /**

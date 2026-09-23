@@ -6,6 +6,53 @@ namespace AG2Router.Tests;
 
 public class AG2TelemetryNormalizerTests
 {
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    public void NormalizeQuotaSnapshot_NonFiniteFractionRemainsUnknown(double input)
+    {
+        var raw = new RawUserStatusResponse { UserStatus = new RawUserStatus {
+            CascadeModelConfigData = new RawCascadeModelConfigData { ClientModelConfigs = [
+                new RawClientModelConfig { Label = "Model", ModelOrTier = "model", QuotaInfo = new RawQuotaInfo { RemainingFraction = input } }
+            ] }
+        } };
+        var quota = AG2TelemetryNormalizer.NormalizeQuotaSnapshot(raw)!;
+        Assert.Null(Assert.Single(quota.Models).RemainingFraction);
+        Assert.False(Assert.Single(quota.Models).IsExhausted);
+        Assert.Null(Assert.Single(quota.CanonicalModels!).RemainingFraction);
+        Assert.Contains("\"remainingFraction\":null", System.Text.Json.JsonSerializer.Serialize(quota,
+            new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web)));
+    }
+
+    [Fact]
+    public void NormalizeQuotaSnapshot_MissingFractionIsNotFullOrExhausted()
+    {
+        var raw = new RawUserStatusResponse { UserStatus = new RawUserStatus {
+            CascadeModelConfigData = new RawCascadeModelConfigData { ClientModelConfigs = [
+                new RawClientModelConfig { Label = "Unknown", ModelOrTier = "unknown", QuotaInfo = new RawQuotaInfo() },
+                new RawClientModelConfig { Label = "Zero", ModelOrTier = "zero", QuotaInfo = new RawQuotaInfo { RemainingFraction = 0 } }
+            ] }
+        } };
+        var models = AG2TelemetryNormalizer.NormalizeQuotaSnapshot(raw)!.Models;
+        Assert.Null(models[0].RemainingFraction);
+        Assert.False(models[0].IsExhausted);
+        Assert.Equal(0, models[1].RemainingFraction);
+        Assert.True(models[1].IsExhausted);
+    }
+
+    [Fact]
+    public void Canonicalize_SameTierWithDifferentOrUnknownResetRemainsSeparate()
+    {
+        var models = new[] {
+            new AG2Router.Core.Models.ModelQuotaDto("A", "same", 0.8, "2026-09-21T18:00:00Z", false),
+            new AG2Router.Core.Models.ModelQuotaDto("A (Thinking)", "same", 0.6, "2026-09-21T20:00:00Z", false),
+            new AG2Router.Core.Models.ModelQuotaDto("A (Reasoning)", "same", null, null, false)
+        };
+        var canonical = AG2TelemetryNormalizer.CanonicalizeModelQuotas(models);
+        Assert.Equal(3, canonical.Count);
+        Assert.Equal(3, canonical.Select(model => model.Key).Distinct().Count());
+    }
     [Fact]
     public void NormalizeAccountIdentity_ValidPayload_ExtractsIdentity()
     {
@@ -133,7 +180,10 @@ public class AG2TelemetryNormalizerTests
             }
         };
 
-        var emptyTrajectories = new RawTrajectoriesResponse();
+        var emptyTrajectories = new RawTrajectoriesResponse
+        {
+            TrajectorySummaries = new Dictionary<string, RawTrajectorySummary>()
+        };
 
         var busySnap = AG2TelemetryNormalizer.NormalizeActivitySnapshot(runningTrajectories);
         Assert.Equal("BUSY", busySnap.State);
@@ -152,7 +202,34 @@ public class AG2TelemetryNormalizerTests
     }
 
     [Fact]
-    public void Canonicalize_ReasoningVariants_SharingModelOrTier_AreDeduplicatedWithModes()
+    public void NormalizeActivitySnapshot_MissingPayloadOrSummariesRemainUnknown()
+    {
+        Assert.Equal("UNKNOWN", AG2TelemetryNormalizer.NormalizeActivitySnapshot(null).State);
+        Assert.Equal("UNKNOWN", AG2TelemetryNormalizer.NormalizeActivitySnapshot(new RawTrajectoriesResponse()).State);
+    }
+
+    [Fact]
+    public void NormalizeActivitySnapshot_UnknownEntryCannotProveIdleButRunningEvidenceWins()
+    {
+        var unknown = new RawTrajectoriesResponse
+        {
+            TrajectorySummaries = new Dictionary<string, RawTrajectorySummary>
+            {
+                ["t1"] = new() { Status = "CASCADE_RUN_STATUS_UNRECOGNIZED" },
+                ["t2"] = new() { Status = "CASCADE_RUN_STATUS_IDLE" }
+            }
+        };
+        Assert.Equal("UNKNOWN", AG2TelemetryNormalizer.NormalizeActivitySnapshot(unknown).State);
+
+        unknown.TrajectorySummaries!["t1"] = new RawTrajectorySummary { Status = "CASCADE_RUN_STATUS_RUNNING" };
+        Assert.Equal("BUSY", AG2TelemetryNormalizer.NormalizeActivitySnapshot(unknown).State);
+
+        unknown.TrajectorySummaries["t1"] = new RawTrajectorySummary { Status = "CASCADE_RUN_STATUS_DONE" };
+        Assert.Equal("IDLE", AG2TelemetryNormalizer.NormalizeActivitySnapshot(unknown).State);
+    }
+
+    [Fact]
+    public void Canonicalize_SameTierAndReset_DoNotProveSharedCapacity()
     {
         var raw = new RawUserStatusResponse
         {
@@ -195,16 +272,14 @@ public class AG2TelemetryNormalizerTests
         // Raw backward compatibility: 2 models preserved
         Assert.Equal(2, snapshot.Models.Count);
 
-        // Canonical deduplication: 1 canonical model
+        // Even equal tier and reset do not establish a shared capacity pool.
         Assert.NotNull(snapshot.CanonicalModels);
-        var canonical = Assert.Single(snapshot.CanonicalModels);
-        Assert.Equal("tier:gemini-2.5-pro", canonical.Key);
-        Assert.Equal("Gemini 2.5 Pro", canonical.Label);
-        Assert.Equal("gemini-2.5-pro", canonical.ModelOrTier);
-        Assert.Equal(0.85, canonical.RemainingFraction);
-        Assert.Equal("2026-09-21T21:00:00Z", canonical.ResetTime);
-        Assert.False(canonical.IsExhausted);
-        Assert.Equal(new[] { "Standard", "Thinking" }, canonical.Modes);
+        Assert.Equal(2, snapshot.CanonicalModels.Count);
+        Assert.Equal("tier:gemini-2.5-pro", snapshot.CanonicalModels[0].Key);
+        Assert.Equal("tier:gemini-2.5-pro:row:1", snapshot.CanonicalModels[1].Key);
+        Assert.Equal(new[] { "Standard" }, snapshot.CanonicalModels[0].Modes);
+        Assert.Equal(new[] { "Thinking" }, snapshot.CanonicalModels[1].Modes);
+        Assert.All(snapshot.CanonicalModels, model => Assert.Equal(0.85, model.RemainingFraction));
     }
 
     [Fact]
@@ -263,7 +338,7 @@ public class AG2TelemetryNormalizerTests
     }
 
     [Fact]
-    public void Canonicalize_SafeLabelFallback_MergesWhenModelOrTierMissingAndResetMatches()
+    public void Canonicalize_DisplayLabelCannotProvePoolIdentity()
     {
         var raw = new RawUserStatusResponse
         {
@@ -302,9 +377,8 @@ public class AG2TelemetryNormalizerTests
 
         Assert.NotNull(snapshot);
         Assert.NotNull(snapshot.CanonicalModels);
-        var canonical = Assert.Single(snapshot.CanonicalModels);
-        Assert.Equal("Claude 3.7 Sonnet", canonical.Label);
-        Assert.Equal(new[] { "Standard", "Thinking" }, canonical.Modes);
+        Assert.Equal(2, snapshot.CanonicalModels.Count);
+        Assert.All(snapshot.CanonicalModels, model => Assert.Equal("Claude 3.7 Sonnet", model.Label));
     }
 
     [Fact]
@@ -352,7 +426,7 @@ public class AG2TelemetryNormalizerTests
     }
 
     [Fact]
-    public void Canonicalize_ConservativeConflict_TakesMinFraction_OrExhaustion_AndMaxResetTime()
+    public void Canonicalize_ConflictingRows_PreserveSeparatePoolTruth()
     {
         var raw = new RawUserStatusResponse
         {
@@ -381,7 +455,7 @@ public class AG2TelemetryNormalizerTests
                             {
                                 RemainingFraction = 0.30,
                                 IsExhausted = true,
-                                ResetTime = "2026-09-21T20:30:00Z"
+                                ResetTime = "2026-09-21T18:00:00Z"
                             }
                         }
                     }
@@ -393,15 +467,13 @@ public class AG2TelemetryNormalizerTests
 
         Assert.NotNull(snapshot);
         Assert.NotNull(snapshot.CanonicalModels);
-        var canonical = Assert.Single(snapshot.CanonicalModels);
-
-        // Min remaining fraction
-        Assert.Equal(0.30, canonical.RemainingFraction);
-        // Logical OR: if any variant is exhausted, canonical is exhausted
-        Assert.True(canonical.IsExhausted);
-        // Latest reset time
-        Assert.Equal("2026-09-21T20:30:00Z", canonical.ResetTime);
-        Assert.Equal(new[] { "Standard", "Reasoning" }, canonical.Modes);
+        Assert.Equal(2, snapshot.CanonicalModels.Count);
+        Assert.Equal(0.80, snapshot.CanonicalModels[0].RemainingFraction);
+        Assert.False(snapshot.CanonicalModels[0].IsExhausted);
+        Assert.Equal(0.30, snapshot.CanonicalModels[1].RemainingFraction);
+        Assert.True(snapshot.CanonicalModels[1].IsExhausted);
+        Assert.Equal(new[] { "Standard" }, snapshot.CanonicalModels[0].Modes);
+        Assert.Equal(new[] { "Reasoning" }, snapshot.CanonicalModels[1].Modes);
     }
 
     [Fact]
@@ -504,18 +576,20 @@ public class AG2TelemetryNormalizerTests
         // Raw models preserved
         Assert.Equal(5, snapshot.Models.Count);
 
-        // Deduplicated canonical models: exactly 3
+        // Canonical rows preserve all five source capacity observations.
         Assert.NotNull(snapshot.CanonicalModels);
-        Assert.Equal(3, snapshot.CanonicalModels.Count);
+        Assert.Equal(5, snapshot.CanonicalModels.Count);
 
         Assert.Equal("Gemini 2.5 Pro", snapshot.CanonicalModels[0].Label);
-        Assert.Equal(new[] { "Standard", "Thinking" }, snapshot.CanonicalModels[0].Modes);
+        Assert.Equal(new[] { "Standard" }, snapshot.CanonicalModels[0].Modes);
+        Assert.Equal(new[] { "Thinking" }, snapshot.CanonicalModels[1].Modes);
 
-        Assert.Equal("Claude 3.7 Sonnet", snapshot.CanonicalModels[1].Label);
-        Assert.Equal(new[] { "Standard", "Thinking" }, snapshot.CanonicalModels[1].Modes);
-
-        Assert.Equal("Gemini 2.5 Flash", snapshot.CanonicalModels[2].Label);
+        Assert.Equal("Claude 3.7 Sonnet", snapshot.CanonicalModels[2].Label);
         Assert.Equal(new[] { "Standard" }, snapshot.CanonicalModels[2].Modes);
+        Assert.Equal(new[] { "Thinking" }, snapshot.CanonicalModels[3].Modes);
+
+        Assert.Equal("Gemini 2.5 Flash", snapshot.CanonicalModels[4].Label);
+        Assert.Equal(new[] { "Standard" }, snapshot.CanonicalModels[4].Modes);
 
         // Credit segregation preserved
         Assert.NotNull(snapshot.PromptCredits);
@@ -525,5 +599,39 @@ public class AG2TelemetryNormalizerTests
         Assert.NotNull(snapshot.FlowCredits);
         Assert.Equal(300, snapshot.FlowCredits.AvailableCredits);
         Assert.Equal(200, snapshot.FlowCredits.UsedCredits);
+    }
+
+    [Fact]
+    public void NormalizeQuotaSnapshot_PartialCreditPool_PreservesNullValuesWithoutCoalescingZero()
+    {
+        var raw = new RawUserStatusResponse
+        {
+            UserStatus = new RawUserStatus
+            {
+                PlanStatus = new RawPlanStatus
+                {
+                    PlanInfo = new RawPlanInfo
+                    {
+                        MonthlyPromptCredits = null,
+                        MonthlyFlowCredits = 500
+                    },
+                    AvailablePromptCredits = 100,
+                    AvailableFlowCredits = null
+                }
+            }
+        };
+
+        var snapshot = AG2TelemetryNormalizer.NormalizeQuotaSnapshot(raw);
+
+        Assert.NotNull(snapshot);
+        Assert.NotNull(snapshot.PromptCredits);
+        Assert.Equal(100, snapshot.PromptCredits.AvailableCredits);
+        Assert.Null(snapshot.PromptCredits.MonthlyCredits);
+        Assert.Null(snapshot.PromptCredits.UsedCredits);
+
+        Assert.NotNull(snapshot.FlowCredits);
+        Assert.Null(snapshot.FlowCredits.AvailableCredits);
+        Assert.Equal(500, snapshot.FlowCredits.MonthlyCredits);
+        Assert.Null(snapshot.FlowCredits.UsedCredits);
     }
 }

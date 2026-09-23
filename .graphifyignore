@@ -1,0 +1,43 @@
+# AG2 Router - Graphify Exclusion Policy
+# Excludes legacy reference code, generated assets, historical documentation,
+# build/package outputs, local machine state, and tool directories from the
+# primary shipped-runtime knowledge graph.
+
+# Legacy and reference TypeScript tree
+/src/
+/test/
+
+# Generated UI assets
+/src/ui/
+
+# Historical and non-authoritative documentation
+docs/architecture.md
+docs/security.md
+docs/security-model.md
+docs/dotnet-migration.md
+docs/release-notes-v0.2.0.md
+
+# Dependencies and build/package outputs
+node_modules/
+dist/
+publish/
+bin/
+obj/
+
+# Graphify output
+graphify-out/
+
+# Tool, agent, and version control directories
+.git/
+.agents/
+.codex/
+.gemini/
+
+# Local runtime data, state, logs, and secrets
+/data/
+/vault/
+.env
+.env.local
+*.log
+*.tmp
+*.dat

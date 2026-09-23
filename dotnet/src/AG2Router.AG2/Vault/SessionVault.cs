@@ -12,6 +12,8 @@ internal sealed record VaultMutationReceipt(
     VaultAccountRecord CommittedRecord,
     VaultAccountRecord? PreviousRecord);
 
+internal sealed record VaultRemovalReceipt(string AccountId, VaultAccountRecord RemovedRecord);
+
 /// <summary>
 /// Encrypted Multi-Account Session Vault.
 /// Implements persistent, encrypted storage for Antigravity 2 account sessions.
@@ -33,7 +35,10 @@ public class SessionVault : ISessionVault
     private readonly string _vaultFilePath;
     private readonly IDpapiProvider _dpapiProvider;
     private readonly SemaphoreSlim _pathLock;
+    private readonly RecoveryQuarantine _recoveryQuarantine;
     private readonly IDurableFileWriter _fileWriter;
+    internal TimeSpan AdmissionTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    internal TimeSpan MutationTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
     public SessionVault(string? vaultDir = null, IDpapiProvider? dpapiProvider = null)
         : this(vaultDir, dpapiProvider, new DurableFileWriter())
@@ -69,7 +74,66 @@ public class SessionVault : ISessionVault
         _vaultFilePath = Path.Combine(_vaultDir, "sessions.dat");
         _dpapiProvider = dpapiProvider ?? throw new ArgumentNullException(nameof(dpapiProvider));
         _pathLock = PathLockRegistry.Get(_vaultFilePath);
+        _recoveryQuarantine = RecoveryQuarantineRegistry.Get(_vaultFilePath);
         _fileWriter = fileWriter ?? throw new ArgumentNullException(nameof(fileWriter));
+    }
+
+    internal void QuarantineUnresolvedMutation()
+    {
+        _recoveryQuarantine.Mark();
+        RecoveryQuarantineRegistry.Get(_vaultFilePath + ".switch").Mark();
+    }
+    internal bool IsQuarantined => _recoveryQuarantine.IsMarked;
+
+    private void EnsureVaultAvailable()
+    {
+        if (_recoveryQuarantine.IsMarked)
+            throw new VaultMutationUncertainException(
+                "Vault outcome is unresolved; manual recovery is required before vault access.");
+    }
+
+    private async Task<T> ObserveMutationAsync<T>(Task<T> operation)
+    {
+        try
+        {
+            return await operation.WaitAsync(MutationTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            if (operation.IsCompleted)
+            {
+                try { return await operation.ConfigureAwait(false); }
+                catch (VaultMutationUncertainException)
+                {
+                    QuarantineUnresolvedMutation();
+                    throw;
+                }
+            }
+            QuarantineUnresolvedMutation();
+            _ = operation.ContinueWith(static completed => _ = completed.Exception,
+                CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+            throw new VaultMutationUncertainException(
+                "Vault mutation did not settle within its deadline; manual recovery is required.");
+        }
+        catch (VaultMutationUncertainException)
+        {
+            QuarantineUnresolvedMutation();
+            throw;
+        }
+    }
+
+    private async Task EnterPathAsync(CancellationToken cancellationToken)
+    {
+        EnsureVaultAvailable();
+        if (!await _pathLock.WaitAsync(AdmissionTimeout, cancellationToken).ConfigureAwait(false))
+            throw new VaultMutationUncertainException(
+                "Vault ownership did not become available within its deadline; manual recovery is required.");
+        if (_recoveryQuarantine.IsMarked)
+        {
+            _pathLock.Release();
+            throw new VaultMutationUncertainException(
+                "Vault mutation is unresolved; manual recovery is required before vault access.");
+        }
     }
 
     /// <summary>
@@ -96,7 +160,14 @@ public class SessionVault : ISessionVault
             .ConfigureAwait(false);
     }
 
-    internal async Task<VaultMutationReceipt> SaveSessionWithReceiptAsync(
+    internal Task<VaultMutationReceipt> SaveSessionWithReceiptAsync(
+        string accountId,
+        byte[] sessionBlob,
+        string target = VaultConstants.DefaultAg2WinCredTarget,
+        CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(SaveSessionCoreAsync(accountId, sessionBlob, target, cancellationToken));
+
+    private async Task<VaultMutationReceipt> SaveSessionCoreAsync(
         string accountId,
         byte[] sessionBlob,
         string target = VaultConstants.DefaultAg2WinCredTarget,
@@ -137,12 +208,13 @@ public class SessionVault : ISessionVault
 
         string encryptedPayloadBase64 = Convert.ToBase64String(encryptedBytes);
 
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
                 .AcquireAsync(_vaultFilePath, cancellationToken)
                 .ConfigureAwait(false);
+            EnsureVaultAvailable();
 
             // 3. Load current vault envelope (fails closed if existing file is corrupted)
             var envelope = ReadEnvelope();
@@ -161,7 +233,32 @@ public class SessionVault : ISessionVault
             envelope.Records[accountId] = record;
 
             // 4. Save atomically
-            await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            EnsureVaultAvailable();
+            try
+            {
+                await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception writeError)
+            {
+                VaultAccountRecord? authoritative;
+                try
+                {
+                    ReadEnvelope().Records.TryGetValue(accountId, out authoritative);
+                }
+                catch (Exception readError)
+                {
+                    throw new VaultMutationUncertainException(
+                        "Vault save outcome could not be read; manual recovery is required.",
+                        new AggregateException(writeError, readError));
+                }
+
+                if (authoritative == record)
+                    return new VaultMutationReceipt(accountId, record, existing);
+                if (authoritative != existing)
+                    throw new VaultMutationUncertainException(
+                        "Vault save outcome changed unexpectedly; manual recovery is required.", writeError);
+                throw;
+            }
             return new VaultMutationReceipt(accountId, record, existing);
         }
         finally
@@ -170,18 +267,24 @@ public class SessionVault : ISessionVault
         }
     }
 
-    internal async Task<bool> RestoreIfCurrentAsync(
+    internal Task<bool> RestoreIfCurrentAsync(
+        VaultMutationReceipt receipt,
+        CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(RestoreIfCurrentCoreAsync(receipt, cancellationToken));
+
+    private async Task<bool> RestoreIfCurrentCoreAsync(
         VaultMutationReceipt receipt,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(receipt);
 
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
                 .AcquireAsync(_vaultFilePath, cancellationToken)
                 .ConfigureAwait(false);
+            EnsureVaultAvailable();
             var envelope = ReadEnvelope();
             if (!envelope.Records.TryGetValue(receipt.AccountId, out var current) ||
                 current != receipt.CommittedRecord)
@@ -198,7 +301,13 @@ public class SessionVault : ISessionVault
                 envelope.Records[receipt.AccountId] = receipt.PreviousRecord;
             }
 
-            await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            EnsureVaultAvailable();
+            try { await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                throw new VaultMutationUncertainException(
+                    "Vault restoration outcome could not be proven; manual recovery is required.", ex);
+            }
             return true;
         }
         finally
@@ -219,12 +328,13 @@ public class SessionVault : ISessionVault
         }
 
         VaultAccountRecord? record;
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
                 .AcquireAsync(_vaultFilePath, cancellationToken)
                 .ConfigureAwait(false);
+            EnsureVaultAvailable();
             var envelope = ReadEnvelope();
             if (!envelope.Records.TryGetValue(accountId, out record))
             {
@@ -302,12 +412,13 @@ public class SessionVault : ISessionVault
             return false;
         }
 
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
                 .AcquireAsync(_vaultFilePath, cancellationToken)
                 .ConfigureAwait(false);
+            EnsureVaultAvailable();
             var envelope = ReadEnvelope();
             return envelope.Records.ContainsKey(accountId);
         }
@@ -320,26 +431,130 @@ public class SessionVault : ISessionVault
     /// <summary>
     /// Remove a session from the vault.
     /// </summary>
-    public async Task<bool> RemoveSessionAsync(string accountId, CancellationToken cancellationToken = default)
+    public Task<bool> RemoveSessionAsync(string accountId, CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(RemoveSessionCoreAsync(accountId, cancellationToken));
+
+    private async Task<bool> RemoveSessionCoreAsync(string accountId, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(accountId))
         {
             return false;
         }
 
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
                 .AcquireAsync(_vaultFilePath, cancellationToken)
                 .ConfigureAwait(false);
+            EnsureVaultAvailable();
             var envelope = ReadEnvelope();
             if (!envelope.Records.Remove(accountId))
             {
                 return false;
             }
 
-            await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            EnsureVaultAvailable();
+            try { await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                throw new VaultMutationUncertainException(
+                    "Vault removal outcome could not be proven; manual recovery is required.", ex);
+            }
+            return true;
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
+    }
+
+    internal Task<VaultRemovalReceipt?> RemoveSessionWithReceiptAsync(
+        string accountId, CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(RemoveSessionWithReceiptCoreAsync(accountId, cancellationToken));
+
+    private async Task<VaultRemovalReceipt?> RemoveSessionWithReceiptCoreAsync(
+        string accountId, CancellationToken cancellationToken = default)
+    {
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var lease = await CrossProcessFileLease.AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
+            EnsureVaultAvailable();
+            var envelope = ReadEnvelope();
+            if (!envelope.Records.Remove(accountId, out var removed)) return null;
+            EnsureVaultAvailable();
+            try
+            {
+                await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A failed writer may have replaced the file before surfacing an error.
+                // Restore the preimage under the same vault ownership before reporting failure.
+                VaultFileEnvelope current;
+                try { current = ReadEnvelope(); }
+                catch (Exception readError)
+                {
+                    throw new VaultMutationUncertainException(
+                        "Vault removal outcome could not be read; manual recovery is required.", readError);
+                }
+                if (current.Records.TryGetValue(accountId, out var authoritative))
+                {
+                    if (authoritative != removed)
+                        throw new VaultMutationUncertainException(
+                            "Vault removal changed the session unexpectedly; manual recovery is required.");
+                }
+                else
+                {
+                    current.Records.Add(accountId, removed);
+                    try
+                    {
+                        // The first writer may have outlived its caller. Do not start a
+                        // compensating write after that caller has quarantined the path.
+                        EnsureVaultAvailable();
+                        await WriteEnvelopeAsync(current, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new VaultMutationUncertainException(
+                            "Vault removal compensation could not be proven; manual recovery is required.", ex);
+                    }
+                }
+                throw;
+            }
+            return new VaultRemovalReceipt(accountId, removed);
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
+    }
+
+    internal Task<bool> RestoreRemovedIfAbsentAsync(
+        VaultRemovalReceipt receipt, CancellationToken cancellationToken = default) =>
+        ObserveMutationAsync(RestoreRemovedIfAbsentCoreAsync(receipt, cancellationToken));
+
+    private async Task<bool> RestoreRemovedIfAbsentCoreAsync(
+        VaultRemovalReceipt receipt, CancellationToken cancellationToken = default)
+    {
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var lease = await CrossProcessFileLease.AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
+            EnsureVaultAvailable();
+            var envelope = ReadEnvelope();
+            if (envelope.Records.ContainsKey(receipt.AccountId)) return false;
+            envelope.Records.Add(receipt.AccountId, receipt.RemovedRecord);
+            EnsureVaultAvailable();
+            try { await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                throw new VaultMutationUncertainException(
+                    "Vault restoration outcome could not be proven; manual recovery is required.", ex);
+            }
             return true;
         }
         finally
@@ -353,12 +568,13 @@ public class SessionVault : ISessionVault
     /// </summary>
     public async Task<IReadOnlyList<string>> ListStoredAccountIdsAsync(CancellationToken cancellationToken = default)
     {
-        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterPathAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await using var lease = await CrossProcessFileLease
                 .AcquireAsync(_vaultFilePath, cancellationToken)
                 .ConfigureAwait(false);
+            EnsureVaultAvailable();
             var envelope = ReadEnvelope();
             return envelope.Records.Keys.ToList();
         }

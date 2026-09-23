@@ -2,7 +2,6 @@ import type {
   AccountsListResponse,
   AccountMetadata,
   SystemStatusDto,
-  SwitchPlanDto,
   SwitchStatusDto,
   RouterConfigDto
 } from './types.js';
@@ -92,16 +91,17 @@ class ApiClient {
     return this.request<{ status: SwitchStatusDto }>('/api/switching/status');
   }
 
-  public async planSwitch(id: string): Promise<{ plan: SwitchPlanDto }> {
-    return this.request<{ plan: SwitchPlanDto }>(`/api/accounts/${encodeURIComponent(id)}/switch-plan`, {
-      method: 'POST'
+  public async getSwitchIntent(): Promise<void> {
+    await this.request<{ ready: boolean }>('/api/switching/intent', {
+      method: 'POST',
+      headers: { 'X-AG2-Intent-Request': '1' }
     });
   }
 
-  public async executeSwitch(id: string): Promise<{ success: boolean; code?: number; message?: string }> {
+  public async executeSwitch(id: string): Promise<{ success: boolean; code: string; message: string }> {
     // If we don't have a token, attempt to acquire one first
     if (!this.switchIntentToken) {
-      await this.getSwitchStatus();
+      await this.getSwitchIntent();
     }
 
     const headers: Record<string, string> = {};
@@ -109,7 +109,7 @@ class ApiClient {
       headers['X-AG2-Switch-Token'] = this.switchIntentToken;
     }
 
-    return this.request<{ success: boolean; code?: number; message?: string }>(`/api/accounts/${encodeURIComponent(id)}/switch`, {
+    return this.request<{ success: boolean; code: string; message: string }>(`/api/accounts/${encodeURIComponent(id)}/switch`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ confirm: true })

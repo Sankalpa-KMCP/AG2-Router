@@ -30,34 +30,86 @@ if (-not $NormalizedExpected.StartsWith([System.IO.Path]::GetFullPath($env:LOCAL
     throw "Security Preflight Failure: Target directory '$ExpectedInstallDir' is not the authorized per-user installation path (%LOCALAPPDATA%\Programs\AG2Router). Aborting uninstallation."
 }
 
-# 2. Graceful Process Shutdown
-$runningProcesses = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
-if ($runningProcesses) {
-    Write-Host "Detected running AG2 Router instance. Requesting graceful shutdown (--exit)..."
-    if (Test-Path $ExePath) {
-        try {
-            $exitProcess = Start-Process -FilePath $ExePath -ArgumentList "--exit" -Wait -PassThru -WindowStyle Hidden
-            if ($exitProcess.ExitCode -ne 0) {
-                Write-Warning "Shutdown request (--exit) returned exit code $($exitProcess.ExitCode)"
-            }
-        } catch {
-            Write-Warning "Failed to invoke --exit signal: $_"
-        }
+# 2. Graceful Process Shutdown via Named Mutex and Process Check
+function Get-AG2RouterProcessState {
+    try {
+        # A successful full enumeration with no matching process proves STOPPED.
+        # Get-Process -Name would throw for an ordinary absent process, making
+        # that case indistinguishable from a failed query.
+        $ag2Processes = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -eq 'AG2Router' })
+        if ($ag2Processes.Count -gt 0) { return 'RUNNING' }
+        return 'STOPPED'
+    } catch {
+        return 'UNKNOWN'
     }
-
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.ElapsedMilliseconds -lt 5000) {
-        $remaining = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
-        if (-not $remaining) { break }
-        Start-Sleep -Milliseconds 250
-    }
-
-    $stillRunning = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
-    if ($stillRunning) {
-        throw "AG2 Router is currently running and could not be gracefully closed. Please exit AG2 Router from the system tray before proceeding."
-    }
-    Write-Host "  [OK] Process closed gracefully." -ForegroundColor Green
 }
+
+function Get-AG2RouterMutexState {
+    try {
+        $sessionMutex = $null
+        $mutexHeld = [System.Threading.Mutex]::TryOpenExisting("Local\AG2Router_Session_Mutex", [ref]$sessionMutex)
+        if ($mutexHeld -and $sessionMutex) { $sessionMutex.Dispose() }
+        if ($mutexHeld) { return 'RUNNING' }
+        return 'STOPPED'
+    } catch {
+        return 'UNKNOWN'
+    }
+}
+
+function Invoke-AG2RouterExitRequest {
+    param([string]$InstalledExe)
+    if (-not (Test-Path $InstalledExe)) {
+        throw "AG2 Router is running but its shutdown executable is missing. Uninstallation aborted."
+    }
+    try {
+        $exitProcess = Start-Process -FilePath $InstalledExe -ArgumentList "--exit" -PassThru -WindowStyle Hidden
+        if (-not $exitProcess.WaitForExit(5000)) {
+            throw "Shutdown request (--exit) did not finish within five seconds. Uninstallation aborted."
+        }
+        if ($exitProcess.ExitCode -ne 0) {
+            throw "Shutdown request (--exit) returned exit code $($exitProcess.ExitCode). Uninstallation aborted."
+        }
+    } catch {
+        throw "Failed to complete --exit shutdown request. Uninstallation aborted: $_"
+    }
+}
+
+function Assert-AG2RouterStopped {
+    param([string]$InstalledExe)
+    $mutexState = Get-AG2RouterMutexState
+    if ($mutexState -eq 'UNKNOWN') {
+        throw 'AG2 Router mutex state could not be verified. Uninstallation aborted.'
+    }
+    $processState = Get-AG2RouterProcessState
+    if ($processState -eq 'UNKNOWN') {
+        throw 'AG2 Router process state could not be verified. Uninstallation aborted.'
+    }
+
+    if ($mutexState -eq 'RUNNING' -or $processState -eq 'RUNNING') {
+        Write-Host "Detected running AG2 Router instance. Requesting graceful shutdown (--exit)..."
+        Invoke-AG2RouterExitRequest -InstalledExe $InstalledExe
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt 5000) {
+            $mutexState = Get-AG2RouterMutexState
+            if ($mutexState -eq 'UNKNOWN') {
+                throw 'AG2 Router mutex state became unknown after --exit. Uninstallation aborted.'
+            }
+            $processState = Get-AG2RouterProcessState
+            if ($processState -eq 'UNKNOWN') {
+                throw 'AG2 Router process state became unknown after --exit. Uninstallation aborted.'
+            }
+            if ($mutexState -eq 'STOPPED' -and $processState -eq 'STOPPED') {
+                Write-Host "  [OK] Process closed gracefully." -ForegroundColor Green
+                return
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        throw 'AG2 Router could not be proven stopped within five seconds. Uninstallation aborted.'
+    }
+}
+
+Assert-AG2RouterStopped -InstalledExe $ExePath
 
 # 3. Startup Registry Ownership Check & Safe Removal
 if (Test-Path $RunKey) {

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.RegularExpressions;
 using AG2Router.Windows.Lifecycle;
 using Xunit;
@@ -243,8 +244,10 @@ public class ReleasePackagingTests
         Assert.Contains("function PrepareToInstall", issContent);
         Assert.Contains("'--exit'", issContent);
 
-        // Verify uninstaller graceful shutdown
-        Assert.Contains("Filename: \"{app}\\AG2Router.exe\"; Parameters: \"--exit\"", issContent);
+        // Verify uninstaller graceful shutdown via InitializeUninstall
+        Assert.Contains("function InitializeUninstall(): Boolean", issContent);
+        Assert.Contains("'--exit'", issContent);
+        Assert.DoesNotContain("[UninstallRun]", issContent);
     }
 
     #endregion
@@ -424,7 +427,7 @@ public class ReleasePackagingTests
         string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
 
         Assert.Contains("procedure CurStepChanged", issContent);
-        Assert.Contains("CurStep = ssPostInstall", issContent);
+        Assert.Contains("CurStep = ssDone", issContent);
         Assert.Contains(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router", issContent);
         Assert.Contains("RegDeleteKeyIncludingSubkeys", issContent);
     }
@@ -444,6 +447,150 @@ public class ReleasePackagingTests
         Assert.True(runKeyDeletePos > 0);
         string deleteSection = issContent.Substring(runKeyDeletePos);
         Assert.DoesNotContain("CurStepChanged", deleteSection);
+    }
+
+    [Fact]
+    public void InnoSetup_And_InstallScripts_CoordinateWithSessionMutexAndFailClosed()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+        string installScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "install.ps1"));
+        string uninstallScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "uninstall.ps1"));
+
+        // 1. Inno Setup mutex imports and coordination
+        Assert.Contains("OpenMutexW", issContent);
+        Assert.Contains("CloseHandle", issContent);
+        Assert.Contains(@"Local\AG2Router_Session_Mutex", issContent);
+        Assert.Contains("function SessionMutexState(): Integer", issContent);
+        Assert.Contains("function WaitForSessionMutexRelease", issContent);
+        Assert.Contains("if SessionMutexState() < 0 then", issContent);
+        Assert.Contains("DLLGetLastError = ERROR_FILE_NOT_FOUND", issContent);
+        Assert.DoesNotContain("ewWaitUntilTerminated", issContent);
+        Assert.Contains("ewNoWait", issContent);
+
+        // 2. Inno Setup PrepareToInstall & InitializeUninstall fail-closed guards
+        Assert.Contains("function PrepareToInstall", issContent);
+        Assert.Contains("function InitializeUninstall(): Boolean", issContent);
+
+        // 3. install.ps1 mutex check and fail-closed guards
+        Assert.Contains(@"Local\AG2Router_Session_Mutex", installScript);
+        Assert.Contains("[System.Threading.Mutex]::TryOpenExisting", installScript);
+        Assert.Contains("Installation aborted", installScript);
+
+        // 4. uninstall.ps1 mutex check and fail-closed guards
+        Assert.Contains(@"Local\AG2Router_Session_Mutex", uninstallScript);
+        Assert.Contains("[System.Threading.Mutex]::TryOpenExisting", uninstallScript);
+        Assert.Contains("Uninstallation aborted", uninstallScript);
+    }
+
+    [Fact]
+    public void InnoSetup_ImplementsAtomicStagedUpgradeWithRollback()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+
+        // 1. Win32 MoveFileW import for atomic directory moves
+        Assert.Contains("MoveFileW", issContent);
+
+        // 2. Staging occurs in the abortable pre-extraction event.
+        string preparation = issContent.Split("function PrepareToInstall(var NeedsRestart: Boolean): String;")[1]
+            .Split("procedure CurStepChanged(CurStep: TSetupStep);")[0];
+        Assert.Contains("if DirExists(BackupDir) then", preparation);
+        Assert.Contains("if not MoveFileW(AppDir, BackupDir) then", preparation);
+        Assert.Contains("No application files were overwritten", preparation);
+        Assert.Contains(".bak", issContent);
+        Assert.Contains("HasBackup := True", issContent);
+
+        // 3. Backup is retained until the successful terminal event.
+        Assert.Contains("CurStep = ssDone", issContent);
+        Assert.Contains("InstallCompleted := True", issContent);
+        Assert.Contains("not DelTree(BackupDir, True, True, True)", issContent);
+
+        // 4. DeinitializeSetup restores backup if install was incomplete
+        Assert.Contains("procedure DeinitializeSetup()", issContent);
+        Assert.Contains("HasBackup and (not InstallCompleted)", issContent);
+        Assert.Contains("MoveFileW(BackupDir, AppDir)", issContent);
+        Assert.Contains("not DelTree(AppDir, True, True, True)", issContent);
+        Assert.Contains("not MoveFileW(BackupDir, AppDir)", issContent);
+        Assert.Contains("remains in the sibling .bak directory", issContent);
+    }
+
+    [Fact]
+    public void InnoUninstall_UnknownMutexAndHungExitFailClosedBeforeRemoval()
+    {
+        string issContent = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "installer", "AG2Router.iss"));
+        string uninstall = issContent.Split("function InitializeUninstall(): Boolean;")[1]
+            .Split("// Helper function to strip trailing backslashes")[0];
+        Assert.Contains("if SessionMutexState() < 0 then", uninstall);
+        Assert.Contains("if not FileExists(InstalledExe) then", uninstall);
+        Assert.Contains("ewNoWait", uninstall);
+        Assert.Contains("if not WaitForSessionMutexRelease(5000) then", uninstall);
+        Assert.DoesNotContain("ewWaitUntilTerminated", uninstall);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PowerShellUninstall_ProcessQueryFailureAbortsBeforeDestructiveContinuation(bool failAfterExit)
+    {
+        string script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "scripts", "uninstall.ps1"));
+        string stopFunctions = script.Split("# 2. Graceful Process Shutdown via Named Mutex and Process Check")[1]
+            .Split("Assert-AG2RouterStopped -InstalledExe $ExePath")[0];
+        string scenario = failAfterExit ? "post" : "pre";
+        string command = $$"""
+            $ErrorActionPreference = 'Stop'
+            $script:destructiveCalls = 0
+            function Remove-Item { $script:destructiveCalls++ }
+            {{stopFunctions}}
+            $script:queries = 0
+            $script:exitCalls = 0
+            function Get-Process {
+                param([string]$ErrorAction)
+                $script:queries++
+                if ('{{scenario}}' -eq 'post' -and $script:queries -eq 1) {
+                    return [pscustomobject]@{ ProcessName = 'AG2Router' }
+                }
+                throw 'Synthetic process query failure'
+            }
+            function Get-AG2RouterMutexState { return 'STOPPED' }
+            function Invoke-AG2RouterExitRequest {
+                param([string]$InstalledExe)
+                $script:exitCalls++
+            }
+            $caught = $false
+            try {
+                Assert-AG2RouterStopped -InstalledExe 'X:\synthetic\AG2Router.exe'
+                Remove-Item 'X:\synthetic\programs'
+            } catch {
+                $caught = $true
+                if ($_.Exception.Message -notmatch 'process state.*(could not be verified|became unknown)') { exit 2 }
+            }
+            if (-not $caught -or $script:destructiveCalls -ne 0) { exit 3 }
+            if ('{{scenario}}' -eq 'post') {
+                if ($script:queries -ne 2 -or $script:exitCalls -ne 1) { exit 4 }
+            } elseif ($script:queries -ne 1 -or $script:exitCalls -ne 0) { exit 5 }
+            exit 0
+            """;
+
+        var start = new ProcessStartInfo("powershell.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add("-NoProfile");
+        start.ArgumentList.Add("-NonInteractive");
+        start.ArgumentList.Add("-EncodedCommand");
+        start.ArgumentList.Add(Convert.ToBase64String(Encoding.Unicode.GetBytes(command)));
+        using var child = Process.Start(start) ?? throw new InvalidOperationException("PowerShell test process did not start.");
+        if (!child.WaitForExit(10000))
+        {
+            child.Kill(entireProcessTree: true);
+            throw new TimeoutException("Synthetic uninstall safety check did not complete.");
+        }
+        Assert.True(child.ExitCode == 0,
+            $"Synthetic {scenario} query failure exited {child.ExitCode}: {child.StandardOutput.ReadToEnd()} {child.StandardError.ReadToEnd()}");
     }
 
     #endregion

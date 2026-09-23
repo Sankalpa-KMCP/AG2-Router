@@ -1,6 +1,6 @@
 <script lang="ts">
   import ProgressRing from './ProgressRing.svelte';
-  import type { LowestQuotaSummary } from '../utils/helpers.js';
+  import { derivePoolsStatusSummary, type LowestQuotaSummary } from '../utils/helpers.js';
 
   interface Props {
     totalAccounts: number;
@@ -9,6 +9,7 @@
     lowestQuota: LowestQuotaSummary | null;
     exhaustedCount: number;
     activeModelsCount: number;
+    unknownModelsCount?: number;
     autoSwitchEnabled: boolean;
     lowThresholdPercent: number;
   }
@@ -20,9 +21,12 @@
     lowestQuota = null,
     exhaustedCount = 0,
     activeModelsCount = 0,
+    unknownModelsCount = 0,
     autoSwitchEnabled = false,
     lowThresholdPercent = 15
   }: Props = $props();
+
+  const poolsSummary = $derived(derivePoolsStatusSummary(activeModelsCount, exhaustedCount, unknownModelsCount));
 </script>
 
 <section class="summary-grid" aria-label="Overview Metrics">
@@ -59,22 +63,22 @@
     <div class="metric-top">
       <span class="metric-label">Lowest Model Quota</span>
       {#if lowestQuota}
-        <span class="badge {lowestQuota.isExhausted ? 'badge-danger' : lowestQuota.percent <= lowThresholdPercent ? 'badge-warning' : 'badge-healthy'}">
-          {lowestQuota.isExhausted ? 'Exhausted' : lowestQuota.percent <= lowThresholdPercent ? 'Low' : 'Healthy'}
+        <span class="badge {lowestQuota.isExhausted ? 'badge-danger' : lowestQuota.percent === null ? 'badge-neutral' : lowestQuota.percent <= lowThresholdPercent ? 'badge-warning' : 'badge-healthy'}">
+          {lowestQuota.isExhausted ? 'Exhausted' : lowestQuota.percent === null ? 'Unknown' : lowestQuota.percent <= lowThresholdPercent ? 'Low' : 'Healthy'}
         </span>
       {:else}
-        <span class="badge badge-neutral">Offline</span>
+        <span class="badge badge-neutral">{unknownModelsCount > 0 ? 'Unknown' : 'No Data'}</span>
       {/if}
     </div>
     <div class="metric-body-with-ring">
       <div class="metric-details">
         <span class="metric-model-name" title={lowestQuota?.label || 'Waiting for telemetry'}>
-          {lowestQuota?.label || 'Telemetry Offline'}
+          {lowestQuota?.label || (unknownModelsCount > 0 ? 'Quota Unknown' : 'No Model Data')}
         </span>
         <span class="metric-subtext">Conservative model floor</span>
       </div>
       <div class="metric-ring-wrap">
-        {#if lowestQuota}
+        {#if lowestQuota && lowestQuota.percent !== null}
           <ProgressRing
             percent={lowestQuota.percent}
             size={46}
@@ -93,13 +97,13 @@
   <div class="card metric-card">
     <div class="metric-top">
       <span class="metric-label">Pools Status</span>
-      <span class="badge {exhaustedCount > 0 ? 'badge-danger' : 'badge-healthy'}">
-        {exhaustedCount > 0 ? `${exhaustedCount} Near Limit` : 'Nominal'}
+      <span class="badge {poolsSummary.badgeClass}">
+        {poolsSummary.badgeText}
       </span>
     </div>
     <div class="metric-body">
-      <span class="metric-value-medium {exhaustedCount > 0 ? 'text-danger' : 'text-success'}">
-        {exhaustedCount > 0 ? `${exhaustedCount} Exhausted` : 'All Healthy'}
+      <span class="metric-value-medium {poolsSummary.metricClass}">
+        {poolsSummary.metricText}
       </span>
       <span class="metric-subtext">
         {activeModelsCount > 0 ? `${activeModelsCount} active quota pools monitored` : 'Waiting for telemetry data'}

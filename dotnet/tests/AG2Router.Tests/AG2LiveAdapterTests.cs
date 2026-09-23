@@ -84,4 +84,52 @@ public class AG2LiveAdapterTests
         Assert.Equal("OFFLINE", activity.State);
         Assert.Equal(0, activity.TotalTrajectories);
     }
+
+    [Fact]
+    public async Task GetActivityStateAsync_WhenRpcPayloadIsMissing_ReturnsUnknown()
+    {
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>(new[] { _validProc }),
+            GetListeningPortsFunc = _ => Task.FromResult<IReadOnlyList<int>>(new[] { 51768 })
+        };
+        var rpc = new MockAG2RpcClient
+        {
+            GetAllCascadeTrajectoriesFunc = (_, _, _) => Task.FromResult<RawTrajectoriesResponse?>(null)
+        };
+        var adapter = new AG2LiveAdapter(new AG2ProcessDetector(inspector, rpc), rpc);
+
+        var activity = await adapter.GetActivityStateAsync();
+
+        Assert.Equal("UNKNOWN", activity.State);
+    }
+
+    [Fact]
+    public async Task AccountQuotaObservationBindsIdentityAndQuotaToOneRpcPayload()
+    {
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>(new[] { _validProc }),
+            GetListeningPortsFunc = _ => Task.FromResult<IReadOnlyList<int>>(new[] { 51768 })
+        };
+        int userStatusCalls = 0;
+        var rpc = new MockAG2RpcClient
+        {
+            GetUserStatusFunc = (_, _, _) =>
+            {
+                Interlocked.Increment(ref userStatusCalls);
+                return Task.FromResult<RawUserStatusResponse?>(new RawUserStatusResponse
+                {
+                    UserStatus = new RawUserStatus { Email = "source@example.com" }
+                });
+            }
+        };
+        var adapter = new AG2LiveAdapter(new AG2ProcessDetector(inspector, rpc), rpc);
+
+        var observation = await adapter.GetAccountQuotaObservationAsync();
+
+        Assert.Equal("source@example.com", observation.Account?.Email);
+        Assert.NotNull(observation.Quota);
+        Assert.Equal(1, userStatusCalls);
+    }
 }

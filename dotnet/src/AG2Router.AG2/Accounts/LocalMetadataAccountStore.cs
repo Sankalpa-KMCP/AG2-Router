@@ -207,6 +207,22 @@ public class LocalMetadataAccountStore : IAccountStore
         }, cancellationToken);
     }
 
+    public Task<bool> RestoreAccountIfUnchangedAsync(
+        AccountMetadata expectedCurrent, AccountMetadata previous, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(expectedCurrent);
+        ArgumentNullException.ThrowIfNull(previous);
+        if (expectedCurrent.Id != previous.Id) return Task.FromResult(false);
+        return MutateAsync(state =>
+        {
+            var accounts = state.Accounts.ToList();
+            int index = accounts.FindIndex(account => account.Id == expectedCurrent.Id);
+            if (index < 0 || accounts[index] != expectedCurrent) return (state, false);
+            accounts[index] = previous;
+            return (new StoreState(accounts, state.ActiveAccountId), true);
+        }, cancellationToken);
+    }
+
     public Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(id)) return Task.FromResult(false);

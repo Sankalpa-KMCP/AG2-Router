@@ -9,6 +9,10 @@ public interface IAccountStore
     Task<AccountMetadata?> GetAccountByEmailAsync(string email, CancellationToken cancellationToken = default);
     Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default);
     Task<AccountMetadata?> UpdateAccountAsync(string id, UpdateAccountInput updates, CancellationToken cancellationToken = default);
+    Task<bool> RestoreAccountIfUnchangedAsync(
+        AccountMetadata expectedCurrent,
+        AccountMetadata previous,
+        CancellationToken cancellationToken = default);
     Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default);
     Task<bool> RemoveAccountIfUnchangedAsync(
         AccountMetadata expected,
@@ -31,8 +35,11 @@ public interface IAG2Adapter
     Task<Ag2StatusDto> GetStatusAsync(CancellationToken cancellationToken = default);
     Task<AccountIdentityDto?> GetCurrentAccountAsync(CancellationToken cancellationToken = default);
     Task<QuotaSnapshotDto?> GetQuotaAsync(CancellationToken cancellationToken = default);
+    Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(CancellationToken cancellationToken = default);
     Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default);
 }
+
+public record AccountQuotaObservation(AccountIdentityDto? Account, QuotaSnapshotDto? Quota);
 
 public interface ISessionVault
 {

@@ -133,6 +133,21 @@ public class InMemoryAccountStore : IAccountStore
         }
     }
 
+    public Task<bool> RestoreAccountIfUnchangedAsync(
+        AccountMetadata expectedCurrent, AccountMetadata previous, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(expectedCurrent);
+        ArgumentNullException.ThrowIfNull(previous);
+        if (expectedCurrent.Id != previous.Id) return Task.FromResult(false);
+        lock (_syncRoot)
+        {
+            if (!_accounts.TryGetValue(expectedCurrent.Id, out var current) || current != expectedCurrent)
+                return Task.FromResult(false);
+            _accounts[previous.Id] = previous;
+            return Task.FromResult(true);
+        }
+    }
+
     /// <inheritdoc />
     public Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default)
     {

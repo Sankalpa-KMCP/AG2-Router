@@ -111,9 +111,14 @@ public static class ModelQuotaFormatter
         {
             var first = models[0];
             var label = string.IsNullOrWhiteSpace(first.Label) ? "Model Quota" : first.Label;
-            var value = $"{Math.Round(first.RemainingFraction * 100)}%";
+            static string FormatPercent(double? fraction) =>
+                fraction is double f && double.IsFinite(f)
+                    ? $"{Math.Round(Math.Clamp(f, 0.0, 1.0) * 100)}%"
+                    : "—%";
+
+            var value = FormatPercent(first.RemainingFraction);
             var tooltip = models.Count > 1
-                ? string.Join(Environment.NewLine, models.Select(m => $"{m.Label}: {Math.Round(m.RemainingFraction * 100)}%"))
+                ? string.Join(Environment.NewLine, models.Select(m => $"{m.Label}: {FormatPercent(m.RemainingFraction)}"))
                 : null;
             return (label, value, tooltip);
         }

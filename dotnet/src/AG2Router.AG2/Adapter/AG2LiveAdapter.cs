@@ -103,6 +103,29 @@ public class AG2LiveAdapter : IAG2Adapter
         }
     }
 
+    public async Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var session = await EnsureSessionAsync(cancellationToken).ConfigureAwait(false);
+        if (session == null) return new AccountQuotaObservation(null, null);
+
+        try
+        {
+            var raw = await _rpcClient.GetUserStatusAsync(
+                session.Port, session.Protocol, session.CsrfToken, cancellationToken).ConfigureAwait(false);
+            _detector.RecordRpcSuccess();
+            _lastTelemetryTimestamp = DateTime.UtcNow.ToString("o");
+            return new AccountQuotaObservation(
+                AG2TelemetryNormalizer.NormalizeAccountIdentity(raw),
+                AG2TelemetryNormalizer.NormalizeQuotaSnapshot(raw));
+        }
+        catch (Exception ex)
+        {
+            _detector.RecordRpcFailure(ex);
+            return new AccountQuotaObservation(null, null);
+        }
+    }
+
     public async Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default)
     {
         var session = await EnsureSessionAsync(cancellationToken).ConfigureAwait(false);

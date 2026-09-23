@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Text;
 using AG2Router.AG2.Accounts;
+using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Switching;
 using AG2Router.AG2.Vault;
 using AG2Router.Core.Contracts;
@@ -65,6 +66,171 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         var result = await Coordinator().SwitchAsync(_target.Id);
         Assert.Equal(SwitchResultCodes.AlreadyActive, result.Code);
         Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task StoredSourceAndLiveIdentityMismatchFailsBeforeMutation()
+    {
+        await SeedAccountsAsync();
+        _adapter.Identity = new AccountIdentityDto("external@example.com");
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public async Task SourceIdentityRotationBeforeMutationFailsClosed()
+    {
+        await SeedAccountsAsync();
+        int reads = 0;
+        _adapter.IdentityBehavior = _ => Task.FromResult<AccountIdentityDto?>(
+            new AccountIdentityDto(Interlocked.Increment(ref reads) == 1
+                ? "source@example.com" : "external@example.com"));
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+    }
+
+    [Fact]
+    public async Task IdentityChangesWhileTargetVaultLoads_NoProcessOrCredentialMutation()
+    {
+        await SeedAccountsAsync();
+        var decryptEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeDecrypt = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blockingVault = new SessionVault(_tempDir, new DelayedDecryptProvider(_dpapi,
+            decryptEntered, resumeDecrypt));
+        var coordinator = new NativeAccountSwitchCoordinator(_accounts, blockingVault,
+            _credentials, _credentials, _adapter, _process);
+
+        var switching = coordinator.SwitchAsync(_target!.Id);
+        await decryptEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        _adapter.Identity = new AccountIdentityDto("external@example.com");
+        resumeDecrypt.TrySetResult();
+        var result = await switching.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task IdentityChangesAtLastPreStopRead_NoProcessOrCredentialMutation()
+    {
+        await SeedAccountsAsync();
+        int reads = 0;
+        _adapter.IdentityBehavior = _ => Task.FromResult<AccountIdentityDto?>(
+            new AccountIdentityDto(Interlocked.Increment(ref reads) >= 3
+                ? "external@example.com" : "source@example.com"));
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task IdentityChangesDuringFinalActiveRead_NoProcessOrCredentialMutation()
+    {
+        await SeedAccountsAsync();
+        int reads = 0;
+        _adapter.IdentityBehavior = _ => Task.FromResult<AccountIdentityDto?>(
+            new AccountIdentityDto(Interlocked.Increment(ref reads) >= 4
+                ? "external@example.com" : "source@example.com"));
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task IdentityChangesDuringStopRevalidation_NoProcessOrCredentialMutation()
+    {
+        await SeedAccountsAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _process.BeforeKillBehavior = async _ =>
+        {
+            entered.TrySetResult();
+            await resume.Task;
+        };
+
+        var switching = Coordinator().SwitchAsync(_target!.Id);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        _adapter.Identity = new AccountIdentityDto("external@example.com");
+        resume.TrySetResult();
+        var result = await switching.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Theory]
+    [InlineData("BUSY", 1, SwitchResultCodes.Ag2Busy)]
+    [InlineData("UNKNOWN", 0, SwitchResultCodes.TelemetryUnavailable)]
+    public async Task ActivityChangesAtStopBoundary_NoProcessOrCredentialMutation(
+        string state, int running, string expectedCode)
+    {
+        await SeedAccountsAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _process.BeforeKillBehavior = async _ =>
+        {
+            entered.TrySetResult();
+            await resume.Task;
+        };
+
+        var switching = Coordinator().SwitchAsync(_target!.Id);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        _adapter.Activity = new ActivityStatusDto(state, running, running, DateTimeOffset.UtcNow.ToString("O"));
+        resume.TrySetResult();
+        var result = await switching.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(expectedCode, result.Code);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task ThrowingFinalActivityProofNeverQuiescesOriginalProcess()
+    {
+        await SeedAccountsAsync();
+        _process.BeforeKillBehavior = _ =>
+        {
+            _adapter.ActivityBehavior = _ => throw new IOException("synthetic final activity failure");
+            return Task.CompletedTask;
+        };
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.False(result.Success);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _process.QuiesceCount);
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    [Fact]
+    public async Task MissingActivityEvidenceFailsBeforeMutation()
+    {
+        await SeedAccountsAsync();
+        _adapter.Activity = AG2Router.AG2.Normalization.AG2TelemetryNormalizer.NormalizeActivitySnapshot(null);
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
     }
 
     [Theory]
@@ -294,9 +460,9 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         _adapter.IdentityBehavior = async ct =>
         {
             int call = Interlocked.Increment(ref calls);
-            if (call == 1)
+            if (call <= 5)
                 return new AccountIdentityDto("source@example.com");
-            if (call > 2) return new AccountIdentityDto("source@example.com");
+            if (call > 6) return new AccountIdentityDto("source@example.com");
             identityEntered.TrySetResult();
             await releaseIdentity.Task.WaitAsync(ct);
             return new AccountIdentityDto("target@example.com");
@@ -362,6 +528,221 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         Assert.DoesNotContain("rollbacksecret", exposed);
     }
 
+    [Fact]
+    public async Task CoordinateShutdownAsync_WhenIdle_CompletesAndRejectsSubsequentSwitches()
+    {
+        await SeedAccountsAsync();
+        var coordinator = Coordinator();
+        await coordinator.CoordinateShutdownAsync(TimeSpan.FromSeconds(5));
+
+        var result = await coordinator.SwitchAsync(_target!.Id);
+        Assert.Equal(SwitchResultCodes.Cancelled, result.Code);
+        Assert.Contains("shutting down", result.Message);
+    }
+
+    [Fact]
+    public async Task CoordinateShutdownAsync_ClosesAdmissionAndReportsActiveTimeout()
+    {
+        await SeedAccountsAsync();
+        var stopped = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _process.StopBehavior = async _ =>
+        {
+            stopped.TrySetResult(true);
+            await release.Task;
+        };
+        var coordinator = Coordinator();
+        var switching = coordinator.SwitchAsync(_target!.Id);
+        await stopped.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            coordinator.CoordinateShutdownAsync(TimeSpan.FromMilliseconds(20)));
+        release.TrySetResult(true);
+        var outcome = await switching.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, outcome.Code);
+        Assert.Equal(SwitchResultCodes.Cancelled, (await coordinator.SwitchAsync(_target.Id)).Code);
+    }
+
+    [Fact]
+    public async Task CallerCancellationAfterProcessTransitionStarted_DoesNotCancelMutationOrRollback()
+    {
+        await SeedAccountsAsync();
+        using var callerCts = new CancellationTokenSource();
+        _process.OnStop = () =>
+        {
+            // Cancel caller token right after process transition starts
+            callerCts.Cancel();
+        };
+
+        var coordinator = Coordinator();
+        var result = await coordinator.SwitchAsync(_target!.Id, callerCts.Token);
+
+        // Switch completed successfully despite caller cancellation after mutation boundary
+        Assert.True(result.Success);
+        Assert.Equal(SwitchResultCodes.Success, result.Code);
+        Assert.Equal(_target!.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public async Task RollbackTimeoutProducesExplicitManualRecoveryState()
+    {
+        await SeedAccountsAsync();
+        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
+        _process.QuiesceBehavior = token => Task.Delay(Timeout.Infinite, token);
+        var coordinator = new NativeAccountSwitchCoordinator(
+            _accounts, _vault, _credentials, _credentials, _adapter, _process,
+            processTimeout: TimeSpan.FromMilliseconds(100),
+            verificationTimeout: TimeSpan.FromMilliseconds(100),
+            rollbackTimeout: TimeSpan.FromMilliseconds(30));
+
+        var result = await coordinator.SwitchAsync(_target!.Id).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, result.Code);
+        Assert.True(result.ManualRecoveryRequired);
+        Assert.Contains("ROLLBACK_FAILED", result.StagesCompleted);
+    }
+
+    [Fact]
+    public async Task NonCooperativeRollbackTimesOutWithoutReleasingSwitchOwnership()
+    {
+        await SeedAccountsAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
+        _process.QuiesceBehavior = async _ =>
+        {
+            entered.TrySetResult();
+            await release.Task; // deliberately ignores cancellation
+        };
+        var coordinator = Coordinator(transactionTimeout: TimeSpan.FromSeconds(2));
+        try
+        {
+            var first = coordinator.SwitchAsync(_target!.Id);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(uncertain.ManualRecoveryRequired);
+            Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, uncertain.Code);
+
+            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.True(later.ManualRecoveryRequired);
+            Assert.Equal(1, _process.StopCount);
+            Assert.Equal(0, _credentials.WriteCount);
+            Assert.True(coordinator.GetStatus().LastResult?.ManualRecoveryRequired);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+        var gate = PathLockRegistry.Get(_vault.GetVaultPath() + ".switch");
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        gate.Release();
+        Assert.True(coordinator.GetStatus().LastResult?.ManualRecoveryRequired);
+    }
+
+    [Fact]
+    public async Task NonCooperativeForwardMutationCannotRaceLaterSwitchOrDowngradeRecovery()
+    {
+        await SeedAccountsAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _process.StopBehavior = async _ =>
+        {
+            entered.TrySetResult();
+            await release.Task; // late continuation can attempt its next mutation
+        };
+        var coordinator = Coordinator(transactionTimeout: TimeSpan.FromSeconds(2));
+        try
+        {
+            var first = coordinator.SwitchAsync(_target!.Id);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(uncertain.ManualRecoveryRequired);
+
+            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.True(later.ManualRecoveryRequired);
+            Assert.Equal(1, _process.StopCount);
+            Assert.Equal(0, _credentials.WriteCount);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+        var gate = PathLockRegistry.Get(_vault.GetVaultPath() + ".switch");
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        gate.Release();
+        Assert.True(coordinator.GetStatus().LastResult?.ManualRecoveryRequired);
+    }
+
+    [Fact]
+    public async Task LateCredentialWriteAfterDeadlineCannotOverlapAnotherTransaction()
+    {
+        await SeedAccountsAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _credentials.WriteBehavior = async (call, entry, _) =>
+        {
+            if (call == 1)
+            {
+                entered.TrySetResult();
+                await release.Task; // the writer ignores cancellation, then really mutates
+            }
+            _credentials.Set(entry);
+            return true;
+        };
+        var coordinator = Coordinator(transactionTimeout: TimeSpan.FromSeconds(2));
+        try
+        {
+            var first = coordinator.SwitchAsync(_target!.Id);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(uncertain.ManualRecoveryRequired);
+
+            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.True(later.ManualRecoveryRequired);
+            Assert.Equal(1, _credentials.WriteCount);
+            var gate = PathLockRegistry.Get(_vault.GetVaultPath() + ".switch");
+            Assert.False(await gate.WaitAsync(TimeSpan.FromMilliseconds(30)));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+        var settledGate = PathLockRegistry.Get(_vault.GetVaultPath() + ".switch");
+        Assert.True(await settledGate.WaitAsync(TimeSpan.FromSeconds(2)));
+        settledGate.Release();
+        Assert.True(coordinator.GetStatus().LastResult?.ManualRecoveryRequired);
+    }
+
+    [Fact]
+    public async Task CleanupFaultCannotMaskEstablishedRollbackFailure()
+    {
+        await SeedAccountsAsync();
+        _process.StopError = new AG2ProcessLifecycleException("synthetic stop failure");
+        _process.RestoreError = new AG2ProcessLifecycleException("synthetic restore failure");
+        var coordinator = Coordinator();
+        coordinator.BeforeLeaseReleaseAsync = () => throw new IOException("synthetic lease release failure");
+
+        var result = await coordinator.SwitchAsync(_target!.Id);
+
+        Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, result.Code);
+        Assert.True(result.ManualRecoveryRequired);
+        Assert.True(coordinator.GetStatus().LastResult?.ManualRecoveryRequired);
+        Assert.Contains("Cleanup also failed", coordinator.GetStatus().LastResult?.Message);
+    }
+
+    private sealed class DelayedDecryptProvider(
+        IDpapiProvider inner, TaskCompletionSource entered, TaskCompletionSource release) : IDpapiProvider
+    {
+        public Task<byte[]> EncryptAsync(byte[] plaintext, CancellationToken cancellationToken = default) =>
+            inner.EncryptAsync(plaintext, cancellationToken);
+
+        public async Task<byte[]> DecryptAsync(byte[] ciphertext, CancellationToken cancellationToken = default)
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+            return await inner.DecryptAsync(ciphertext, cancellationToken);
+        }
+    }
+
     private async Task SeedAccountsAsync(bool vaultTarget = true)
     {
         _source = await _accounts.AddAccountAsync(new CreateAccountInput(
@@ -375,11 +756,13 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         }
     }
 
-    private NativeAccountSwitchCoordinator Coordinator(TimeSpan? verificationTimeout = null) =>
+    private NativeAccountSwitchCoordinator Coordinator(
+        TimeSpan? verificationTimeout = null, TimeSpan? transactionTimeout = null) =>
         new(_accounts, _vault, _credentials, _credentials, _adapter, _process,
             processTimeout: TimeSpan.FromMilliseconds(100),
             verificationTimeout: verificationTimeout ?? TimeSpan.FromMilliseconds(100),
-            pollInterval: TimeSpan.FromMilliseconds(5));
+            pollInterval: TimeSpan.FromMilliseconds(5),
+            transactionTimeout: transactionTimeout);
 
     private void ConfigureFailure(string failure)
     {
@@ -460,6 +843,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         public Ag2StatusDto Status { get; set; } =
             new(true, "HEALTHY", new ActivityStatusDto("IDLE", 0, 0, DateTimeOffset.UtcNow.ToString("O")), "synthetic");
         public Func<CancellationToken, Task<AccountIdentityDto?>>? IdentityBehavior { get; set; }
+        public Func<CancellationToken, Task<ActivityStatusDto>>? ActivityBehavior { get; set; }
 
         public Task<Ag2StatusDto> GetStatusAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(Status);
@@ -467,8 +851,10 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             IdentityBehavior?.Invoke(cancellationToken) ?? Task.FromResult(Identity);
         public Task<QuotaSnapshotDto?> GetQuotaAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult<QuotaSnapshotDto?>(null);
+        public Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new AccountQuotaObservation(Identity, null));
         public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult(Activity);
+            ActivityBehavior?.Invoke(cancellationToken) ?? Task.FromResult(Activity);
     }
 
     private sealed class SwitchProcessLifecycle : IAG2ProcessLifecycle
@@ -490,12 +876,16 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         public int RevalidateErrorOnCall { get; set; }
         public bool GenerationCurrent { get; set; } = true;
         public int StopCount { get; private set; }
+        public int QuiesceCount { get; private set; }
         public int LaunchCount { get; private set; }
         public int RestoreCount { get; private set; }
         public bool RollbackTokenWasCancelled { get; private set; }
         public Action? OnReplacement { get; set; }
         public Action? OnRestore { get; set; }
         public Action? OnStop { get; set; }
+        public Func<CancellationToken, Task>? StopBehavior { get; set; }
+        public Func<CancellationToken, Task>? BeforeKillBehavior { get; set; }
+        public Func<CancellationToken, Task>? QuiesceBehavior { get; set; }
 
         public Task<AG2ProcessSnapshot> CaptureVerifiedAsync(CancellationToken cancellationToken = default) =>
             CaptureError != null ? Task.FromException<AG2ProcessSnapshot>(CaptureError) : Task.FromResult(_snapshot);
@@ -508,14 +898,21 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             return Task.CompletedTask;
         }
 
-        public Task StopVerifiedAsync(
+        public async Task StopVerifiedAsync(
             AG2ProcessSnapshot snapshot,
             TimeSpan timeout,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
+            Action? onStopAttempted = null)
         {
+            if (BeforeKillBehavior != null) await BeforeKillBehavior(cancellationToken);
+            if (verifyBeforeKillAsync != null) await verifyBeforeKillAsync(cancellationToken);
+            onStopAttempted?.Invoke();
             StopCount++;
             OnStop?.Invoke();
-            return StopError != null ? Task.FromException(StopError) : Task.CompletedTask;
+            if (StopBehavior != null) await StopBehavior(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (StopError != null) throw StopError;
         }
 
         public Task<AG2ProcessGeneration> LaunchAsync(
@@ -539,15 +936,16 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             return Task.FromResult(_replacement);
         }
 
-        public Task QuiesceForRollbackAsync(
+        public async Task QuiesceForRollbackAsync(
             AG2ProcessSnapshot original,
             AG2ProcessGeneration? transactionOwnedReplacement,
             TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
+            QuiesceCount++;
             RollbackTokenWasCancelled = cancellationToken.IsCancellationRequested;
+            if (QuiesceBehavior != null) await QuiesceBehavior(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
-            return Task.CompletedTask;
         }
 
         public Task<AG2ProcessGeneration> RestoreAsync(

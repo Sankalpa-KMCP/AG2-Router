@@ -7,20 +7,19 @@
   import RoutingConfigSection from './lib/components/RoutingConfigSection.svelte';
   import ActivityLogSection from './lib/components/ActivityLogSection.svelte';
   import ConnectAccountModal from './lib/components/ConnectAccountModal.svelte';
-  import SwitchPlanModal from './lib/components/SwitchPlanModal.svelte';
   import DeleteAccountModal from './lib/components/DeleteAccountModal.svelte';
   import ExecuteSwitchConfirmModal from './lib/components/ExecuteSwitchConfirmModal.svelte';
   import { api } from './lib/api/client.js';
   import {
     resolveAccountDisplayName,
     getAccountSubtitle,
-    deriveLowestModelQuota
+    deriveLowestModelQuota,
+    DashboardRefreshGate
   } from './lib/utils/helpers.js';
   import type {
     SystemStatusDto,
     AccountMetadata,
-    RouterConfigDto,
-    SwitchPlanDto
+    RouterConfigDto
   } from './lib/api/types.js';
 
   // Application State
@@ -45,12 +44,6 @@
 
   // Modal State
   let isConnectModalOpen = $state<boolean>(false);
-
-  let planModalOpen = $state<boolean>(false);
-  let planTargetAccount = $state<AccountMetadata | null>(null);
-  let planData = $state<SwitchPlanDto | null>(null);
-  let isPlanLoading = $state<boolean>(false);
-  let planError = $state<string | null>(null);
 
   let deleteModalOpen = $state<boolean>(false);
   let deleteTargetAccount = $state<AccountMetadata | null>(null);
@@ -98,7 +91,11 @@
   const lowestQuota = $derived(deriveLowestModelQuota(modelPools));
 
   const exhaustedCount = $derived(
-    modelPools.filter(m => m.isExhausted || m.remainingFraction <= 0).length
+    modelPools.filter(m => m.isExhausted || (m.remainingFraction !== null && Number.isFinite(m.remainingFraction) && m.remainingFraction <= 0)).length
+  );
+
+  const unknownModelsCount = $derived(
+    modelPools.filter(m => !m.isExhausted && (m.remainingFraction === null || !Number.isFinite(m.remainingFraction))).length
   );
 
   const activeModelsCount = $derived(modelPools.length);
@@ -118,57 +115,70 @@
 
   // Polling routine
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  const refreshGate = new DashboardRefreshGate();
+  let latestRefresh = 0;
 
   async function refreshAll() {
+    const refreshId = ++latestRefresh;
     isRefreshing = true;
+    const statusTicket = refreshGate.beginRead('status');
+    const accountsTicket = refreshGate.beginRead('accounts');
+    const configTicket = refreshGate.beginRead('config');
     try {
-      const [statusRes, accountsRes, configRes] = await Promise.all([
-        api.getStatus().catch(() => null),
-        api.getAccounts().catch(() => ({ accounts: [], totalCount: 0, activeAccountId: null })),
-        api.getConfig().catch(() => ({ config: null }))
+      await Promise.all([
+        api.getStatus().then(value => {
+          if (refreshGate.canPublish(statusTicket)) status = value;
+        }).catch(() => {}),
+        api.getAccounts().then(value => {
+          if (refreshGate.canPublish(accountsTicket)) {
+            accounts = value.accounts;
+            totalAccountsCount = value.totalCount;
+            activeAccountId = value.activeAccountId;
+          }
+        }).catch(() => {}),
+        api.getConfig().then(value => {
+          if (value.config && refreshGate.canPublish(configTicket)) routerConfig = value.config;
+        }).catch(() => {})
       ]);
 
-      if (statusRes) {
-        status = statusRes;
-      }
-      if (accountsRes) {
-        accounts = accountsRes.accounts || [];
-        totalAccountsCount = accountsRes.totalCount ?? accounts.length;
-        activeAccountId = accountsRes.activeAccountId || null;
-      }
-      if (configRes && configRes.config) {
-        routerConfig = configRes.config;
-      }
-
-      lastPollTime = new Date().toLocaleTimeString();
+      if (refreshId === latestRefresh) lastPollTime = new Date().toLocaleTimeString();
     } finally {
-      isInitialLoading = false;
-      isRefreshing = false;
+      if (refreshId === latestRefresh) {
+        isInitialLoading = false;
+        isRefreshing = false;
+      }
     }
   }
 
   // Handlers
   async function handleUpdateAlias(id: string, newAlias: string) {
-    const res = await api.updateAccountAlias(id, newAlias);
-    if (res.success && res.account) {
-      accounts = accounts.map(a => (a.id === id ? { ...a, alias: res.account.alias } : a));
-      logActivity(`Updated alias for ${res.account.email} to "${res.account.alias || '(cleared)'}".`);
+    refreshGate.beginMutation();
+    try {
+      const res = await api.updateAccountAlias(id, newAlias);
+      if (res.success && res.account) {
+        accounts = accounts.map(a => (a.id === id ? { ...a, alias: res.account.alias } : a));
+        logActivity(`Updated alias for ${res.account.email} to "${res.account.alias || '(cleared)'}".`);
+      }
+    } finally {
+      refreshGate.endMutation();
     }
   }
 
   async function handleSaveCurrentAccount() {
     isSavingCurrent = true;
+    refreshGate.beginMutation();
     try {
       const res = await api.enrollCurrentAccount();
       logActivity(res.message || `Captured running Antigravity 2 session for ${res.account.email}.`);
-      await refreshAll();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Session capture failed';
       logActivity(`Session capture error: ${msg}`);
       globalNotification = { type: 'error', message: msg };
     } finally {
+      refreshGate.endMutation();
       isSavingCurrent = false;
     }
+    await refreshAll();
   }
 
   async function handleConnectAccount(data: {
@@ -178,29 +188,14 @@
     priority: number;
     isReserve: boolean;
   }) {
-    const res = await api.createAccount(data);
-    logActivity(`Connected account metadata for ${res.account.email}.`);
+    refreshGate.beginMutation();
+    try {
+      const res = await api.createAccount(data);
+      logActivity(`Connected account metadata for ${res.account.email}.`);
+    } finally {
+      refreshGate.endMutation();
+    }
     await refreshAll();
-  }
-
-  function handleOpenPlanSwitch(account: AccountMetadata) {
-    planTargetAccount = account;
-    planData = null;
-    planError = null;
-    isPlanLoading = true;
-    planModalOpen = true;
-
-    api.planSwitch(account.id)
-      .then(res => {
-        planData = res.plan;
-        logActivity(`Evaluated switch readiness for ${account.email}: ${res.plan.ready ? 'READY' : 'BLOCKED'}`);
-      })
-      .catch(err => {
-        planError = err instanceof Error ? err.message : 'Switch evaluation error';
-      })
-      .finally(() => {
-        isPlanLoading = false;
-      });
   }
 
   function handleOpenExecuteSwitch(account: AccountMetadata) {
@@ -210,13 +205,15 @@
 
   async function handleConfirmSwitch(account: AccountMetadata) {
     isSwitching = true;
+    refreshGate.beginMutation();
     try {
       const res = await api.executeSwitch(account.id);
       logActivity(res.message || `Switched active account to ${account.email}.`);
-      await refreshAll();
     } finally {
+      refreshGate.endMutation();
       isSwitching = false;
     }
+    await refreshAll();
   }
 
   function handleOpenDelete(account: AccountMetadata) {
@@ -226,6 +223,7 @@
 
   async function handleConfirmDelete(account: AccountMetadata) {
     isDeleting = true;
+    refreshGate.beginMutation();
     try {
       const res = await api.deleteAccount(account.id);
       if (res.vaultRecordDeleted) {
@@ -233,10 +231,11 @@
       } else {
         logActivity(`Deleted account metadata (${account.email}).`);
       }
-      await refreshAll();
     } finally {
+      refreshGate.endMutation();
       isDeleting = false;
     }
+    await refreshAll();
   }
 
   async function handleSaveConfig(updated: {
@@ -245,12 +244,17 @@
     minimumCandidateQuotaPercent: number;
     pollingIntervalMs: number;
   }) {
-    const res = await api.saveConfig(updated);
-    if (res.success && res.config) {
-      routerConfig = res.config;
-      logActivity(`Updated router configuration: AutoSwitch=${updated.autoSwitchEnabled}, Threshold=${updated.lowQuotaThresholdPercent}%`);
-      await refreshAll();
+    refreshGate.beginMutation();
+    try {
+      const res = await api.saveConfig(updated);
+      if (res.success && res.config) {
+        routerConfig = res.config;
+        logActivity(`Updated router configuration: AutoSwitch=${updated.autoSwitchEnabled}, Threshold=${updated.lowQuotaThresholdPercent}%`);
+      }
+    } finally {
+      refreshGate.endMutation();
     }
+    await refreshAll();
   }
 
   onMount(() => {
@@ -302,6 +306,7 @@
         {activeAccountSubtitle}
         {lowestQuota}
         {exhaustedCount}
+        {unknownModelsCount}
         {activeModelsCount}
         {autoSwitchEnabled}
         {lowThresholdPercent}
@@ -357,7 +362,6 @@
           {accounts}
           onSaveCurrent={handleSaveCurrentAccount}
           onOpenConnect={() => (isConnectModalOpen = true)}
-          onPlanSwitch={handleOpenPlanSwitch}
           onExecuteSwitch={handleOpenExecuteSwitch}
           onDeleteAccount={handleOpenDelete}
           onUpdateAlias={handleUpdateAlias}
@@ -369,7 +373,6 @@
           {accounts}
           onSaveCurrent={handleSaveCurrentAccount}
           onOpenConnect={() => (isConnectModalOpen = true)}
-          onPlanSwitch={handleOpenPlanSwitch}
           onExecuteSwitch={handleOpenExecuteSwitch}
           onDeleteAccount={handleOpenDelete}
           onUpdateAlias={handleUpdateAlias}
@@ -411,15 +414,6 @@
   isOpen={isConnectModalOpen}
   onClose={() => (isConnectModalOpen = false)}
   onSubmit={handleConnectAccount}
-/>
-
-<SwitchPlanModal
-  isOpen={planModalOpen}
-  targetAccount={planTargetAccount}
-  plan={planData}
-  isLoading={isPlanLoading}
-  error={planError}
-  onClose={() => (planModalOpen = false)}
 />
 
 <ExecuteSwitchConfirmModal

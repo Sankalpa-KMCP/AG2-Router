@@ -17,7 +17,9 @@ public class RoutingSafetyGate
         [RoutingSafetyGateState.Idle] = new(StringComparer.OrdinalIgnoreCase)
         {
             RoutingSafetyGateState.LowQuotaDetected,
-            RoutingSafetyGateState.SwitchPending
+            RoutingSafetyGateState.SwitchPending,
+            RoutingSafetyGateState.Cooldown,
+            RoutingSafetyGateState.ManualRecoveryRequired
         },
         [RoutingSafetyGateState.LowQuotaDetected] = new(StringComparer.OrdinalIgnoreCase)
         {

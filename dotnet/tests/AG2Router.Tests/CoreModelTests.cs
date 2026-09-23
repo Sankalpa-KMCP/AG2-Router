@@ -7,6 +7,21 @@ namespace AG2Router.Tests;
 public class CoreModelTests
 {
     [Fact]
+    public void CanonicalQuotaAndAccountFieldsSerializeWithFrontendWireNames()
+    {
+        var model = new CanonicalModelQuotaDto("tier:pro", "Pro", "pro", 0.4, null, false, ["Standard"]);
+        using var modelJson = JsonDocument.Parse(JsonSerializer.Serialize(model, JsonSerializerOptions.Web));
+        Assert.Equal("tier:pro", modelJson.RootElement.GetProperty("canonicalKey").GetString());
+        Assert.Equal("Pro", modelJson.RootElement.GetProperty("displayLabel").GetString());
+
+        var account = new AccountMetadata("acc_1", "user@example.com", null, 1, false,
+            "VALID", false, "2026-09-20T08:00:00Z", "2026-09-20T08:00:00Z",
+            LastActiveAt: "2026-09-20T09:00:00Z");
+        using var accountJson = JsonDocument.Parse(JsonSerializer.Serialize(account, JsonSerializerOptions.Web));
+        Assert.True(accountJson.RootElement.TryGetProperty("lastActiveAt", out _));
+        Assert.False(accountJson.RootElement.TryGetProperty("lastUsedAt", out _));
+    }
+    [Fact]
     public void RouterConfigDto_Defaults_MatchSystemContracts()
     {
         var config = new RouterConfigDto();

@@ -1,6 +1,6 @@
 <script lang="ts">
   import ProgressRing from './ProgressRing.svelte';
-  import { formatQuotaFraction, formatResetTime } from '../utils/helpers.js';
+  import { formatCreditPool, formatQuotaFraction, formatResetTime } from '../utils/helpers.js';
   import type { QuotaSnapshotDto } from '../api/types.js';
 
   interface Props {
@@ -28,7 +28,7 @@
       <h2 class="quota-title">Quota Overview</h2>
       <p class="quota-subtitle">
         {hasCanonical
-          ? 'Canonical model pools • Reasoning variants deduplicated'
+          ? 'Distinct model capacity rows'
           : 'Live model quota pools'}
       </p>
     </div>
@@ -53,8 +53,9 @@
       {#if hasCanonical && canonicalModels}
         {#each canonicalModels as model (model.canonicalKey)}
           {@const pct = formatQuotaFraction(model.remainingFraction)}
-          {@const isLow = pct <= lowThresholdPercent}
-          <div class="model-pool-card {model.isExhausted ? 'exhausted' : isLow ? 'warning' : 'healthy'}">
+          {@const isUnknown = pct === null && !model.isExhausted}
+          {@const isLow = pct !== null && pct <= lowThresholdPercent}
+          <div class="model-pool-card {model.isExhausted ? 'exhausted' : isUnknown ? 'unknown' : isLow ? 'warning' : 'healthy'}">
             <div class="model-pool-top">
               <div class="model-info">
                 <h3 class="model-label">{model.displayLabel}</h3>
@@ -64,13 +65,12 @@
                   {/each}
                 </div>
               </div>
-              <ProgressRing
-                percent={pct}
-                size={58}
-                strokeWidth={6}
-                isExhausted={model.isExhausted}
-                label={model.displayLabel}
-              />
+              {#if pct !== null}
+                <ProgressRing percent={pct} size={58} strokeWidth={6}
+                  isExhausted={model.isExhausted} label={model.displayLabel} />
+              {:else}
+                <span class="unknown-quota" aria-label="Quota unknown">--%</span>
+              {/if}
             </div>
 
             <div class="model-pool-bottom">
@@ -78,8 +78,8 @@
                 <span class="reset-icon" aria-hidden="true">⏱</span>
                 <span class="reset-text">{formatResetTime(model.resetTime)}</span>
               </div>
-              <span class="badge {model.isExhausted ? 'badge-danger' : isLow ? 'badge-warning' : 'badge-healthy'}">
-                {model.isExhausted ? 'EXHAUSTED' : isLow ? 'LOW QUOTA' : 'HEALTHY'}
+              <span class="badge {model.isExhausted ? 'badge-danger' : isUnknown ? 'badge-neutral' : isLow ? 'badge-warning' : 'badge-healthy'}">
+                {model.isExhausted ? 'EXHAUSTED' : isUnknown ? 'UNKNOWN' : isLow ? 'LOW QUOTA' : 'HEALTHY'}
               </span>
             </div>
           </div>
@@ -88,20 +88,20 @@
         <!-- Graceful fallback to raw models if canonical grouping is absent -->
         {#each rawModels as model, idx (model.modelOrTier + idx)}
           {@const pct = formatQuotaFraction(model.remainingFraction)}
-          {@const isLow = pct <= lowThresholdPercent}
-          <div class="model-pool-card {model.isExhausted ? 'exhausted' : isLow ? 'warning' : 'healthy'}">
+          {@const isUnknown = pct === null && !model.isExhausted}
+          {@const isLow = pct !== null && pct <= lowThresholdPercent}
+          <div class="model-pool-card {model.isExhausted ? 'exhausted' : isUnknown ? 'unknown' : isLow ? 'warning' : 'healthy'}">
             <div class="model-pool-top">
               <div class="model-info">
                 <h3 class="model-label">{model.label}</h3>
                 <span class="mode-pill">Direct Pool</span>
               </div>
-              <ProgressRing
-                percent={pct}
-                size={58}
-                strokeWidth={6}
-                isExhausted={model.isExhausted}
-                label={model.label}
-              />
+              {#if pct !== null}
+                <ProgressRing percent={pct} size={58} strokeWidth={6}
+                  isExhausted={model.isExhausted} label={model.label} />
+              {:else}
+                <span class="unknown-quota" aria-label="Quota unknown">--%</span>
+              {/if}
             </div>
 
             <div class="model-pool-bottom">
@@ -109,8 +109,8 @@
                 <span class="reset-icon" aria-hidden="true">⏱</span>
                 <span class="reset-text">{formatResetTime(model.resetTime)}</span>
               </div>
-              <span class="badge {model.isExhausted ? 'badge-danger' : isLow ? 'badge-warning' : 'badge-healthy'}">
-                {model.isExhausted ? 'EXHAUSTED' : isLow ? 'LOW QUOTA' : 'HEALTHY'}
+              <span class="badge {model.isExhausted ? 'badge-danger' : isUnknown ? 'badge-neutral' : isLow ? 'badge-warning' : 'badge-healthy'}">
+                {model.isExhausted ? 'EXHAUSTED' : isUnknown ? 'UNKNOWN' : isLow ? 'LOW QUOTA' : 'HEALTHY'}
               </span>
             </div>
           </div>
@@ -120,46 +120,58 @@
 
     <!-- Segregated Credit Pools -->
     {#if promptCredits || flowCredits}
+      {@const prompt = formatCreditPool(promptCredits)}
+      {@const flow = formatCreditPool(flowCredits)}
       <div class="credits-section">
         <h3 class="credits-title">CREDIT POOLS (SEGREGATED)</h3>
         <div class="credits-grid">
-          {#if promptCredits}
+          {#if prompt.hasData}
             <div class="credit-card">
               <div class="credit-header">
                 <span class="credit-type">Prompt Credits</span>
                 <span class="credit-ratio">
-                  {Math.round((promptCredits.availableCredits / Math.max(1, promptCredits.monthlyCredits)) * 100)}% Available
+                  {prompt.ratioPercent !== null ? `${prompt.ratioPercent}% Available` : 'Available Pool'}
                 </span>
               </div>
               <div class="credit-values">
-                <strong>{promptCredits.availableCredits.toLocaleString()}</strong>
-                <span class="credit-total">/ {promptCredits.monthlyCredits.toLocaleString()} total</span>
+                <strong>{prompt.availableText}</strong>
+                {#if prompt.totalText}
+                  <span class="credit-total">{prompt.totalText}</span>
+                {:else}
+                  <span class="credit-total">available</span>
+                {/if}
               </div>
               <div class="credit-bar">
                 <div
                   class="credit-fill"
-                  style="width: {Math.min(100, Math.round((promptCredits.availableCredits / Math.max(1, promptCredits.monthlyCredits)) * 100))}%;"
+                  class:is-indeterminate={prompt.isIndeterminate}
+                  style="width: {prompt.ratioPercent !== null ? prompt.ratioPercent : 0}%;"
                 ></div>
               </div>
             </div>
           {/if}
 
-          {#if flowCredits}
+          {#if flow.hasData}
             <div class="credit-card">
               <div class="credit-header">
                 <span class="credit-type">Flow Credits</span>
                 <span class="credit-ratio">
-                  {Math.round((flowCredits.availableCredits / Math.max(1, flowCredits.monthlyCredits)) * 100)}% Available
+                  {flow.ratioPercent !== null ? `${flow.ratioPercent}% Available` : 'Available Pool'}
                 </span>
               </div>
               <div class="credit-values">
-                <strong>{flowCredits.availableCredits.toLocaleString()}</strong>
-                <span class="credit-total">/ {flowCredits.monthlyCredits.toLocaleString()} total</span>
+                <strong>{flow.availableText}</strong>
+                {#if flow.totalText}
+                  <span class="credit-total">{flow.totalText}</span>
+                {:else}
+                  <span class="credit-total">available</span>
+                {/if}
               </div>
               <div class="credit-bar">
                 <div
                   class="credit-fill flow-fill"
-                  style="width: {Math.min(100, Math.round((flowCredits.availableCredits / Math.max(1, flowCredits.monthlyCredits)) * 100))}%;"
+                  class:is-indeterminate={flow.isIndeterminate}
+                  style="width: {flow.ratioPercent !== null ? flow.ratioPercent : 0}%;"
                 ></div>
               </div>
             </div>
@@ -358,6 +370,11 @@
 
   .credit-fill.flow-fill {
     background-color: #8B5CF6;
+  }
+
+  .credit-fill.is-indeterminate {
+    opacity: 0.3;
+    background-color: var(--color-text-muted);
   }
 
   .empty-state {

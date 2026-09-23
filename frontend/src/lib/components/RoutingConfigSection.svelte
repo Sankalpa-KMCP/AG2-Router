@@ -23,17 +23,26 @@
   let localMinCandidate = $state<number>(30);
   let localPollingSeconds = $state<number>(10);
 
+  let isDirty = $state<boolean>(false);
+  let editGeneration = 0;
   let isSaving = $state<boolean>(false);
   let saveMessage = $state<string | null>(null);
   let errorMessage = $state<string | null>(null);
 
-  // Sync with prop updates if changed externally
+  function markDirty() {
+    editGeneration++;
+    isDirty = true;
+  }
+
+  // Sync with prop updates if changed externally and user has not made unsubmitted changes
   $effect(() => {
-    localAutoSwitch = autoSwitchEnabled;
+    if (!isDirty) {
+      localAutoSwitch = autoSwitchEnabled;
+    }
   });
 
   $effect(() => {
-    if (config) {
+    if (config && !isDirty) {
       localLowThreshold = config.lowQuotaThresholdPercent;
       localMinCandidate = config.minimumCandidateQuotaPercent;
       localPollingSeconds = Math.round(config.pollingIntervalMs / 1000);
@@ -46,6 +55,7 @@
     isSaving = true;
     saveMessage = null;
     errorMessage = null;
+    const capturedGeneration = editGeneration;
 
     try {
       await onSaveConfig({
@@ -54,6 +64,9 @@
         minimumCandidateQuotaPercent: localMinCandidate,
         pollingIntervalMs: localPollingSeconds * 1000
       });
+      if (editGeneration === capturedGeneration) {
+        isDirty = false;
+      }
       saveMessage = 'Settings saved successfully.';
       setTimeout(() => {
         saveMessage = null;
@@ -86,6 +99,7 @@
           id="cfg-auto-switch"
           type="checkbox"
           bind:checked={localAutoSwitch}
+          onchange={markDirty}
         />
         <span class="toggle-slider"></span>
       </label>
@@ -103,6 +117,7 @@
           max="50"
           step="1"
           bind:value={localLowThreshold}
+          oninput={markDirty}
           required
         />
         <span class="form-hint">Switch triggers when quota drops to or below this level.</span>
@@ -118,6 +133,7 @@
           max="90"
           step="1"
           bind:value={localMinCandidate}
+          oninput={markDirty}
           required
         />
         <span class="form-hint">A candidate account must meet this quota floor to be selected.</span>
@@ -133,6 +149,7 @@
           max="60"
           step="1"
           bind:value={localPollingSeconds}
+          oninput={markDirty}
           required
         />
         <span class="form-hint">Telemetry refresh interval from Antigravity 2 loopback.</span>

@@ -41,21 +41,21 @@ export function getAccountSubtitle(account?: AccountDisplayNameInput | null): st
  * Formats a fractional quota [0.0, 1.0] into a clean integer percentage [0, 100].
  * Clamps strictly to [0, 100].
  */
-export function formatQuotaFraction(fraction: number): number {
-  if (typeof fraction !== 'number' || isNaN(fraction)) return 0;
+export function formatQuotaFraction(fraction: number | null | undefined): number | null {
+  if (typeof fraction !== 'number' || !Number.isFinite(fraction)) return null;
   const clamped = Math.max(0, Math.min(1, fraction));
   return Math.round(clamped * 100);
 }
 
 export interface LowestQuotaSummary {
-  fraction: number;
-  percent: number;
+  fraction: number | null;
+  percent: number | null;
   label: string;
   isExhausted: boolean;
 }
 
 export interface ModelQuotaLike {
-  remainingFraction: number;
+  remainingFraction: number | null;
   isExhausted?: boolean;
   label?: string;
   displayLabel?: string;
@@ -71,12 +71,26 @@ export function deriveLowestModelQuota(
 ): LowestQuotaSummary | null {
   if (!models || models.length === 0) return null;
 
+  const exhausted = models.find(item => item.isExhausted ||
+    (typeof item.remainingFraction === 'number' && Number.isFinite(item.remainingFraction) && item.remainingFraction <= 0));
+  if (exhausted) {
+    const fraction = Number.isFinite(exhausted.remainingFraction) ? exhausted.remainingFraction : null;
+    return {
+      fraction,
+      percent: formatQuotaFraction(fraction),
+      label: exhausted.displayLabel || exhausted.label || exhausted.modelOrTier || 'Model',
+      isExhausted: true
+    };
+  }
+
+  if (models.some(item => item.remainingFraction === null || !Number.isFinite(item.remainingFraction))) return null;
+
   let lowestItem: ModelQuotaLike | null = null;
   let minFraction = Infinity;
 
   for (const item of models) {
     const fraction = item.remainingFraction;
-    if (fraction < minFraction) {
+    if (fraction !== null && fraction < minFraction) {
       minFraction = fraction;
       lowestItem = item;
     }
@@ -137,4 +151,129 @@ export function formatResetTime(resetTime?: string | null, relativeTo: Date = ne
  */
 export function prepareAliasPayload(input: string): { alias: string } {
   return { alias: input.trim() };
+}
+
+export interface PoolsStatusSummary {
+  badgeText: string;
+  badgeClass: string;
+  metricText: string;
+  metricClass: string;
+}
+
+/**
+ * Derives the truthful status summary for model quota pools.
+ * When activeModelsCount === 0, returns 'No Data' / neutral instead of fabricating 'Nominal' / 'All Healthy'.
+ */
+export function derivePoolsStatusSummary(
+  activeModelsCount: number,
+  exhaustedCount: number,
+  unknownModelsCount: number
+): PoolsStatusSummary {
+  if (activeModelsCount === 0) {
+    return {
+      badgeText: 'No Data',
+      badgeClass: 'badge-neutral',
+      metricText: 'No Data',
+      metricClass: 'text-muted'
+    };
+  }
+
+  if (exhaustedCount > 0) {
+    return {
+      badgeText: `${exhaustedCount} Near Limit`,
+      badgeClass: 'badge-danger',
+      metricText: `${exhaustedCount} Exhausted`,
+      metricClass: 'text-danger'
+    };
+  }
+
+  if (unknownModelsCount > 0) {
+    return {
+      badgeText: `${unknownModelsCount} Unknown`,
+      badgeClass: 'badge-neutral',
+      metricText: 'Quota Unknown',
+      metricClass: 'text-muted'
+    };
+  }
+
+  return {
+    badgeText: 'Nominal',
+    badgeClass: 'badge-healthy',
+    metricText: 'All Healthy',
+    metricClass: 'text-success'
+  };
+}
+
+export interface FormattedCreditPool {
+  hasData: boolean;
+  availableText: string;
+  totalText: string | null;
+  ratioPercent: number | null;
+  isIndeterminate: boolean;
+}
+
+export type RefreshResource = 'status' | 'accounts' | 'config';
+export interface RefreshTicket { resource: RefreshResource; sequence: number; mutationVersion: number }
+
+/** Rejects out-of-order reads and every read crossing a mutating request. */
+export class DashboardRefreshGate {
+  private readonly sequences: Record<RefreshResource, number> = { status: 0, accounts: 0, config: 0 };
+  private mutationVersion = 0;
+  private mutationsInFlight = 0;
+
+  beginRead(resource: RefreshResource): RefreshTicket {
+    return { resource, sequence: ++this.sequences[resource], mutationVersion: this.mutationVersion };
+  }
+
+  canPublish(ticket: RefreshTicket): boolean {
+    return this.mutationsInFlight === 0 && ticket.mutationVersion === this.mutationVersion &&
+      ticket.sequence === this.sequences[ticket.resource];
+  }
+
+  beginMutation(): void {
+    this.mutationVersion++;
+    this.mutationsInFlight++;
+  }
+
+  endMutation(): void {
+    if (this.mutationsInFlight === 0) throw new Error('No dashboard mutation is in flight');
+    this.mutationsInFlight--;
+    this.mutationVersion++;
+  }
+}
+
+/**
+ * Formats a credit pool truthfully, distinguishing unknown totals from zero and avoiding 100% fabrications.
+ */
+export function formatCreditPool(
+  pool?: { availableCredits?: number | null; monthlyCredits?: number | null; usedCredits?: number | null } | null
+): FormattedCreditPool {
+  if (!pool || (pool.availableCredits == null && pool.monthlyCredits == null)) {
+    return {
+      hasData: false,
+      availableText: '--',
+      totalText: null,
+      ratioPercent: null,
+      isIndeterminate: true
+    };
+  }
+
+  const avail = pool.availableCredits;
+  const monthly = pool.monthlyCredits;
+
+  const availableText = avail != null ? avail.toLocaleString() : '--';
+  const totalText = monthly != null && monthly > 0 ? `/ ${monthly.toLocaleString()} total` : null;
+
+  let ratioPercent: number | null = null;
+  if (avail != null && monthly != null && monthly > 0) {
+    ratioPercent = Math.max(0, Math.min(100, Math.round((avail / monthly) * 100)));
+  }
+
+  return {
+    hasData: true,
+    availableText,
+    totalText,
+    ratioPercent,
+    isIndeterminate: ratioPercent === null
+  };
 }

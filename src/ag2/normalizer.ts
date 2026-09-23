@@ -108,11 +108,11 @@ export function normalizeQuotaSnapshot(raw?: RawUserStatusResponse | null): Quot
     const q = cfg.quotaInfo;
 
     const remainingFraction =
-      typeof q?.remainingFraction === 'number'
+      typeof q?.remainingFraction === 'number' && Number.isFinite(q.remainingFraction)
         ? Math.max(0, Math.min(1, q.remainingFraction))
-        : 1.0;
+        : null;
     const resetTime = q?.resetTime || undefined;
-    const isExhausted = Boolean(q?.isExhausted || remainingFraction <= 0);
+    const isExhausted = Boolean(q?.isExhausted || remainingFraction === 0);
 
     return {
       label,
@@ -130,20 +130,20 @@ export function normalizeQuotaSnapshot(raw?: RawUserStatusResponse | null): Quot
   if (u.planStatus) {
     const planInfo = u.planStatus.planInfo;
 
-    const monthlyPrompt = typeof planInfo?.monthlyPromptCredits === 'number' ? planInfo.monthlyPromptCredits : 0;
-    const availablePrompt = typeof u.planStatus.availablePromptCredits === 'number' ? u.planStatus.availablePromptCredits : 0;
+    const monthlyPrompt = Number.isFinite(planInfo?.monthlyPromptCredits) ? planInfo!.monthlyPromptCredits! : null;
+    const availablePrompt = Number.isFinite(u.planStatus.availablePromptCredits) ? u.planStatus.availablePromptCredits! : null;
     promptCredits = {
       availableCredits: availablePrompt,
       monthlyCredits: monthlyPrompt,
-      usedCredits: Math.max(0, monthlyPrompt - availablePrompt)
+      usedCredits: monthlyPrompt === null || availablePrompt === null ? null : Math.max(0, monthlyPrompt - availablePrompt)
     };
 
-    const monthlyFlow = typeof planInfo?.monthlyFlowCredits === 'number' ? planInfo.monthlyFlowCredits : 0;
-    const availableFlow = typeof u.planStatus.availableFlowCredits === 'number' ? u.planStatus.availableFlowCredits : 0;
+    const monthlyFlow = Number.isFinite(planInfo?.monthlyFlowCredits) ? planInfo!.monthlyFlowCredits! : null;
+    const availableFlow = Number.isFinite(u.planStatus.availableFlowCredits) ? u.planStatus.availableFlowCredits! : null;
     flowCredits = {
       availableCredits: availableFlow,
       monthlyCredits: monthlyFlow,
-      usedCredits: Math.max(0, monthlyFlow - availableFlow)
+      usedCredits: monthlyFlow === null || availableFlow === null ? null : Math.max(0, monthlyFlow - availableFlow)
     };
   }
 
@@ -163,23 +163,26 @@ export function normalizeQuotaSnapshot(raw?: RawUserStatusResponse | null): Quot
  *
  * Invariant:
  * - runningTrajectories > 0 => BUSY
- * - valid response with runningTrajectories === 0 => IDLE
+ * - only an explicit empty collection or known inactive statuses => IDLE
  */
 export function normalizeActivitySnapshot(raw?: RawTrajectoriesResponse | null): ActivitySnapshot {
-  if (!raw || !raw.trajectorySummaries || typeof raw.trajectorySummaries !== 'object') {
+  if (!raw || !raw.trajectorySummaries || typeof raw.trajectorySummaries !== 'object' ||
+      Array.isArray(raw.trajectorySummaries)) {
     return {
-      state: 'IDLE',
+      state: 'UNKNOWN',
       totalTrajectories: 0,
       runningTrajectories: 0,
       timestamp: new Date().toISOString()
     };
   }
 
-  const entries = Object.values(raw.trajectorySummaries).filter((t) => Boolean(t));
+  const entries = Object.values(raw.trajectorySummaries);
   const totalTrajectories = entries.length;
-  const runningTrajectories = entries.filter((t) => t.status === 'CASCADE_RUN_STATUS_RUNNING').length;
+  const runningTrajectories = entries.filter((t) => t?.status === 'CASCADE_RUN_STATUS_RUNNING').length;
 
-  const state: TrajectoryRunState = runningTrajectories > 0 ? 'BUSY' : 'IDLE';
+  const allKnownInactive = entries.every((t) =>
+    t?.status === 'CASCADE_RUN_STATUS_IDLE' || t?.status === 'CASCADE_RUN_STATUS_DONE');
+  const state: TrajectoryRunState = runningTrajectories > 0 ? 'BUSY' : allKnownInactive ? 'IDLE' : 'UNKNOWN';
 
   return {
     state,
@@ -227,25 +230,14 @@ export function canonicalizeModelQuotas(models?: readonly ModelQuotaInfo[]): rea
   }
 
   const groups: Array<{ key: string; items: ModelQuotaInfo[] }> = [];
-  const keyIndex = new Map<string, number>();
 
-  for (const model of models) {
-    let key: string;
-    if (model.modelOrTier && model.modelOrTier.trim()) {
-      key = `tier:${model.modelOrTier.trim().toLowerCase()}`;
-    } else {
-      const cleaned = cleanModelLabel(model.label).toLowerCase();
-      const reset = model.resetTime && model.resetTime.trim() ? model.resetTime.trim() : 'none';
-      key = `label:${cleaned}:${reset}`;
-    }
+  for (const [row, model] of models.entries()) {
+    const tier = model.modelOrTier?.trim().toLowerCase() || null;
+    // Model/tier and reset equality cannot establish shared pool ownership.
+    const baseKey = tier ? `tier:${tier}` : `row:${row}`;
+    const key = groups.some(group => group.key === baseKey) ? `${baseKey}:row:${row}` : baseKey;
 
-    const existingIndex = keyIndex.get(key);
-    if (existingIndex !== undefined) {
-      groups[existingIndex].items.push(model);
-    } else {
-      keyIndex.set(key, groups.length);
-      groups.push({ key, items: [model] });
-    }
+    groups.push({ key, items: [model] });
   }
 
   return groups.map(({ key, items }) => {
@@ -262,8 +254,9 @@ export function canonicalizeModelQuotas(models?: readonly ModelQuotaInfo[]): rea
       }
     }
 
-    const remainingFraction = Math.max(0, Math.min(1, Math.min(...items.map((m) => m.remainingFraction))));
-    const isExhausted = items.some((m) => m.isExhausted) || remainingFraction <= 0;
+    const knownFractions = items.map(m => m.remainingFraction).filter((n): n is number => n !== null && Number.isFinite(n));
+    const remainingFraction = knownFractions.length > 0 ? Math.max(0, Math.min(1, Math.min(...knownFractions))) : null;
+    const isExhausted = items.some((m) => m.isExhausted) || remainingFraction === 0;
     const resetTime = selectLatestResetTime(items.map((m) => m.resetTime));
     const modelOrTier = items.find((m) => m.modelOrTier && m.modelOrTier.trim())?.modelOrTier?.trim();
 

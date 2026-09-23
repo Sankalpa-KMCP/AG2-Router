@@ -41,6 +41,7 @@ public class LoopbackServer : IAsyncDisposable
         INativeAccountSwitchCoordinator? switchCoordinator = null,
         INativeAutoRouter? autoRouter = null,
         IAutostartService? autostartService = null,
+        Action<TimeSpan>? onPollingIntervalChanged = null,
         CancellationToken cancellationToken = default)
     {
         string switchIntentToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
@@ -60,7 +61,7 @@ public class LoopbackServer : IAsyncDisposable
 
         _app = builder.Build();
 
-        // 3. Security Middleware: Reject any non-loopback connections
+        // 3. Security Middleware: Reject any non-loopback connections and enforce origin/Sec-Fetch-Site boundaries
         _app.Use(async (context, next) =>
         {
             var remoteIp = context.Connection.RemoteIpAddress;
@@ -74,6 +75,24 @@ public class LoopbackServer : IAsyncDisposable
             {
                 context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 await context.Response.WriteAsync("Forbidden: Invalid loopback host.", cancellationToken);
+                return;
+            }
+
+            // Global check for Sec-Fetch-Site: cross-site across all /api routes
+            if (context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(context.Request.Headers["Sec-Fetch-Site"], "cross-site", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                await context.Response.WriteAsync("Forbidden: Cross-site requests forbidden.", cancellationToken);
+                return;
+            }
+
+            // Reject foreign Origin whenever Origin is present
+            string origin = context.Request.Headers.Origin.ToString();
+            if (!string.IsNullOrWhiteSpace(origin) && !IsAllowedLoopbackOrigin(origin, context.Connection.LocalPort))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                await context.Response.WriteAsync("Forbidden: Unauthorized origin.", cancellationToken);
                 return;
             }
 
@@ -98,7 +117,7 @@ public class LoopbackServer : IAsyncDisposable
         {
             if (statusProvider != null)
             {
-                return Results.Ok(statusProvider());
+                return Results.Ok(SanitizeStatusQuota(statusProvider()));
             }
 
             var status = new SystemStatusDto(
@@ -138,11 +157,7 @@ public class LoopbackServer : IAsyncDisposable
             var enriched = new List<AccountMetadata>(accounts.Count);
             foreach (var acc in accounts)
             {
-                bool hasVaulted = acc.HasVaultedSession;
-                if (!hasVaulted && sessionVault != null)
-                {
-                    hasVaulted = await sessionVault.HasSessionAsync(acc.Id);
-                }
+                bool hasVaulted = await HasAvailableSessionAsync(sessionVault, acc.Id);
 
                 enriched.Add(acc with
                 {
@@ -187,6 +202,7 @@ public class LoopbackServer : IAsyncDisposable
 
             try
             {
+                input = input with { HasVaultedSession = false };
                 var created = await accountStore.AddAccountAsync(input);
                 return Results.Json(new { account = created }, statusCode: StatusCodes.Status201Created);
             }
@@ -290,11 +306,7 @@ public class LoopbackServer : IAsyncDisposable
                 return Results.Json(new { error = "Account not found" }, statusCode: StatusCodes.Status404NotFound);
             }
 
-            bool hasVaulted = updated.HasVaultedSession;
-            if (!hasVaulted && sessionVault != null)
-            {
-                hasVaulted = await sessionVault.HasSessionAsync(updated.Id);
-            }
+            bool hasVaulted = await HasAvailableSessionAsync(sessionVault, updated.Id);
             var activeId = await accountStore.GetActiveAccountIdAsync();
             var enriched = updated with
             {
@@ -332,19 +344,27 @@ public class LoopbackServer : IAsyncDisposable
                 return Results.Json(new { error = "Account not found" }, statusCode: StatusCodes.Status404NotFound);
             }
 
-            bool removed = await accountStore.RemoveAccountAsync(id);
-            bool vaultDeleted = false;
-            if (sessionVault != null)
+            if (sessionVault is not AG2Router.AG2.Vault.SessionVault concreteVault)
+                return Results.Json(new { error = "Session vault is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            try
             {
-                vaultDeleted = await sessionVault.RemoveSessionAsync(id);
+                var removal = await new AccountRemovalService(accountStore, concreteVault)
+                    .RemoveAsync(id, context.RequestAborted);
+                return Results.Ok(new { success = true, removedId = id, vaultRecordDeleted = removal.VaultRecordDeleted });
             }
-
-            return Results.Ok(new
+            catch (AccountRemovalConflictException ex)
             {
-                success = removed,
-                removedId = id,
-                vaultRecordDeleted = vaultDeleted
-            });
+                return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status409Conflict);
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.Json(new { error = "Account not found." }, statusCode: StatusCodes.Status404NotFound);
+            }
+            catch (Exception)
+            {
+                return Results.Json(new { error = "Account removal failed; existing state requires verification." },
+                    statusCode: StatusCodes.Status500InternalServerError);
+            }
         });
 
         // GET /api/switching/status - Switching state machine status
@@ -358,9 +378,6 @@ public class LoopbackServer : IAsyncDisposable
                     LastResult: null
                 )));
             }
-            // Same-origin dashboard clients obtain this per-launch token. A cross-origin form
-            // cannot read it or attach the required custom header.
-            context.Response.Headers["X-AG2-Switch-Token"] = switchIntentToken;
             var status = switchCoordinator.GetStatus();
             if (status.LastResult != null)
             {
@@ -374,6 +391,16 @@ public class LoopbackServer : IAsyncDisposable
                 };
             }
             return Results.Ok(new { status });
+        });
+
+        // A separate same-origin browser/native intent request keeps the token off status surfaces.
+        _app.MapPost("/api/switching/intent", (HttpContext context) =>
+        {
+            if (!string.Equals(context.Request.Headers["X-AG2-Intent-Request"], "1", StringComparison.Ordinal))
+                return Results.Json(new { error = "Switch intent request header is required." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            context.Response.Headers["X-AG2-Switch-Token"] = switchIntentToken;
+            return Results.Ok(new { ready = true });
         });
 
         // POST /api/accounts/{id}/switch-plan - Dry-run evaluation
@@ -423,7 +450,29 @@ public class LoopbackServer : IAsyncDisposable
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
-            var result = await switchCoordinator.SwitchAsync(id, context.RequestAborted);
+            ManualSwitchToken? manualSwitchToken = autoRouter?.NotifyManualSwitchStarted(id);
+            NativeSwitchResult result;
+            try
+            {
+                result = await switchCoordinator.SwitchAsync(id, context.RequestAborted);
+            }
+            catch (Exception)
+            {
+                var failureResult = new NativeSwitchResult(
+                    null, false, SwitchResultCodes.SwitchFailedRollbackFailed, NativeSwitchStates.Failed,
+                    id, null, null, null, "Switch outcome could not be proven; manual recovery is required.", [],
+                    DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O"),
+                    ManualRecoveryRequired: true);
+
+                if (manualSwitchToken.HasValue)
+                    await autoRouter!.NotifyManualSwitchCompletedAsync(manualSwitchToken.Value, failureResult);
+                return Results.Json(new { error = "Switch request failed; inspect switching status before retrying." },
+                    statusCode: StatusCodes.Status500InternalServerError);
+            }
+            if (manualSwitchToken.HasValue)
+            {
+                await autoRouter!.NotifyManualSwitchCompletedAsync(manualSwitchToken.Value, result);
+            }
             result = result with
             {
                 Message = AG2Security.RedactSensitiveText(
@@ -473,7 +522,11 @@ public class LoopbackServer : IAsyncDisposable
                     return Results.Json(new { error = "Invalid configuration payload." }, statusCode: StatusCodes.Status400BadRequest);
                 }
                 var updated = autoRouter.UpdateConfig(body);
-                return Results.Ok(new { config = updated });
+                if (body.PollingIntervalMs > 0)
+                {
+                    onPollingIntervalChanged?.Invoke(TimeSpan.FromMilliseconds(body.PollingIntervalMs));
+                }
+                return Results.Ok(new { success = true, config = updated });
             }
             catch (Exception ex)
             {
@@ -589,15 +642,62 @@ public class LoopbackServer : IAsyncDisposable
         string.Equals(host, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsAllowedLoopbackOrigin(string origin, int localPort) =>
+        Uri.TryCreate(origin, UriKind.Absolute, out var uri) &&
+        string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+        IsAllowedLoopbackHost(uri.Host) &&
+        uri.Port == localPort;
+
     private static bool IsAllowedMutationOrigin(HttpContext context)
     {
         string origin = context.Request.Headers.Origin.ToString();
         if (string.IsNullOrWhiteSpace(origin)) return true;
-        return Uri.TryCreate(origin, UriKind.Absolute, out var uri) &&
-            string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
-            IsAllowedLoopbackHost(uri.Host) &&
-            uri.Port == context.Connection.LocalPort;
+        return IsAllowedLoopbackOrigin(origin, context.Connection.LocalPort);
     }
+
+    private static async Task<bool> HasAvailableSessionAsync(ISessionVault? vault, string accountId)
+    {
+        if (vault == null) return false;
+        try
+        {
+            var session = await vault.GetSessionAsync(accountId).ConfigureAwait(false);
+            if (session == null) return false;
+            try { return session.Length > 0; }
+            finally { CryptographicOperations.ZeroMemory(session); }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static SystemStatusDto SanitizeStatusQuota(SystemStatusDto status)
+    {
+        if (status.Telemetry is not { } telemetry) return status;
+        var quota = telemetry.Quota;
+        if (quota != null)
+        {
+            quota = quota with
+            {
+                Models = quota.Models.Select(model => model with
+                {
+                    RemainingFraction = FiniteOrNull(model.RemainingFraction)
+                }).ToArray(),
+                CanonicalModels = quota.CanonicalModels?.Select(model => model with
+                {
+                    RemainingFraction = FiniteOrNull(model.RemainingFraction)
+                }).ToArray()
+            };
+        }
+        return status with { Telemetry = telemetry with
+        {
+            Quota = quota,
+            TotalAvailableQuotaPercent = FiniteOrNull(telemetry.TotalAvailableQuotaPercent)
+        } };
+    }
+
+    private static double? FiniteOrNull(double? value) =>
+        value.HasValue && double.IsFinite(value.Value) ? value : null;
 
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {

@@ -50,6 +50,50 @@ describe('AG2 Normalizer', () => {
   });
 
   describe('normalizeQuotaSnapshot', () => {
+    it('keeps missing, partial and non-finite credits unknown while preserving observed zero', () => {
+      const missing = normalizeQuotaSnapshot({ userStatus: { planStatus: { planInfo: {} } } });
+      assert.deepEqual(missing?.promptCredits,
+        { availableCredits: null, monthlyCredits: null, usedCredits: null });
+      assert.deepEqual(missing?.flowCredits,
+        { availableCredits: null, monthlyCredits: null, usedCredits: null });
+
+      const partial = normalizeQuotaSnapshot({ userStatus: { planStatus: {
+        availablePromptCredits: 7,
+        availableFlowCredits: Infinity,
+        planInfo: { monthlyFlowCredits: 20, monthlyPromptCredits: NaN }
+      } } });
+      assert.deepEqual(partial?.promptCredits,
+        { availableCredits: 7, monthlyCredits: null, usedCredits: null });
+      assert.deepEqual(partial?.flowCredits,
+        { availableCredits: null, monthlyCredits: 20, usedCredits: null });
+
+      const zero = normalizeQuotaSnapshot({ userStatus: { planStatus: {
+        availablePromptCredits: 0,
+        availableFlowCredits: 0,
+        planInfo: { monthlyPromptCredits: 0, monthlyFlowCredits: 10 }
+      } } });
+      assert.deepEqual(zero?.promptCredits,
+        { availableCredits: 0, monthlyCredits: 0, usedCredits: 0 });
+      assert.deepEqual(zero?.flowCredits,
+        { availableCredits: 0, monthlyCredits: 10, usedCredits: 10 });
+    });
+
+    it('preserves absent and non-finite model capacity as unknown rather than 100%', () => {
+      const values = [undefined, NaN, Infinity, -Infinity, 0, 0.42];
+      const result = normalizeQuotaSnapshot({ userStatus: { cascadeModelConfigData: {
+        clientModelConfigs: values.map((remainingFraction, index) => ({
+          label: `Model ${index}`,
+          modelOrTier: `model-${index}`,
+          quotaInfo: { remainingFraction }
+        }))
+      } } });
+      assert.ok(result);
+      assert.deepEqual(result.models.map(model => model.remainingFraction),
+        [null, null, null, null, 0, 0.42]);
+      assert.deepEqual(result.models.map(model => model.isExhausted),
+        [false, false, false, false, true, false]);
+    });
+
     it('should preserve segregated model quota pools without artificial aggregation', () => {
       const fixture: RawUserStatusResponse = {
         userStatus: {
@@ -135,7 +179,7 @@ describe('AG2 Normalizer', () => {
       assert.equal(normalizeQuotaSnapshot({}), null);
     });
 
-    it('should deduplicate reasoning variants sharing modelOrTier and extract modes', () => {
+    it('preserves same-tier same-reset reasoning variants as separate capacity rows', () => {
       const fixture: RawUserStatusResponse = {
         userStatus: {
           cascadeModelConfigData: {
@@ -168,9 +212,9 @@ describe('AG2 Normalizer', () => {
       // Raw compatibility
       assert.equal(quota.models.length, 2);
 
-      // Canonical deduplication
+      // Equal tier and reset still cannot prove shared capacity.
       assert.ok(quota.canonicalModels);
-      assert.equal(quota.canonicalModels.length, 1);
+      assert.equal(quota.canonicalModels.length, 2);
       const canonical = quota.canonicalModels[0];
       assert.equal(canonical.key, 'tier:gemini-2.5-pro');
       assert.equal(canonical.label, 'Gemini 2.5 Pro');
@@ -178,7 +222,9 @@ describe('AG2 Normalizer', () => {
       assert.equal(canonical.remainingFraction, 0.85);
       assert.equal(canonical.resetTime, '2026-09-21T21:00:00Z');
       assert.equal(canonical.isExhausted, false);
-      assert.deepEqual(canonical.modes, ['Standard', 'Thinking']);
+      assert.deepEqual(canonical.modes, ['Standard']);
+      assert.equal(quota.canonicalModels[1].key, 'tier:gemini-2.5-pro:row:1');
+      assert.deepEqual(quota.canonicalModels[1].modes, ['Thinking']);
     });
 
     it('should never merge distinct modelOrTier even with similar labels or suffixes', () => {
@@ -220,7 +266,7 @@ describe('AG2 Normalizer', () => {
       assert.equal(quota.canonicalModels[3].key, 'tier:tier-beta');
     });
 
-    it('should safely merge by label fallback only when modelOrTier is missing and resetTimes match', () => {
+    it('does not treat a presentation label as pool identity even when reset times match', () => {
       const fixture: RawUserStatusResponse = {
         userStatus: {
           cascadeModelConfigData: {
@@ -240,9 +286,9 @@ describe('AG2 Normalizer', () => {
 
       const quota = normalizeQuotaSnapshot(fixture);
       assert.ok(quota?.canonicalModels);
-      assert.equal(quota.canonicalModels.length, 1);
+      assert.equal(quota.canonicalModels.length, 2);
       assert.equal(quota.canonicalModels[0].label, 'Claude 3.7 Sonnet');
-      assert.deepEqual(quota.canonicalModels[0].modes, ['Standard', 'Thinking']);
+      assert.deepEqual(quota.canonicalModels.map(model => model.modes), [['Standard'], ['Thinking']]);
     });
 
     it('should not merge by label fallback when resetTimes differ', () => {
@@ -268,7 +314,7 @@ describe('AG2 Normalizer', () => {
       assert.equal(quota.canonicalModels.length, 2);
     });
 
-    it('should apply conservative conflict resolution (min fraction, OR exhausted, max resetTime)', () => {
+    it('preserves conflicting rows when no source pool identity proves sharing', () => {
       const fixture: RawUserStatusResponse = {
         userStatus: {
           cascadeModelConfigData: {
@@ -288,7 +334,7 @@ describe('AG2 Normalizer', () => {
                 quotaInfo: {
                   remainingFraction: 0.30,
                   isExhausted: true,
-                  resetTime: '2026-09-21T20:30:00Z'
+                  resetTime: '2026-09-21T18:00:00Z'
                 }
               }
             ]
@@ -298,12 +344,13 @@ describe('AG2 Normalizer', () => {
 
       const quota = normalizeQuotaSnapshot(fixture);
       assert.ok(quota?.canonicalModels);
-      assert.equal(quota.canonicalModels.length, 1);
-      const canonical = quota.canonicalModels[0];
-      assert.equal(canonical.remainingFraction, 0.30);
-      assert.equal(canonical.isExhausted, true);
-      assert.equal(canonical.resetTime, '2026-09-21T20:30:00Z');
-      assert.deepEqual(canonical.modes, ['Standard', 'Reasoning']);
+      assert.equal(quota.canonicalModels.length, 2);
+      assert.equal(quota.canonicalModels[0].remainingFraction, 0.80);
+      assert.equal(quota.canonicalModels[0].isExhausted, false);
+      assert.equal(quota.canonicalModels[1].remainingFraction, 0.30);
+      assert.equal(quota.canonicalModels[1].isExhausted, true);
+      assert.deepEqual(quota.canonicalModels[0].modes, ['Standard']);
+      assert.deepEqual(quota.canonicalModels[1].modes, ['Reasoning']);
     });
 
     it('should force isExhausted to true when remaining fraction is zero', () => {
@@ -377,16 +424,18 @@ describe('AG2 Normalizer', () => {
       assert.ok(quota);
       assert.equal(quota.models.length, 5);
       assert.ok(quota.canonicalModels);
-      assert.equal(quota.canonicalModels.length, 3);
+      assert.equal(quota.canonicalModels.length, 5);
 
       assert.equal(quota.canonicalModels[0].label, 'Gemini 2.5 Pro');
-      assert.deepEqual(quota.canonicalModels[0].modes, ['Standard', 'Thinking']);
+      assert.deepEqual(quota.canonicalModels[0].modes, ['Standard']);
+      assert.deepEqual(quota.canonicalModels[1].modes, ['Thinking']);
 
-      assert.equal(quota.canonicalModels[1].label, 'Claude 3.7 Sonnet');
-      assert.deepEqual(quota.canonicalModels[1].modes, ['Standard', 'Thinking']);
-
-      assert.equal(quota.canonicalModels[2].label, 'Gemini 2.5 Flash');
+      assert.equal(quota.canonicalModels[2].label, 'Claude 3.7 Sonnet');
       assert.deepEqual(quota.canonicalModels[2].modes, ['Standard']);
+      assert.deepEqual(quota.canonicalModels[3].modes, ['Thinking']);
+
+      assert.equal(quota.canonicalModels[4].label, 'Gemini 2.5 Flash');
+      assert.deepEqual(quota.canonicalModels[4].modes, ['Standard']);
 
       assert.equal(quota.promptCredits?.availableCredits, 1500);
       assert.equal(quota.promptCredits?.usedCredits, 500);
@@ -440,16 +489,22 @@ describe('AG2 Normalizer', () => {
       assert.equal(activity.runningTrajectories, 0);
     });
 
-    it('should classify as IDLE when summaries are empty or null', () => {
+    it('should require explicit activity evidence before declaring IDLE', () => {
       const activityEmpty = normalizeActivitySnapshot({ trajectorySummaries: {} });
       assert.equal(activityEmpty.state, 'IDLE');
       assert.equal(activityEmpty.totalTrajectories, 0);
       assert.equal(activityEmpty.runningTrajectories, 0);
 
       const activityNull = normalizeActivitySnapshot(null);
-      assert.equal(activityNull.state, 'IDLE');
+      assert.equal(activityNull.state, 'UNKNOWN');
       assert.equal(activityNull.totalTrajectories, 0);
       assert.equal(activityNull.runningTrajectories, 0);
+
+      assert.equal(normalizeActivitySnapshot({}).state, 'UNKNOWN');
+      assert.equal(normalizeActivitySnapshot({ trajectorySummaries: {
+        'traj-1': { status: 'CASCADE_RUN_STATUS_UNRECOGNIZED' }
+      } }).state, 'UNKNOWN');
+      assert.equal(normalizeActivitySnapshot({ trajectorySummaries: [] } as never).state, 'UNKNOWN');
     });
   });
 });

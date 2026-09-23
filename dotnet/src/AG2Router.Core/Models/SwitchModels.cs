@@ -62,5 +62,9 @@ public record NativeSwitchStatus(
 public interface INativeAccountSwitchCoordinator
 {
     Task<NativeSwitchResult> SwitchAsync(string targetAccountId, CancellationToken cancellationToken = default);
+    Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+        string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
+        CancellationToken cancellationToken = default) => SwitchAsync(targetAccountId, cancellationToken);
     NativeSwitchStatus GetStatus();
+    Task CoordinateShutdownAsync(TimeSpan timeout, CancellationToken cancellationToken = default);
 }

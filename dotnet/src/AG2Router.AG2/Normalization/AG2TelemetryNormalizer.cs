@@ -55,8 +55,10 @@ public static class AG2TelemetryNormalizer
                 : (!string.IsNullOrWhiteSpace(cfg.ModelOrTier) ? cfg.ModelOrTier.Trim() : "Unknown Model");
 
             var q = cfg.QuotaInfo;
-            double fraction = q?.RemainingFraction is double f ? Math.Clamp(f, 0.0, 1.0) : 1.0;
-            bool isExhausted = (q?.IsExhausted == true) || fraction <= 0.0;
+            double? fraction = q?.RemainingFraction is double f && double.IsFinite(f)
+                ? Math.Clamp(f, 0.0, 1.0)
+                : null;
+            bool isExhausted = (q?.IsExhausted == true) || fraction == 0.0;
 
             models.Add(new ModelQuotaDto(
                 Label: label,
@@ -72,20 +74,26 @@ public static class AG2TelemetryNormalizer
 
         if (u.PlanStatus is { } plan)
         {
-            long monthlyPrompt = plan.PlanInfo?.MonthlyPromptCredits ?? 0;
-            long availPrompt = plan.AvailablePromptCredits ?? 0;
+            long? monthlyPrompt = plan.PlanInfo?.MonthlyPromptCredits;
+            long? availPrompt = plan.AvailablePromptCredits;
+            long? usedPrompt = (monthlyPrompt.HasValue && availPrompt.HasValue)
+                ? Math.Max(0, monthlyPrompt.Value - availPrompt.Value)
+                : null;
             promptCredits = new CreditPoolDto(
                 AvailableCredits: availPrompt,
                 MonthlyCredits: monthlyPrompt,
-                UsedCredits: Math.Max(0, monthlyPrompt - availPrompt)
+                UsedCredits: usedPrompt
             );
 
-            long monthlyFlow = plan.PlanInfo?.MonthlyFlowCredits ?? 0;
-            long availFlow = plan.AvailableFlowCredits ?? 0;
+            long? monthlyFlow = plan.PlanInfo?.MonthlyFlowCredits;
+            long? availFlow = plan.AvailableFlowCredits;
+            long? usedFlow = (monthlyFlow.HasValue && availFlow.HasValue)
+                ? Math.Max(0, monthlyFlow.Value - availFlow.Value)
+                : null;
             flowCredits = new CreditPoolDto(
                 AvailableCredits: availFlow,
                 MonthlyCredits: monthlyFlow,
-                UsedCredits: Math.Max(0, monthlyFlow - availFlow)
+                UsedCredits: usedFlow
             );
         }
 
@@ -102,7 +110,17 @@ public static class AG2TelemetryNormalizer
 
     public static ActivityStatusDto NormalizeActivitySnapshot(RawTrajectoriesResponse? raw)
     {
-        if (raw?.TrajectorySummaries == null || raw.TrajectorySummaries.Count == 0)
+        if (raw?.TrajectorySummaries == null)
+        {
+            return new ActivityStatusDto(
+                State: "UNKNOWN",
+                TotalTrajectories: 0,
+                RunningTrajectories: 0,
+                Timestamp: DateTime.UtcNow.ToString("o")
+            );
+        }
+
+        if (raw.TrajectorySummaries.Count == 0)
         {
             return new ActivityStatusDto(
                 State: "IDLE",
@@ -112,12 +130,15 @@ public static class AG2TelemetryNormalizer
             );
         }
 
-        var validEntries = raw.TrajectorySummaries.Values.Where(t => t != null).ToList();
-        int total = validEntries.Count;
-        int running = validEntries.Count(t => string.Equals(t.Status, "CASCADE_RUN_STATUS_RUNNING", StringComparison.OrdinalIgnoreCase));
+        var entries = raw.TrajectorySummaries.Values.ToList();
+        int total = entries.Count;
+        int running = entries.Count(t => string.Equals(t?.Status, "CASCADE_RUN_STATUS_RUNNING", StringComparison.OrdinalIgnoreCase));
+        bool allKnownInactive = entries.All(t =>
+            string.Equals(t?.Status, "CASCADE_RUN_STATUS_IDLE", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(t?.Status, "CASCADE_RUN_STATUS_DONE", StringComparison.OrdinalIgnoreCase));
 
         return new ActivityStatusDto(
-            State: running > 0 ? "BUSY" : "IDLE",
+            State: running > 0 ? "BUSY" : allKnownInactive ? "IDLE" : "UNKNOWN",
             TotalTrajectories: total,
             RunningTrajectories: running,
             Timestamp: DateTime.UtcNow.ToString("o")
@@ -200,31 +221,17 @@ public static class AG2TelemetryNormalizer
         }
 
         var groups = new List<(string Key, List<ModelQuotaDto> Items)>();
-        var keyIndex = new Dictionary<string, int>(StringComparer.Ordinal);
-
-        foreach (var model in models)
+        for (int row = 0; row < models.Count; row++)
         {
-            string key;
-            if (!string.IsNullOrWhiteSpace(model.ModelOrTier))
-            {
-                key = $"tier:{model.ModelOrTier.Trim().ToLowerInvariant()}";
-            }
-            else
-            {
-                string cleanLabel = CleanModelLabel(model.Label).ToLowerInvariant();
-                string reset = string.IsNullOrWhiteSpace(model.ResetTime) ? "none" : model.ResetTime.Trim();
-                key = $"label:{cleanLabel}:{reset}";
-            }
-
-            if (keyIndex.TryGetValue(key, out int index))
-            {
-                groups[index].Items.Add(model);
-            }
-            else
-            {
-                keyIndex[key] = groups.Count;
-                groups.Add((key, new List<ModelQuotaDto> { model }));
-            }
+            var model = models[row];
+            // Neither a presentation label, model/tier, nor matching reset instant
+            // proves that two source rows share one capacity pool.
+            string? tier = string.IsNullOrWhiteSpace(model.ModelOrTier)
+                ? null : model.ModelOrTier.Trim().ToLowerInvariant();
+            string baseKey = tier != null ? $"tier:{tier}" : $"row:{row}";
+            string key = groups.Any(g => g.Key == baseKey)
+                ? $"{baseKey}:row:{row}" : baseKey;
+            groups.Add((key, new List<ModelQuotaDto> { model }));
         }
 
         var canonical = new List<CanonicalModelQuotaDto>(groups.Count);
@@ -246,8 +253,10 @@ public static class AG2TelemetryNormalizer
                 }
             }
 
-            double remainingFraction = Math.Clamp(items.Min(m => m.RemainingFraction), 0.0, 1.0);
-            bool isExhausted = items.Any(m => m.IsExhausted) || remainingFraction <= 0.0;
+            var validFractions = items.Where(m => m.RemainingFraction.HasValue && double.IsFinite(m.RemainingFraction.Value))
+                .Select(m => m.RemainingFraction!.Value).ToList();
+            double? remainingFraction = validFractions.Count > 0 ? Math.Clamp(validFractions.Min(), 0.0, 1.0) : null;
+            bool isExhausted = items.Any(m => m.IsExhausted) || (remainingFraction.HasValue && remainingFraction.Value <= 0.0);
             string? resetTime = SelectLatestResetTime(items.Select(m => m.ResetTime));
             string? modelOrTier = items.FirstOrDefault(m => !string.IsNullOrWhiteSpace(m.ModelOrTier))?.ModelOrTier?.Trim();
 

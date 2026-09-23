@@ -8,6 +8,7 @@ using AG2Router.App.Diagnostics;
 using AG2Router.App.Lifecycle;
 using AG2Router.App.Services;
 using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
 
 namespace AG2Router.App.Views;
 
@@ -21,8 +22,14 @@ public partial class MainWindow : Window, IDashboardWindow
     private readonly string _dashboardUrl;
     private CoreWebView2DevToolsProtocolEventReceiver? _exceptionReceiver;
     private CoreWebView2DevToolsProtocolEventReceiver? _consoleReceiver;
+    private CoreWebViewRecoveryEventSource? _eventSource;
+    private WebViewRecoveryEventBinding? _eventBinding;
     private bool _isWebViewInitialized;
     private bool _isDisposed;
+    private readonly WebViewRecoveryPolicy _recoveryPolicy = new();
+    private bool _recoveryInProgress;
+    private (WebViewFailureKind Kind, long Generation)? _pendingRecovery;
+    private WebViewFailureKind? _exhaustedFailureKind;
 
     public uint? BrowserProcessId { get; private set; }
 
@@ -56,67 +63,66 @@ public partial class MainWindow : Window, IDashboardWindow
     private async Task InitializeWebViewAsync()
     {
         if (_isWebViewInitialized || _isDisposed) return;
+        var webView = DashboardWebView;
+        long generation = _recoveryPolicy.CurrentGeneration;
 
         try
         {
             var env = await WebView2EnvironmentCoordinator.GetOrCreateEnvironmentAsync();
-            if (_isDisposed) return;
+            if (!IsCurrentWebView(webView, generation)) return;
 
-            await DashboardWebView.EnsureCoreWebView2Async(env);
-            if (_isDisposed)
-            {
-                TeardownWebView();
-                return;
-            }
+            await WebViewAttemptDeadline.RunAsync(
+                () => webView.EnsureCoreWebView2Async(env), TimeSpan.FromSeconds(10));
+            if (!IsCurrentWebView(webView, generation)) return;
+            var core = webView.CoreWebView2;
 
-            DashboardWebView.DefaultBackgroundColor = System.Drawing.Color.White;
+            webView.DefaultBackgroundColor = System.Drawing.Color.White;
 
-            BrowserProcessId = DashboardWebView.CoreWebView2.BrowserProcessId;
+            BrowserProcessId = core.BrowserProcessId;
 
-            DashboardWebView.CoreWebView2.Settings.IsStatusBarEnabled = false;
-            DashboardWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
-            DashboardWebView.CoreWebView2.Settings.IsZoomControlEnabled = true;
+            core.Settings.IsStatusBarEnabled = false;
+            core.Settings.AreDefaultContextMenusEnabled = true;
+            core.Settings.IsZoomControlEnabled = true;
 
             // 1. Trap unhandled promise rejections before application scripts load
-            await DashboardWebView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(@"
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(@"
                 window.addEventListener('unhandledrejection', (e) => {
                     const reason = e.reason ? (e.reason.stack || e.reason.toString()) : 'Unhandled rejection with null reason';
                     console.error('UnhandledPromiseRejection: ' + reason);
                 });
             ");
+            if (!IsCurrentWebView(webView, generation)) return;
 
             // 2. Hook Runtime.exceptionThrown for synchronous & uncaught script exceptions
-            _exceptionReceiver = DashboardWebView.CoreWebView2.GetDevToolsProtocolEventReceiver("Runtime.exceptionThrown");
+            _exceptionReceiver = core.GetDevToolsProtocolEventReceiver("Runtime.exceptionThrown");
             _exceptionReceiver.DevToolsProtocolEventReceived += OnExceptionThrown;
 
             // 3. Hook Runtime.consoleAPICalled to catch console.error / console.assert
-            _consoleReceiver = DashboardWebView.CoreWebView2.GetDevToolsProtocolEventReceiver("Runtime.consoleAPICalled");
+            _consoleReceiver = core.GetDevToolsProtocolEventReceiver("Runtime.consoleAPICalled");
             _consoleReceiver.DevToolsProtocolEventReceived += OnConsoleAPICalled;
 
             // 4. Enable CDP Runtime domain
-            await DashboardWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Runtime.enable", "{}");
+            await core.CallDevToolsProtocolMethodAsync("Runtime.enable", "{}");
+            if (!IsCurrentWebView(webView, generation)) return;
 
             // 5. Monitor navigation and process failures
-            DashboardWebView.CoreWebView2.NavigationCompleted += (s, e) =>
-            {
-                if (!e.IsSuccess)
+            _eventSource = new CoreWebViewRecoveryEventSource(core);
+            _eventBinding = new WebViewRecoveryEventBinding(
+                _eventSource, _recoveryPolicy, generation,
+                () => IsCurrentWebView(webView, generation),
+                () =>
+                {
+                    _exhaustedFailureKind = null;
+                    ErrorOverlay.Visibility = Visibility.Collapsed;
+                },
+                async (kind, detail, capturedGeneration) =>
                 {
                     JsRuntimeDiagnostics.RecordError(
-                        "NavigationFailure",
-                        $"Navigation failed with status: {e.WebErrorStatus}"
-                    );
-                }
-            };
+                        kind == WebViewFailureKind.Process ? "ProcessFailed" : "NavigationFailure", detail);
+                    await RecoverWebViewAsync(kind, detail, capturedGeneration);
+                });
 
-            DashboardWebView.CoreWebView2.ProcessFailed += (s, e) =>
-            {
-                JsRuntimeDiagnostics.RecordError(
-                    "ProcessFailed",
-                    $"Process {e.ProcessFailedKind} exited with code {e.ExitCode}"
-                );
-            };
-
-            DashboardWebView.CoreWebView2.Navigate(_dashboardUrl);
+            core.Navigate(_dashboardUrl);
             _isWebViewInitialized = true;
         }
         catch (ObjectDisposedException)
@@ -125,13 +131,135 @@ public partial class MainWindow : Window, IDashboardWindow
         }
         catch (Exception ex)
         {
+            if (!IsCurrentWebView(webView, generation)) return;
             JsRuntimeDiagnostics.RecordError("InitializationError", ex.Message, ex.StackTrace);
-            System.Windows.MessageBox.Show(
-                $"Failed to initialize WebView2 dashboard runtime: {ex.Message}\n\nPlease ensure the Microsoft Edge WebView2 Runtime is installed.",
-                "AG2 Router Initialization Error",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error
-            );
+            if (_recoveryInProgress) throw;
+            await RecoverWebViewAsync(WebViewFailureKind.Initialization, ex.Message, generation);
+        }
+    }
+
+    private bool IsCurrentWebView(WebView2 webView, long generation) =>
+        !_isDisposed && ReferenceEquals(DashboardWebView, webView) && _recoveryPolicy.IsCurrent(generation);
+
+    private async Task RecoverWebViewAsync(WebViewFailureKind kind, string detail, long? sourceGeneration = null)
+    {
+        long generation = sourceGeneration ?? _recoveryPolicy.CurrentGeneration;
+        if (_isDisposed || !_recoveryPolicy.IsCurrent(generation)) return;
+        if (_recoveryInProgress)
+        {
+            if (kind == WebViewFailureKind.Process) _pendingRecovery = (kind, generation);
+            return;
+        }
+        _recoveryInProgress = true;
+        try
+        {
+            while (!_isDisposed && _recoveryPolicy.IsCurrent(generation))
+            {
+                var action = _recoveryPolicy.RecordFailureIfCurrent(generation, kind);
+                if (action == null) return;
+                if (action == WebViewRecoveryAction.ManualRetry)
+                {
+                    _exhaustedFailureKind = kind;
+                    ErrorOverlayMessage.Text = $"Dashboard recovery stopped after repeated {kind.ToString().ToLowerInvariant()} failures ({detail}). Retry manually when the problem is resolved.";
+                    ErrorOverlay.Visibility = Visibility.Visible;
+                    return;
+                }
+
+                await Task.Delay(500);
+                if (_isDisposed || !_recoveryPolicy.IsCurrent(generation)) return;
+                try
+                {
+                    if (action == WebViewRecoveryAction.Reload && DashboardWebView.CoreWebView2 != null)
+                        DashboardWebView.CoreWebView2.Navigate(_dashboardUrl);
+                    else
+                    {
+                        RecreateWebViewControl();
+                        generation = _recoveryPolicy.CurrentGeneration;
+                        await InitializeWebViewAsync();
+                    }
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    if (!_recoveryPolicy.IsCurrent(generation)) return;
+                    JsRuntimeDiagnostics.RecordError("RecoveryError", ex.Message, ex.StackTrace);
+                    kind = WebViewFailureKind.Initialization;
+                    detail = ex.Message;
+                }
+            }
+        }
+        finally
+        {
+            _recoveryInProgress = false;
+            if (!_isDisposed && _pendingRecovery is { } pending &&
+                _recoveryPolicy.IsCurrent(pending.Generation))
+            {
+                _pendingRecovery = null;
+                await RecoverWebViewAsync(pending.Kind, "WebView process failed during recovery", pending.Generation);
+            }
+            else _pendingRecovery = null;
+        }
+    }
+
+    private void RecreateWebViewControl()
+    {
+        _recoveryPolicy.AdvanceGeneration();
+        _pendingRecovery = null;
+        var old = DashboardWebView;
+        DetachWebViewEvents();
+        if (_exceptionReceiver != null)
+        {
+            _exceptionReceiver.DevToolsProtocolEventReceived -= OnExceptionThrown;
+            _exceptionReceiver = null;
+        }
+        if (_consoleReceiver != null)
+        {
+            _consoleReceiver.DevToolsProtocolEventReceived -= OnConsoleAPICalled;
+            _consoleReceiver = null;
+        }
+        WebView2EnvironmentCoordinator.NotifyWindowClosing(BrowserProcessId);
+        BrowserProcessId = null;
+        (old.Parent as System.Windows.Controls.Panel)?.Children.Remove(old);
+        old.Dispose();
+        DashboardWebView = new WebView2();
+        ((Grid)Content).Children.Insert(0, DashboardWebView);
+        _isWebViewInitialized = false;
+    }
+
+    private void DetachWebViewEvents()
+    {
+        _eventBinding?.Dispose();
+        _eventBinding = null;
+        _eventSource?.Dispose();
+        _eventSource = null;
+    }
+
+    private sealed class CoreWebViewRecoveryEventSource : IWebViewRecoveryEventSource, IDisposable
+    {
+        private readonly CoreWebView2 _core;
+
+        public CoreWebViewRecoveryEventSource(CoreWebView2 core)
+        {
+            _core = core;
+            core.NavigationCompleted += OnNavigationCompleted;
+            core.ProcessFailed += OnProcessFailed;
+        }
+
+        public event EventHandler<WebViewNavigationOutcomeEventArgs>? NavigationCompleted;
+        public event EventHandler<WebViewProcessFailureEventArgs>? ProcessFailed;
+
+        private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e) =>
+            NavigationCompleted?.Invoke(this,
+                new WebViewNavigationOutcomeEventArgs(e.IsSuccess, e.WebErrorStatus.ToString()));
+
+        private void OnProcessFailed(object? sender, CoreWebView2ProcessFailedEventArgs e) =>
+            ProcessFailed?.Invoke(this,
+                new WebViewProcessFailureEventArgs($"Process {e.ProcessFailedKind} exited with code {e.ExitCode}"));
+
+        public void Dispose()
+        {
+            _core.NavigationCompleted -= OnNavigationCompleted;
+            _core.ProcessFailed -= OnProcessFailed;
         }
     }
 
@@ -188,6 +316,9 @@ public partial class MainWindow : Window, IDashboardWindow
     {
         if (_isDisposed) return;
         _isDisposed = true;
+        _recoveryPolicy.AdvanceGeneration();
+        _pendingRecovery = null;
+        DetachWebViewEvents();
 
         if (DashboardWebView != null)
         {
@@ -227,6 +358,39 @@ public partial class MainWindow : Window, IDashboardWindow
             catch
             {
                 // Ignore disposal errors on teardown
+            }
+        }
+    }
+
+    private void OnRetryConnectionClicked(object sender, RoutedEventArgs e)
+    {
+        _recoveryPolicy.ResetForManualRetry();
+        ErrorOverlay.Visibility = Visibility.Collapsed;
+        if (_isDisposed) return;
+        if (_exhaustedFailureKind == WebViewFailureKind.Navigation && DashboardWebView.CoreWebView2 != null)
+        {
+            try
+            {
+                DashboardWebView.CoreWebView2.Navigate(_dashboardUrl);
+            }
+            catch (Exception ex)
+            {
+                JsRuntimeDiagnostics.RecordError("NavigationRetryError", ex.Message, ex.StackTrace);
+                _ = RecoverWebViewAsync(WebViewFailureKind.Navigation, ex.Message);
+            }
+        }
+        else
+        {
+            _exhaustedFailureKind = null;
+            try
+            {
+                RecreateWebViewControl();
+                _ = InitializeWebViewAsync();
+            }
+            catch (Exception ex)
+            {
+                JsRuntimeDiagnostics.RecordError("ManualRecoveryError", ex.Message, ex.StackTrace);
+                _ = RecoverWebViewAsync(WebViewFailureKind.Initialization, ex.Message);
             }
         }
     }

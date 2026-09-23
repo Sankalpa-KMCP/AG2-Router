@@ -6,6 +6,39 @@ namespace AG2Router.Tests;
 
 public class CandidateSelectorTests
 {
+    [Fact]
+    public void UnknownCurrentQuotaNeverAuthorizesAutomaticMutation()
+    {
+        var current = CreateAccount("current");
+        var candidate = CreateAccount("candidate");
+        var selection = CandidateSelector.SelectBestCandidate("current", null,
+            [current, candidate], new Dictionary<string, double> { ["candidate"] = 0.9 },
+            new RouterConfigDto(), new HashSet<string> { "current", "candidate" });
+        Assert.False(selection.ShouldSwitch);
+        Assert.Null(selection.BestCandidate);
+        Assert.Contains("unknown", selection.Reason);
+    }
+
+    [Fact]
+    public void MixedKnownAndUnknownRelevantPoolsCannotProveCandidateCapacity()
+    {
+        var current = CreateAccount("current");
+        var candidate = CreateAccount("candidate");
+        var modelQuotas = new Dictionary<string, IReadOnlyList<ModelQuotaDto>> {
+            ["candidate"] = [
+                new("Known", "model", 0.9, "2026-09-21T18:00:00Z", false),
+                new("Unknown", "model", null, "2026-09-21T20:00:00Z", false),
+                new("Unrelated", "other", 1.0, null, false)
+            ]
+        };
+        var selection = CandidateSelector.SelectBestCandidate("current", 0.05,
+            [current, candidate], new Dictionary<string, double> { ["candidate"] = 0.9 },
+            new RouterConfigDto(), new HashSet<string> { "current", "candidate" },
+            accountModelQuotas: modelQuotas, relevantModelKeys: ["model"]);
+        Assert.False(selection.ShouldSwitch);
+        Assert.Contains("unknown", Assert.Single(selection.Candidates).IneligibilityReason);
+    }
+
     private static AccountMetadata CreateAccount(
         string id,
         string email = "test@example.com",
@@ -318,5 +351,174 @@ public class CandidateSelectorTests
         Assert.False(result.ShouldSwitch);
         Assert.Null(result.BestCandidate);
         Assert.Contains("No secondary accounts", result.Reason);
+    }
+
+    [Fact]
+    public void SelectBestCandidate_CandidateWithoutObservedQuota_IsMarkedIneligible()
+    {
+        var config = new RouterConfigDto(LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30);
+        var current = CreateAccount("acc_curr");
+        var unobservedCandidate = CreateAccount("acc_unobserved");
+        var accounts = new List<AccountMetadata> { current, unobservedCandidate };
+        // quotas dictionary only contains current account; unobservedCandidate has no entry
+        var quotas = new Dictionary<string, double> { ["acc_curr"] = 0.05 };
+
+        var result = CandidateSelector.SelectBestCandidate(
+            "acc_curr",
+            0.05,
+            accounts,
+            quotas,
+            config,
+            vaultedAccountIds: new HashSet<string> { "acc_curr", "acc_unobserved" }
+        );
+
+        Assert.False(result.ShouldSwitch);
+        Assert.Null(result.BestCandidate);
+        var candidateEval = Assert.Single(result.Candidates);
+        Assert.False(candidateEval.IsEligible);
+        Assert.Contains("unknown", candidateEval.IneligibilityReason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SelectBestCandidate_CandidateLacksModelTelemetryWhenRelevantModelSpecified_IsMarkedIneligible()
+    {
+        var config = new RouterConfigDto(LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30);
+        var current = CreateAccount("acc_curr");
+        var candidate = CreateAccount("acc_cand");
+        var accounts = new List<AccountMetadata> { current, candidate };
+        var quotas = new Dictionary<string, double>
+        {
+            ["acc_curr"] = 0.05,
+            ["acc_cand"] = 0.80
+        };
+
+        var result = CandidateSelector.SelectBestCandidate(
+            "acc_curr",
+            0.05,
+            accounts,
+            quotas,
+            config,
+            vaultedAccountIds: new HashSet<string> { "acc_curr", "acc_cand" },
+            relevantModelKeys: new List<string> { "gemini-pro" },
+            accountModelQuotas: new Dictionary<string, IReadOnlyList<ModelQuotaDto>>() // empty: no per-model telemetry for candidate
+        );
+
+        Assert.False(result.ShouldSwitch);
+        Assert.Null(result.BestCandidate);
+        var candEval = Assert.Single(result.Candidates);
+        Assert.False(candEval.IsEligible);
+        Assert.Contains("unknown", candEval.IneligibilityReason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SelectBestCandidate_CandidateMissingSpecificRelevantModel_IsMarkedIneligible()
+    {
+        var config = new RouterConfigDto(LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30);
+        var current = CreateAccount("acc_curr");
+        var candidate = CreateAccount("acc_cand");
+        var accounts = new List<AccountMetadata> { current, candidate };
+        var quotas = new Dictionary<string, double>
+        {
+            ["acc_curr"] = 0.05,
+            ["acc_cand"] = 0.80
+        };
+        var modelQuotas = new Dictionary<string, IReadOnlyList<ModelQuotaDto>>
+        {
+            ["acc_cand"] = new List<ModelQuotaDto>
+            {
+                new("Claude 3.7 Sonnet", "claude-3-7-sonnet", 0.90, null, false)
+            }
+        };
+
+        var result = CandidateSelector.SelectBestCandidate(
+            "acc_curr",
+            0.05,
+            accounts,
+            quotas,
+            config,
+            vaultedAccountIds: new HashSet<string> { "acc_curr", "acc_cand" },
+            relevantModelKeys: new List<string> { "gemini-pro" },
+            accountModelQuotas: modelQuotas
+        );
+
+        Assert.False(result.ShouldSwitch);
+        Assert.Null(result.BestCandidate);
+        var candEval = Assert.Single(result.Candidates);
+        Assert.False(candEval.IsEligible);
+        Assert.Contains("gemini-pro", candEval.IneligibilityReason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SelectBestCandidate_CandidateHasExhaustedRelevantModel_IsMarkedIneligible()
+    {
+        var config = new RouterConfigDto(LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30);
+        var current = CreateAccount("acc_curr");
+        var candidate = CreateAccount("acc_cand");
+        var accounts = new List<AccountMetadata> { current, candidate };
+        var quotas = new Dictionary<string, double>
+        {
+            ["acc_curr"] = 0.05,
+            ["acc_cand"] = 0.80
+        };
+        var modelQuotas = new Dictionary<string, IReadOnlyList<ModelQuotaDto>>
+        {
+            ["acc_cand"] = new List<ModelQuotaDto>
+            {
+                new("Gemini Pro", "gemini-pro", 0.0, null, true)
+            }
+        };
+
+        var result = CandidateSelector.SelectBestCandidate(
+            "acc_curr",
+            0.05,
+            accounts,
+            quotas,
+            config,
+            vaultedAccountIds: new HashSet<string> { "acc_curr", "acc_cand" },
+            relevantModelKeys: new List<string> { "gemini-pro" },
+            accountModelQuotas: modelQuotas
+        );
+
+        Assert.False(result.ShouldSwitch);
+        Assert.Null(result.BestCandidate);
+        var candEval = Assert.Single(result.Candidates);
+        Assert.False(candEval.IsEligible);
+        Assert.Contains("exhausted", candEval.IneligibilityReason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SelectBestCandidate_CandidateHasHealthyRelevantModel_IsSelected()
+    {
+        var config = new RouterConfigDto(LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30);
+        var current = CreateAccount("acc_curr");
+        var candidate = CreateAccount("acc_cand");
+        var accounts = new List<AccountMetadata> { current, candidate };
+        var quotas = new Dictionary<string, double>
+        {
+            ["acc_curr"] = 0.05,
+            ["acc_cand"] = 0.80
+        };
+        var modelQuotas = new Dictionary<string, IReadOnlyList<ModelQuotaDto>>
+        {
+            ["acc_cand"] = new List<ModelQuotaDto>
+            {
+                new("Gemini Pro", "gemini-pro", 0.75, null, false)
+            }
+        };
+
+        var result = CandidateSelector.SelectBestCandidate(
+            "acc_curr",
+            0.05,
+            accounts,
+            quotas,
+            config,
+            vaultedAccountIds: new HashSet<string> { "acc_curr", "acc_cand" },
+            relevantModelKeys: new List<string> { "gemini-pro" },
+            accountModelQuotas: modelQuotas
+        );
+
+        Assert.True(result.ShouldSwitch);
+        Assert.NotNull(result.BestCandidate);
+        Assert.Equal("acc_cand", result.BestCandidate.Account.Id);
     }
 }

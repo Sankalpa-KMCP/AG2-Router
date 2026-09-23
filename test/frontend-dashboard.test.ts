@@ -6,7 +6,10 @@ import {
   formatQuotaFraction,
   deriveLowestModelQuota,
   formatResetTime,
-  prepareAliasPayload
+  prepareAliasPayload,
+  derivePoolsStatusSummary,
+  formatCreditPool,
+  DashboardRefreshGate
 } from '../src/dashboard/helpers.js';
 
 describe('Frontend Dashboard Business Logic & Truthful Telemetry', () => {
@@ -71,9 +74,13 @@ describe('Frontend Dashboard Business Logic & Truthful Telemetry', () => {
       assert.equal(formatQuotaFraction(1.5), 100);
     });
 
-    it('should handle NaN and non-numbers gracefully by returning 0', () => {
-      assert.equal(formatQuotaFraction(NaN), 0);
-      assert.equal(formatQuotaFraction(undefined as unknown as number), 0);
+    it('keeps unknown and non-finite fractions distinct from observed zero', () => {
+      assert.equal(formatQuotaFraction(null), null);
+      assert.equal(formatQuotaFraction(NaN), null);
+      assert.equal(formatQuotaFraction(Infinity), null);
+      assert.equal(formatQuotaFraction(-Infinity), null);
+      assert.equal(formatQuotaFraction(undefined), null);
+      assert.equal(formatQuotaFraction(0), 0);
     });
   });
 
@@ -123,6 +130,41 @@ describe('Frontend Dashboard Business Logic & Truthful Telemetry', () => {
       assert.equal(deriveLowestModelQuota(null), null);
       assert.equal(deriveLowestModelQuota(undefined), null);
     });
+
+    it('does not call a partly unknown set healthy and prioritizes observed exhaustion', () => {
+      assert.equal(deriveLowestModelQuota([
+        { label: 'known', remainingFraction: 0.8 },
+        { label: 'unknown', remainingFraction: null }
+      ]), null);
+      const lowest = deriveLowestModelQuota([
+        { label: 'lower numeric', remainingFraction: 0.1 },
+        { label: 'exhausted', remainingFraction: 0.5, isExhausted: true }
+      ]);
+      assert.equal(lowest?.label, 'exhausted');
+      assert.equal(lowest?.isExhausted, true);
+    });
+  });
+
+  describe('DashboardRefreshGate', () => {
+    it('orders each resource independently and rejects requests crossing a save', () => {
+      const gate = new DashboardRefreshGate();
+      const oldStatus = gate.beginRead('status');
+      const newestStatus = gate.beginRead('status');
+      const accounts = gate.beginRead('accounts');
+      assert.equal(gate.canPublish(oldStatus), false);
+      assert.equal(gate.canPublish(newestStatus), true);
+      assert.equal(gate.canPublish(accounts), true);
+
+      const beforeSave = gate.beginRead('config');
+      gate.beginMutation();
+      const duringSave = gate.beginRead('config');
+      assert.equal(gate.canPublish(duringSave), false);
+      gate.endMutation();
+      assert.equal(gate.canPublish(beforeSave), false);
+      assert.equal(gate.canPublish(duringSave), false);
+      assert.equal(gate.canPublish(gate.beginRead('config')), true);
+      assert.equal(gate.canPublish(accounts), false);
+    });
   });
 
   describe('formatResetTime', () => {
@@ -162,6 +204,67 @@ describe('Frontend Dashboard Business Logic & Truthful Telemetry', () => {
     it('should produce empty string to signal alias clearance', () => {
       assert.deepEqual(prepareAliasPayload('   '), { alias: '' });
       assert.deepEqual(prepareAliasPayload(''), { alias: '' });
+    });
+  });
+
+  describe('derivePoolsStatusSummary', () => {
+    it('returns No Data when activeModelsCount is 0 without fabricating Nominal', () => {
+      const summary = derivePoolsStatusSummary(0, 0, 0);
+      assert.equal(summary.badgeText, 'No Data');
+      assert.equal(summary.badgeClass, 'badge-neutral');
+      assert.equal(summary.metricText, 'No Data');
+      assert.equal(summary.metricClass, 'text-muted');
+    });
+
+    it('reports Near Limit / Exhausted when exhausted models exist', () => {
+      const summary = derivePoolsStatusSummary(3, 2, 0);
+      assert.equal(summary.badgeText, '2 Near Limit');
+      assert.equal(summary.badgeClass, 'badge-danger');
+      assert.equal(summary.metricText, '2 Exhausted');
+      assert.equal(summary.metricClass, 'text-danger');
+    });
+
+    it('reports Unknown when unknown models exist and none exhausted', () => {
+      const summary = derivePoolsStatusSummary(2, 0, 1);
+      assert.equal(summary.badgeText, '1 Unknown');
+      assert.equal(summary.badgeClass, 'badge-neutral');
+      assert.equal(summary.metricText, 'Quota Unknown');
+      assert.equal(summary.metricClass, 'text-muted');
+    });
+
+    it('reports Nominal / All Healthy when all active models are healthy', () => {
+      const summary = derivePoolsStatusSummary(4, 0, 0);
+      assert.equal(summary.badgeText, 'Nominal');
+      assert.equal(summary.badgeClass, 'badge-healthy');
+      assert.equal(summary.metricText, 'All Healthy');
+      assert.equal(summary.metricClass, 'text-success');
+    });
+  });
+
+  describe('formatCreditPool', () => {
+    it('returns indeterminate when pool is null or credits are missing', () => {
+      const formatted = formatCreditPool(null);
+      assert.equal(formatted.hasData, false);
+      assert.equal(formatted.isIndeterminate, true);
+      assert.equal(formatted.ratioPercent, null);
+    });
+
+    it('formats normal credits with correct ratio', () => {
+      const formatted = formatCreditPool({ availableCredits: 800, monthlyCredits: 1000, usedCredits: 200 });
+      assert.equal(formatted.hasData, true);
+      assert.equal(formatted.availableText, '800');
+      assert.equal(formatted.totalText, '/ 1,000 total');
+      assert.equal(formatted.ratioPercent, 80);
+      assert.equal(formatted.isIndeterminate, false);
+    });
+
+    it('avoids fabricating 100% when monthly limit is missing or zero', () => {
+      const formatted = formatCreditPool({ availableCredits: 500, monthlyCredits: null, usedCredits: null });
+      assert.equal(formatted.hasData, true);
+      assert.equal(formatted.availableText, '500');
+      assert.equal(formatted.totalText, null);
+      assert.equal(formatted.ratioPercent, null);
+      assert.equal(formatted.isIndeterminate, true);
     });
   });
 });

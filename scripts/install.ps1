@@ -18,32 +18,49 @@ Write-Host "AG2 Router - Per-User Installation" -ForegroundColor Cyan
 Write-Host "Target Directory: $InstallDir" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
-# 1. Graceful Shutdown of Existing Running Instance
+# 1. Graceful Shutdown of Existing Running Instance via Named Mutex and Process Check
+$sessionMutex = $null
+$mutexHeld = [System.Threading.Mutex]::TryOpenExisting("Local\AG2Router_Session_Mutex", [ref]$sessionMutex)
+if ($mutexHeld -and $sessionMutex) {
+    $sessionMutex.Dispose()
+}
 $runningProcesses = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
-if ($runningProcesses) {
+
+if ($mutexHeld -or $runningProcesses) {
     Write-Host "Detected running AG2 Router instance. Requesting graceful shutdown (--exit)..."
-    if (Test-Path $ExePath) {
-        try {
-            $exitProcess = Start-Process -FilePath $ExePath -ArgumentList "--exit" -Wait -PassThru -WindowStyle Hidden
-            if ($exitProcess.ExitCode -ne 0) {
-                Write-Warning "Shutdown request (--exit) returned exit code $($exitProcess.ExitCode)"
-            }
-        } catch {
-            Write-Warning "Failed to invoke --exit signal: $_"
-        }
+    if (-not (Test-Path $ExePath)) {
+        throw "AG2 Router is running but its shutdown executable is missing at $ExePath. Installation aborted."
     }
 
-    # Wait up to 5 seconds for process termination
+    try {
+        $exitProcess = Start-Process -FilePath $ExePath -ArgumentList "--exit" -PassThru -WindowStyle Hidden
+        if (-not $exitProcess.WaitForExit(5000)) {
+            throw "Shutdown request (--exit) did not finish within five seconds. Installation aborted."
+        }
+        if ($exitProcess.ExitCode -ne 0) {
+            throw "Shutdown request (--exit) returned exit code $($exitProcess.ExitCode). Installation aborted."
+        }
+    } catch {
+        throw "Failed to complete --exit shutdown request. Installation aborted: $_"
+    }
+
+    # Wait up to 5 seconds for mutex release and process termination
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $stillRunning = $true
     while ($sw.ElapsedMilliseconds -lt 5000) {
+        $testMutex = $null
+        $mHeld = [System.Threading.Mutex]::TryOpenExisting("Local\AG2Router_Session_Mutex", [ref]$testMutex)
+        if ($mHeld -and $testMutex) { $testMutex.Dispose() }
         $remaining = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
-        if (-not $remaining) { break }
+        if (-not $mHeld -and -not $remaining) {
+            $stillRunning = $false
+            break
+        }
         Start-Sleep -Milliseconds 250
     }
 
-    $stillRunning = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
     if ($stillRunning) {
-        throw "AG2 Router is currently running and could not be gracefully closed. Please exit AG2 Router from the system tray before proceeding."
+        throw "AG2 Router is currently running and could not be gracefully closed within 5 seconds. Please exit AG2 Router from the system tray before proceeding."
     }
     Write-Host "  [OK] Previous instance closed gracefully." -ForegroundColor Green
 }
@@ -73,26 +90,70 @@ if (-not $webview2Installed) {
     Write-Warning "Download from: https://developer.microsoft.com/en-us/microsoft-edge/webview2/"
 }
 
-# 3. Create Target Directory & Copy Files
-Write-Host "Installing binaries to $InstallDir..."
-if (-not (Test-Path $InstallDir)) {
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+# 3. Staging Directory & Atomic Directory Swap (V021-020)
+Write-Host "Staging binaries for atomic installation to $InstallDir..."
+$ParentDir = Split-Path -Path $InstallDir -Parent
+if (-not (Test-Path $ParentDir)) {
+    New-Item -ItemType Directory -Force -Path $ParentDir | Out-Null
 }
 
-# Copy files from SourceDir to InstallDir (excluding install.ps1 to avoid self-locking if run from there)
+$StagingDir = "$InstallDir.staging.$PID"
+$BackupDir = "$InstallDir.bak.$PID"
+
+if (Test-Path $StagingDir) {
+    Remove-Item -Path $StagingDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+New-Item -ItemType Directory -Force -Path $StagingDir | Out-Null
+
+# Copy files from SourceDir to StagingDir (excluding install scripts and staging/backup directories)
 Get-ChildItem -Path $SourceDir | ForEach-Object {
-    if ($_.Name -ne "install.ps1" -and $_.Name -ne "dist") {
-        Copy-Item -Path $_.FullName -Destination $InstallDir -Recurse -Force
+    if ($_.Name -ne "install.ps1" -and $_.Name -ne "dist" -and -not $_.Name.StartsWith("AG2Router.staging.") -and -not $_.Name.StartsWith("AG2Router.bak.")) {
+        Copy-Item -Path $_.FullName -Destination $StagingDir -Recurse -Force
     }
 }
 
-# Ensure uninstall script is copied into InstallDir
+# Ensure uninstall script is copied into StagingDir
 $sourceUninstall = Join-Path $SourceDir "uninstall.ps1"
 if (Test-Path $sourceUninstall) {
-    Copy-Item -Path $sourceUninstall -Destination (Join-Path $InstallDir "uninstall.ps1") -Force
+    Copy-Item -Path $sourceUninstall -Destination (Join-Path $StagingDir "uninstall.ps1") -Force
 }
 
-# Validate essential executable exists
+# Validate essential executable exists in staging before swapping
+$stagedExePath = Join-Path $StagingDir "AG2Router.exe"
+if (-not (Test-Path $stagedExePath)) {
+    Remove-Item -Path $StagingDir -Recurse -Force -ErrorAction SilentlyContinue
+    throw "Installation failed: AG2Router.exe not found in staged payload at $stagedExePath"
+}
+
+# Perform atomic rename swap with backup and rollback
+$hasExistingInstall = Test-Path $InstallDir
+if ($hasExistingInstall) {
+    if (Test-Path $BackupDir) {
+        Remove-Item -Path $BackupDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Move-Item -Path $InstallDir -Destination $BackupDir -Force
+}
+
+try {
+    Move-Item -Path $StagingDir -Destination $InstallDir -Force
+} catch {
+    # Rollback to previous installation if swap failed
+    if ($hasExistingInstall -and (Test-Path $BackupDir) -and -not (Test-Path $InstallDir)) {
+        Move-Item -Path $BackupDir -Destination $InstallDir -Force -ErrorAction SilentlyContinue
+    }
+    throw "Installation failed during atomic directory swap: $_"
+} finally {
+    if (Test-Path $InstallDir) {
+        if (Test-Path $BackupDir) {
+            Remove-Item -Path $BackupDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path $StagingDir) {
+        Remove-Item -Path $StagingDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Validate essential executable exists in final installation
 if (-not (Test-Path $ExePath)) {
     throw "Installation failed: AG2Router.exe not found at $ExePath"
 }

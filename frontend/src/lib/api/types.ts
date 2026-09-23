@@ -7,7 +7,7 @@ export interface AccountMetadata {
   isReserve: boolean;
   createdAt: string;
   updatedAt?: string | null;
-  lastUsedAt?: string | null;
+  lastActiveAt?: string | null;
   hasVaultedSession: boolean;
   validationStatus?: string | null;
   notes?: string | null;
@@ -23,7 +23,7 @@ export interface AccountsListResponse {
 export interface RawModelQuotaDto {
   modelOrTier: string;
   label: string;
-  remainingFraction: number;
+  remainingFraction: number | null;
   resetTime?: string | null;
   isExhausted: boolean;
 }
@@ -32,7 +32,7 @@ export interface CanonicalModelDto {
   canonicalKey: string;
   displayLabel: string;
   modes: string[];
-  remainingFraction: number;
+  remainingFraction: number | null;
   resetTime?: string | null;
   isExhausted: boolean;
   timeUntilReset?: string | null;
@@ -40,9 +40,9 @@ export interface CanonicalModelDto {
 }
 
 export interface CreditPoolDto {
-  availableCredits: number;
-  monthlyCredits: number;
-  usedCredits: number;
+  availableCredits?: number | null;
+  monthlyCredits?: number | null;
+  usedCredits?: number | null;
 }
 
 export interface QuotaSnapshotDto {
@@ -105,23 +105,11 @@ export interface SystemStatusDto {
   telemetry?: TelemetrySnapshotDto | null;
 }
 
-export interface SwitchPlanCheck {
-  code: string;
-  passed: boolean;
-  message: string;
-}
-
-export interface SwitchPlanDto {
-  ready: boolean;
-  blockers: string[];
-  checks: SwitchPlanCheck[];
-}
-
 export interface SwitchStatusDto {
   activeTransactionId?: string | null;
   currentState: string;
   lastResult?: {
-    code: number;
+    code: string;
     message: string;
   } | null;
 }
