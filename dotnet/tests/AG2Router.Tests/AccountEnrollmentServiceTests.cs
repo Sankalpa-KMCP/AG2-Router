@@ -278,7 +278,8 @@ public class AccountEnrollmentServiceTests : IDisposable
         var failingStore = new FailUpdateAccountStore(_accountStore);
         var failingService = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, failingStore);
 
-        await Assert.ThrowsAsync<AccountEnrollmentException>(() => failingService.EnrollCurrentAccountAsync());
+        var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(() => failingService.EnrollCurrentAccountAsync());
+        Assert.DoesNotContain("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Empty(await _accountStore.ListAccountsAsync());
         Assert.Empty(await _sessionVault.ListStoredAccountIdsAsync());
         Assert.Null(await _accountStore.GetActiveAccountIdAsync());
@@ -431,8 +432,98 @@ public class AccountEnrollmentServiceTests : IDisposable
         await _sessionVault.SaveSessionAsync(account.Id, newer);
         blockingStore.ReleaseFailure();
 
-        await Assert.ThrowsAsync<AccountEnrollmentException>(() => enrollmentTask);
+        var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(() => enrollmentTask);
+        Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(newer, await _sessionVault.GetSessionAsync(account.Id));
+    }
+
+    [Fact]
+    public async Task MetadataFailureAndVaultRestoreFailureRequiresManualRecovery()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("restore-failure@example.com", "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", "restore-failure@example.com",
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var vault = new SessionVault(Path.Combine(_tempDir, "fault-vault"),
+            new FakeDpapiProvider(), new FailSecondVaultWrite());
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, vault,
+            new FailUpdateAccountStore(_accountStore));
+
+        var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync());
+
+        Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
+        var pending = await _accountStore.GetAccountByEmailAsync("restore-failure@example.com");
+        Assert.NotNull(pending);
+        Assert.True(await vault.HasSessionAsync(pending.Id));
+    }
+
+    [Fact]
+    public async Task MetadataFailureAndUnreadableReadbackRequiresManualRecovery()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("readback-failure@example.com", "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", "readback-failure@example.com",
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var store = new FailUpdateAccountStore(_accountStore) { FailReadback = true };
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store);
+
+        var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync());
+
+        Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.NotNull(await _accountStore.GetAccountByEmailAsync("readback-failure@example.com"));
+    }
+
+    [Fact]
+    public async Task MetadataFailureAndUnprovedConditionalRemovalRequiresManualRecovery()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("remove-failure@example.com", "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", "remove-failure@example.com",
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var store = new FailUpdateAccountStore(_accountStore) { ReturnFalseOnRemoval = true };
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store);
+
+        var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync());
+
+        Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
+        var pending = await _accountStore.GetAccountByEmailAsync("remove-failure@example.com");
+        Assert.NotNull(pending);
+        Assert.False(await _sessionVault.HasSessionAsync(pending.Id));
+    }
+
+    [Fact]
+    public async Task MetadataWriterFailureAfterReplacementReportsUncertainCommit()
+    {
+        const string email = "replaced-metadata@example.com";
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email,
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var store = new LocalMetadataAccountStore(
+            Path.Combine(_tempDir, "replaced-metadata.json"), new ThrowAfterNthWrite(2));
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store);
+
+        var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync());
+
+        Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
+        var committed = await store.GetAccountByEmailAsync(email);
+        Assert.NotNull(committed);
+        Assert.True(committed.HasVaultedSession);
+        Assert.True(await _sessionVault.HasSessionAsync(committed.Id));
+    }
+
+    [Fact]
+    public async Task ActiveSelectionWriterFailureAfterReplacementReportsCommittedSelection()
+    {
+        const string email = "replaced-active@example.com";
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email,
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var store = new LocalMetadataAccountStore(
+            Path.Combine(_tempDir, "replaced-active.json"), new ThrowAfterNthWrite(3));
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store);
+
+        var result = await service.EnrollCurrentAccountAsync();
+
+        Assert.True(result.Success);
+        Assert.Equal(result.Account.Id, await store.GetActiveAccountIdAsync());
+        Assert.DoesNotContain("preserved", result.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -477,6 +568,32 @@ public class AccountEnrollmentServiceTests : IDisposable
             throw new DpapiException("Injected decryption failure.");
     }
 
+    private sealed class FailSecondVaultWrite : IDurableFileWriter
+    {
+        private int _writes;
+        private readonly DurableFileWriter _inner = new();
+
+        public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _writes) == 2)
+                return Task.FromException(new IOException("Injected vault restoration write failure."));
+            return _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+        }
+    }
+
+    private sealed class ThrowAfterNthWrite(int ordinal) : IDurableFileWriter
+    {
+        private int _writes;
+        private readonly DurableFileWriter _inner = new();
+
+        public async Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            await _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+            if (Interlocked.Increment(ref _writes) == ordinal)
+                throw new IOException("Injected exception after durable replacement.");
+        }
+    }
+
     private sealed class TrackingDpapiProvider : IDpapiProvider
     {
         private int _currentEncryptions;
@@ -512,12 +629,15 @@ public class AccountEnrollmentServiceTests : IDisposable
 
     private sealed class FailUpdateAccountStore(IAccountStore inner) : IAccountStore
     {
+        public bool FailReadback { get; init; }
+        public bool ReturnFalseOnRemoval { get; init; }
         public Task<bool> RestoreAccountIfUnchangedAsync(AccountMetadata expectedCurrent, AccountMetadata previous, CancellationToken cancellationToken = default) =>
             inner.RestoreAccountIfUnchangedAsync(expectedCurrent, previous, cancellationToken);
         public Task<IReadOnlyList<AccountMetadata>> ListAccountsAsync(CancellationToken cancellationToken = default) =>
             inner.ListAccountsAsync(cancellationToken);
         public Task<AccountMetadata?> GetAccountAsync(string id, CancellationToken cancellationToken = default) =>
-            inner.GetAccountAsync(id, cancellationToken);
+            FailReadback ? Task.FromException<AccountMetadata?>(new IOException("Injected readback failure.")) :
+                inner.GetAccountAsync(id, cancellationToken);
         public Task<AccountMetadata?> GetAccountByEmailAsync(string email, CancellationToken cancellationToken = default) =>
             inner.GetAccountByEmailAsync(email, cancellationToken);
         public Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default) =>
@@ -529,7 +649,8 @@ public class AccountEnrollmentServiceTests : IDisposable
         public Task<bool> RemoveAccountIfUnchangedAsync(
             AccountMetadata expected,
             CancellationToken cancellationToken = default) =>
-            inner.RemoveAccountIfUnchangedAsync(expected, cancellationToken);
+            ReturnFalseOnRemoval ? Task.FromResult(false) :
+                inner.RemoveAccountIfUnchangedAsync(expected, cancellationToken);
         public Task<string?> GetActiveAccountIdAsync(CancellationToken cancellationToken = default) =>
             inner.GetActiveAccountIdAsync(cancellationToken);
         public Task SetActiveAccountIdAsync(string? id, CancellationToken cancellationToken = default) =>

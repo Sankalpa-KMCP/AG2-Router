@@ -167,15 +167,25 @@ public class AccountEnrollmentService
                     catch
                     {
                         bool originallyVaulted = existing?.HasVaultedSession == true;
-                        AccountMetadata? currentMetadata = null;
+                        using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                        AccountMetadata? currentMetadata;
                         try
                         {
-                            currentMetadata = await _accountStore.GetAccountAsync(pending.Id, CancellationToken.None)
-                                .ConfigureAwait(false);
+                            currentMetadata = await _accountStore.GetAccountAsync(pending.Id, recovery.Token)
+                                .WaitAsync(recovery.Token).ConfigureAwait(false);
                         }
-                        catch { }
+                        catch
+                        {
+                            throw new AccountEnrollmentException(
+                                "Account metadata could not be read after a failed enrollment commit; manual recovery is required.");
+                        }
 
-                        bool metadataHasVaultedSession = currentMetadata != null && currentMetadata.HasVaultedSession;
+                        if (currentMetadata == null)
+                            throw new AccountEnrollmentException(
+                                "Account metadata disappeared after a failed enrollment commit; manual recovery is required.");
+
+                        bool metadataHasVaultedSession = currentMetadata.HasVaultedSession;
+                        bool metadataUnchanged = currentMetadata == pending;
 
                         if (!metadataHasVaultedSession || originallyVaulted)
                         {
@@ -183,23 +193,43 @@ public class AccountEnrollmentService
                             {
                                 try
                                 {
-                                    await _sessionVault.RestoreIfCurrentAsync(
-                                        vaultReceipt!,
-                                        CancellationToken.None).ConfigureAwait(false);
+                                    bool restored = await _sessionVault.RestoreIfCurrentAsync(
+                                            vaultReceipt!, recovery.Token)
+                                        .WaitAsync(recovery.Token).ConfigureAwait(false);
+                                    if (!restored)
+                                        throw new AccountEnrollmentException(
+                                            "Vault restoration could not be proven after a failed enrollment commit; manual recovery is required.");
                                 }
-                                catch { }
+                                catch (AccountEnrollmentException) { throw; }
+                                catch
+                                {
+                                    throw new AccountEnrollmentException(
+                                        "Vault restoration failed after a failed enrollment commit; manual recovery is required.");
+                                }
                             }
 
-                            if (isNew && !metadataHasVaultedSession)
+                            if (isNew && metadataUnchanged)
                             {
                                 try
                                 {
-                                    await _accountStore.RemoveAccountIfUnchangedAsync(pending, CancellationToken.None)
-                                        .ConfigureAwait(false);
+                                    bool removed = await _accountStore.RemoveAccountIfUnchangedAsync(pending, recovery.Token)
+                                        .WaitAsync(recovery.Token).ConfigureAwait(false);
+                                    if (!removed)
+                                        throw new AccountEnrollmentException(
+                                            "Account metadata cleanup could not be proven after a failed enrollment commit; manual recovery is required.");
                                 }
-                                catch { }
+                                catch (AccountEnrollmentException) { throw; }
+                                catch
+                                {
+                                    throw new AccountEnrollmentException(
+                                        "Account metadata cleanup failed after a failed enrollment commit; manual recovery is required.");
+                                }
                             }
                         }
+
+                        if (!metadataUnchanged)
+                            throw new AccountEnrollmentException(
+                                "Account metadata changed after a failed enrollment commit; manual recovery is required.");
 
                         throw;
                     }
@@ -251,18 +281,39 @@ public class AccountEnrollmentService
                     }
 
                     bool activeUpdated = false;
+                    bool activeSelectionPreserved = false;
                     if (liveIdentityStillCurrent)
                     {
+                        using var completion = new CancellationTokenSource(TimeSpan.FromSeconds(15));
                         try
                         {
                             activeUpdated = await _accountStore.CompareExchangeActiveAccountIdAsync(
                                 previousActiveId,
                                 pending.Id,
-                                CancellationToken.None).ConfigureAwait(false);
+                                completion.Token).WaitAsync(completion.Token).ConfigureAwait(false);
                         }
                         catch
                         {
-                            activeUpdated = false;
+                            // A writer can durably replace the active marker and then
+                            // throw. The exception alone cannot prove preservation.
+                        }
+                        if (!activeUpdated)
+                        {
+                            using var reconciliation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                            string? authoritativeActiveId;
+                            try
+                            {
+                                authoritativeActiveId = await _accountStore.GetActiveAccountIdAsync(reconciliation.Token)
+                                    .WaitAsync(reconciliation.Token).ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                                throw new AccountEnrollmentException(
+                                    "Active-account selection could not be verified after enrollment; manual recovery is required.");
+                            }
+                            activeUpdated = string.Equals(authoritativeActiveId, pending.Id, StringComparison.Ordinal);
+                            activeSelectionPreserved = string.Equals(authoritativeActiveId, previousActiveId,
+                                StringComparison.Ordinal);
                         }
                     }
 
@@ -271,7 +322,9 @@ public class AccountEnrollmentService
                         : $"Successfully updated session vault for existing account '{email}'.";
                     if (!activeUpdated)
                     {
-                        message += " The current active-account selection was preserved.";
+                        message += activeSelectionPreserved
+                            ? " The current active-account selection was preserved."
+                            : " The active-account selection changed externally and was not overwritten.";
                     }
 
                     return new EnrollmentResult(true, account, isNew, message);
