@@ -376,11 +376,9 @@ public class SessionVaultTests : IDisposable
         await newerVault.SaveSessionAsync(accountId, "newer-session"u8.ToArray());
         string newerEnvelope = await File.ReadAllTextAsync(newerVault.GetVaultPath());
 
-        var vault = new SessionVault(_tempVaultDir, dpapi)
-        {
-            MutationTimeout = TimeSpan.FromMilliseconds(80)
-        };
+        var vault = new SessionVault(_tempVaultDir, dpapi);
         if (remove) await vault.SaveSessionAsync(accountId, "older-session"u8.ToArray());
+        vault.MutationTimeout = TimeSpan.FromMilliseconds(80);
 
         var heldLease = await CrossProcessFileLease.AcquireAsync(vault.GetVaultPath(), CancellationToken.None);
         try
@@ -433,11 +431,9 @@ public class SessionVaultTests : IDisposable
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var writer = new ReplacePauseThenThrowWriter(entered, release);
-        var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider(), writer)
-        {
-            MutationTimeout = TimeSpan.FromMilliseconds(80)
-        };
+        var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider(), writer);
         await vault.SaveSessionAsync(accountId, "original-session"u8.ToArray());
+        vault.MutationTimeout = TimeSpan.FromMilliseconds(80);
 
         Task removal = vault.RemoveSessionWithReceiptAsync(accountId);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));

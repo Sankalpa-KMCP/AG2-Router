@@ -531,7 +531,7 @@ public class ReleasePackagingTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void PowerShellUninstall_ProcessQueryFailureAbortsBeforeDestructiveContinuation(bool failAfterExit)
+    public async Task PowerShellUninstall_ProcessQueryFailureAbortsBeforeDestructiveContinuation(bool failAfterExit)
     {
         string script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "scripts", "uninstall.ps1"));
         string stopFunctions = script.Split("# 2. Graceful Process Shutdown via Named Mutex and Process Check")[1]
@@ -547,6 +547,7 @@ public class ReleasePackagingTests
             function Get-Process {
                 param([string]$ErrorAction)
                 $script:queries++
+                [Console]::Error.WriteLine('phase: process query ' + $script:queries)
                 if ('{{scenario}}' -eq 'post' -and $script:queries -eq 1) {
                     return [pscustomobject]@{ ProcessName = 'AG2Router' }
                 }
@@ -556,6 +557,7 @@ public class ReleasePackagingTests
             function Invoke-AG2RouterExitRequest {
                 param([string]$InstalledExe)
                 $script:exitCalls++
+                [Console]::Error.WriteLine('phase: exit request')
             }
             $caught = $false
             try {
@@ -584,13 +586,27 @@ public class ReleasePackagingTests
         start.ArgumentList.Add("-EncodedCommand");
         start.ArgumentList.Add(Convert.ToBase64String(Encoding.Unicode.GetBytes(command)));
         using var child = Process.Start(start) ?? throw new InvalidOperationException("PowerShell test process did not start.");
-        if (!child.WaitForExit(10000))
+        Task<string> standardOutput = child.StandardOutput.ReadToEndAsync();
+        Task<string> standardError = child.StandardError.ReadToEndAsync();
+        try
         {
-            child.Kill(entireProcessTree: true);
-            throw new TimeoutException("Synthetic uninstall safety check did not complete.");
+            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
         }
+        catch (TimeoutException)
+        {
+            if (!child.HasExited)
+            {
+                try { child.Kill(entireProcessTree: true); }
+                catch (InvalidOperationException) { }
+            }
+            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            throw new TimeoutException(
+                $"Synthetic uninstall safety check did not complete. stdout: {await standardOutput} stderr: {await standardError}");
+        }
+        string output = await standardOutput;
+        string error = await standardError;
         Assert.True(child.ExitCode == 0,
-            $"Synthetic {scenario} query failure exited {child.ExitCode}: {child.StandardOutput.ReadToEnd()} {child.StandardError.ReadToEnd()}");
+            $"Synthetic {scenario} query failure exited {child.ExitCode}: {output} {error}");
     }
 
     #endregion

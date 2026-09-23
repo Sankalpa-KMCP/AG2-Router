@@ -543,10 +543,12 @@ public class AccountEnrollmentServiceTests : IDisposable
             Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var store = new FailUpdateAccountStore(_accountStore) { NeverCompleteUpdate = true };
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, store,
-            TimeSpan.FromMilliseconds(60));
+            TimeSpan.FromSeconds(2));
 
+        var enrollment = service.EnrollCurrentAccountAsync();
+        await store.UpdateEntered.WaitAsync(TimeSpan.FromSeconds(5));
         var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(
-            () => service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(2)));
+            () => enrollment.WaitAsync(TimeSpan.FromSeconds(5)));
 
         Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
         var second = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
@@ -875,8 +877,13 @@ public class AccountEnrollmentServiceTests : IDisposable
         }
         public Task<AccountMetadata?> UpdateAccountAsync(string id, UpdateAccountInput updates, CancellationToken cancellationToken = default) =>
             DelayedCommit ? CommitLateAsync(id, updates) : NeverCompleteUpdate
-                ? new TaskCompletionSource<AccountMetadata?>(TaskCreationOptions.RunContinuationsAsynchronously).Task
+                ? NeverCompleteAfterEntry()
                 : throw new IOException("Injected metadata commit failure.");
+        private Task<AccountMetadata?> NeverCompleteAfterEntry()
+        {
+            _updateEntered.TrySetResult();
+            return new TaskCompletionSource<AccountMetadata?>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        }
         private async Task<AccountMetadata?> CommitLateAsync(string id, UpdateAccountInput updates)
         {
             _updateEntered.TrySetResult();
@@ -1132,11 +1139,13 @@ public sealed class AccountRemovalServiceTests : IDisposable
 
         try
         {
+            var removal = new AccountRemovalService(store, vault, TimeSpan.FromSeconds(5))
+                .RemoveAsync(account.Id);
+            await writer.RemovalReplaced.WaitAsync(TimeSpan.FromSeconds(10));
+            await writer.RestoreStarted.WaitAsync(TimeSpan.FromSeconds(10));
             var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                new AccountRemovalService(store, vault, TimeSpan.FromMilliseconds(60))
-                    .RemoveAsync(account.Id).WaitAsync(TimeSpan.FromSeconds(2)));
+                removal.WaitAsync(TimeSpan.FromSeconds(10)));
             Assert.Contains("manual recovery", error.Message, StringComparison.OrdinalIgnoreCase);
-            await writer.RestoreStarted.WaitAsync(TimeSpan.FromSeconds(2));
 
             // The late writer ignores cancellation. No newer vault mutation may
             // be admitted while its durable outcome is unresolved.
@@ -1257,9 +1266,11 @@ public sealed class AccountRemovalServiceTests : IDisposable
     {
         private readonly DurableFileWriter _inner = new();
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _removalReplaced = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _restoreStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _restoreFinished = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _writes;
+        public Task RemovalReplaced => _removalReplaced.Task;
         public Task RestoreStarted => _restoreStarted.Task;
         public Task RestoreFinished => _restoreFinished.Task;
         public void Release() => _release.TrySetResult();
@@ -1277,7 +1288,10 @@ public sealed class AccountRemovalServiceTests : IDisposable
             }
             await _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
             if (write == 2)
+            {
+                _removalReplaced.TrySetResult();
                 throw new IOException("Injected post-replacement removal failure.");
+            }
         }
     }
 
