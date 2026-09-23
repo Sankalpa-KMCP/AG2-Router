@@ -9,6 +9,10 @@ public interface IAccountStore
     Task<AccountMetadata?> GetAccountByEmailAsync(string email, CancellationToken cancellationToken = default);
     Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default);
     Task<AccountMetadata?> UpdateAccountAsync(string id, UpdateAccountInput updates, CancellationToken cancellationToken = default);
+    Task<bool> RestoreAccountIfUnchangedAsync(
+        AccountMetadata expectedCurrent,
+        AccountMetadata previous,
+        CancellationToken cancellationToken = default);
     Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default);
     Task<bool> RemoveAccountIfUnchangedAsync(
         AccountMetadata expected,

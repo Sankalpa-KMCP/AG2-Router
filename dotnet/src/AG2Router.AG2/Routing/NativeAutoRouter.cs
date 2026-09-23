@@ -29,6 +29,7 @@ public class NativeAutoRouter : INativeAutoRouter
     private string? _lastEvaluatedAt;
     private string _lastDecisionReason = "Router initialized";
     private long _manualSwitchEpoch;
+    private long _lastSuccessfulManualEpoch;
     private long _nextManualTokenId;
     private bool _manualSwitchPending;
     private CancellationTokenSource? _timerCts;
@@ -169,6 +170,7 @@ public class NativeAutoRouter : INativeAutoRouter
     {
         if (result.Success)
         {
+            _lastSuccessfulManualEpoch = _manualSwitchEpoch;
             _lastActiveAccountId = result.TargetAccountId;
             _lastActiveAccountEmail = result.TargetEmail;
             _observedQuotas.Remove(result.TargetAccountId);
@@ -478,27 +480,40 @@ public class NativeAutoRouter : INativeAutoRouter
             Dictionary<string, double> observedSnapshot;
             Dictionary<string, IReadOnlyList<ModelQuotaDto>> observedModelSnapshot;
             RouterConfigDto configSnapshot;
-            lock (_stateLock)
+            string switchResource = _sessionVault.GetVaultPath() + ".switch";
+            var switchLock = PathLockRegistry.Get(switchResource);
+            await switchLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                if (activeAccountId != null)
+                await using var lease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken)
+                    .ConfigureAwait(false);
+                var activeAfterQuota = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+                lock (_stateLock)
                 {
-                    if (currentQuotaFraction.HasValue && double.IsFinite(currentQuotaFraction.Value))
+                    if (_manualSwitchEpoch != planEpoch || _manualSwitchPending ||
+                        !string.Equals(activeAfterQuota, activeAccountId, StringComparison.Ordinal))
+                        return new SelectionResult(false, "Active account changed during quota observation.",
+                            activeAfterQuota, null, null, Array.Empty<CandidateEvaluation>());
+                    if (activeAccountId != null)
                     {
-                        _observedQuotas[activeAccountId] = currentQuotaFraction.Value;
-                    }
-                    else
-                    {
-                        _observedQuotas.Remove(activeAccountId);
-                    }
+                        if (currentQuotaFraction.HasValue && double.IsFinite(currentQuotaFraction.Value))
+                            _observedQuotas[activeAccountId] = currentQuotaFraction.Value;
+                        else
+                            _observedQuotas.Remove(activeAccountId);
 
-                    if (quotaSnapshot?.Models != null)
-                    {
-                        _observedModelQuotas[activeAccountId] = quotaSnapshot.Models;
+                        if (quotaSnapshot?.Models != null)
+                            _observedModelQuotas[activeAccountId] = quotaSnapshot.Models;
+                        else
+                            _observedModelQuotas.Remove(activeAccountId);
                     }
+                    observedSnapshot = new Dictionary<string, double>(_observedQuotas, StringComparer.Ordinal);
+                    observedModelSnapshot = new Dictionary<string, IReadOnlyList<ModelQuotaDto>>(_observedModelQuotas, StringComparer.Ordinal);
+                    configSnapshot = _config;
                 }
-                observedSnapshot = new Dictionary<string, double>(_observedQuotas, StringComparer.Ordinal);
-                observedModelSnapshot = new Dictionary<string, IReadOnlyList<ModelQuotaDto>>(_observedModelQuotas, StringComparer.Ordinal);
-                configSnapshot = _config;
+            }
+            finally
+            {
+                switchLock.Release();
             }
 
             var accountQuotas = new Dictionary<string, double>(observedSnapshot, StringComparer.Ordinal);
@@ -641,112 +656,138 @@ public class NativeAutoRouter : INativeAutoRouter
         }
         catch (Exception ex)
         {
-            if (!IsAutomaticPlanCurrent(planEpoch))
-            {
-                if (!_manualSwitchPending && _safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
-                {
-                    _safetyGate.Reset("Stale automatic plan threw exception; reset to idle.");
-                }
-                return;
-            }
-            _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed, $"Switch invocation threw: {AG2Security.RedactSensitiveText(ex.Message)}");
-            _candidateCooldowns[targetAccountId] = DateTime.UtcNow.AddSeconds(60);
-            _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after failed switch attempt");
-            _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
-            return;
-        }
-
-        // CRITICAL INVARIANT (V021-009): Terminal safety outcomes MUST survive stale-plan/epoch invalidation.
-        // A stale automatic plan must never erase a safety-critical terminal state (ManualRecoveryRequired).
-        if (switchResult.ManualRecoveryRequired)
-        {
-            if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
-            {
-                _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed, $"Switch failed: {switchResult.Message}");
-                _safetyGate.Transition(RoutingSafetyGateState.ManualRecoveryRequired, $"Manual recovery required: {switchResult.Message}");
-            }
-            else if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
-            {
-                if (_safetyGate.State != RoutingSafetyGateState.Idle)
-                {
-                    _safetyGate.Reset("Automatic switch failed; manual recovery required.");
-                }
-                _safetyGate.Transition(RoutingSafetyGateState.ManualRecoveryRequired, $"Manual recovery required: {switchResult.Message}");
-            }
-
             lock (_stateLock)
             {
-                _config = _config with { AutoSwitchEnabled = false };
-                _lastDecisionReason = $"Automatic switching halted: manual recovery required ({switchResult.Message}).";
+                if (_lastSuccessfulManualEpoch > planEpoch) return;
+                if (_manualSwitchEpoch != planEpoch)
+                {
+                    if (!_manualSwitchPending && _safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
+                        _safetyGate.Reset("Stale automatic plan threw exception; reset to idle.");
+                    return;
+                }
+                _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed, $"Switch invocation threw: {AG2Security.RedactSensitiveText(ex.Message)}");
+                _candidateCooldowns[targetAccountId] = DateTime.UtcNow.AddSeconds(60);
+                _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after failed switch attempt");
+                _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
             }
             return;
         }
 
-        if (!IsAutomaticPlanCurrent(planEpoch))
+        // Reconcile a successful transaction while owning the same resource as manual
+        // switching. A manual coordinator may have committed a newer identity before
+        // its completion callback has published the epoch to this router.
+        SemaphoreSlim? publicationLock = null;
+        CrossProcessFileLease? publicationLease = null;
+        bool publicationLockHeld = false;
+        string? authoritativeActiveId = null;
+        try
         {
+            if (switchResult.Success)
+            {
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                string resource = _sessionVault.GetVaultPath() + ".switch";
+                publicationLock = PathLockRegistry.Get(resource);
+                await publicationLock.WaitAsync(deadline.Token).ConfigureAwait(false);
+                publicationLockHeld = true;
+                publicationLease = await CrossProcessFileLease.AcquireAsync(resource, deadline.Token).ConfigureAwait(false);
+                authoritativeActiveId = await _accountStore.GetActiveAccountIdAsync(deadline.Token).ConfigureAwait(false);
+            }
+
+            // Manual completion and automatic terminal publication use the same state owner.
+            lock (_stateLock)
+            {
+            if (_lastSuccessfulManualEpoch > planEpoch) return;
+            if (_safetyGate.State == RoutingSafetyGateState.ManualRecoveryRequired) return;
+
+            if (switchResult.ManualRecoveryRequired)
+            {
+                if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
+                    _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed, $"Switch failed: {switchResult.Message}");
+                else if (_safetyGate.State != RoutingSafetyGateState.Idle &&
+                         _safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
+                    _safetyGate.Reset("Automatic switch failed; manual recovery required.");
+                if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
+                    _safetyGate.Transition(RoutingSafetyGateState.ManualRecoveryRequired,
+                        $"Manual recovery required: {switchResult.Message}");
+                _config = _config with { AutoSwitchEnabled = false };
+                _lastDecisionReason = $"Automatic switching halted: manual recovery required ({switchResult.Message}).";
+                return;
+            }
+
+            if (switchResult.Success)
+            {
+                if (!string.Equals(authoritativeActiveId, switchResult.TargetAccountId, StringComparison.Ordinal))
+                {
+                    if (!_manualSwitchPending && _safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
+                        _safetyGate.Reset("Automatic result superseded by a newer active identity.");
+                    return;
+                }
+                _lastActiveAccountId = switchResult.TargetAccountId;
+                _lastActiveAccountEmail = switchResult.TargetEmail;
+                _observedQuotas.Remove(switchResult.TargetAccountId);
+                _observedModelQuotas.Remove(switchResult.TargetAccountId);
+                if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
+                {
+                    _safetyGate.Transition(RoutingSafetyGateState.Verifying,
+                        $"Verifying target identity {switchResult.TargetEmail}");
+                    _safetyGate.Transition(RoutingSafetyGateState.SwitchCompleted,
+                        $"Switch completed successfully to {switchResult.TargetEmail}");
+                }
+                else if (_safetyGate.State != RoutingSafetyGateState.Idle &&
+                         _safetyGate.State != RoutingSafetyGateState.Cooldown)
+                    _safetyGate.Reset("Completed automatic transaction after manual contention.");
+                if (_safetyGate.State != RoutingSafetyGateState.Cooldown)
+                    _safetyGate.Transition(RoutingSafetyGateState.Cooldown,
+                        "Stabilizing after successful automatic switch");
+                _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
+                _lastDecisionReason = $"Switch succeeded to {switchResult.TargetEmail}.";
+                return;
+            }
+
             if (switchResult.Code == SwitchResultCodes.SwitchFailedRolledBack)
             {
                 _candidateCooldowns[targetAccountId] = DateTime.UtcNow.AddSeconds(60);
-            }
-
-            // Reconcile an already-admitted transaction after manual contention.
-            if (switchResult.Success && string.Equals(
-                await _accountStore.GetActiveAccountIdAsync(CancellationToken.None).ConfigureAwait(false),
-                switchResult.TargetAccountId, StringComparison.Ordinal))
-            {
-                lock (_stateLock)
+                if (!_manualSwitchPending)
                 {
-                    _lastActiveAccountId = switchResult.TargetAccountId;
-                    _lastActiveAccountEmail = switchResult.TargetEmail;
-                    if (!_manualSwitchPending && _safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
-                    {
-                        _safetyGate.Reset("Completed automatic transaction after manual contention.");
-                        _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after automatic switch");
-                        _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
-                    }
+                    if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
+                        _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed,
+                            $"Switch failed and was rolled back: {switchResult.Message}");
+                    else if (_safetyGate.State != RoutingSafetyGateState.Idle &&
+                             _safetyGate.State != RoutingSafetyGateState.Cooldown)
+                        _safetyGate.Reset("Rolled back automatic transaction after contention.");
+                    if (_safetyGate.State != RoutingSafetyGateState.Cooldown)
+                        _safetyGate.Transition(RoutingSafetyGateState.Cooldown,
+                            "Stabilizing after rolled back switch");
+                    _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
                 }
-            }
-            else if (!_manualSwitchPending && _safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
-            {
-                _safetyGate.Reset("Stale automatic plan finished without activation.");
-            }
-            return;
-        }
-
-        if (switchResult.Success)
-        {
-            lock (_stateLock)
-            {
-                _lastActiveAccountId = switchResult.TargetAccountId;
-                _lastActiveAccountEmail = switchResult.TargetEmail;
-            }
-            _safetyGate.Transition(RoutingSafetyGateState.Verifying, $"Verifying target identity {switchResult.TargetEmail}");
-            _safetyGate.Transition(RoutingSafetyGateState.SwitchCompleted, $"Switch completed successfully to {switchResult.TargetEmail}");
-            _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after successful switch");
-            _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
-            lock (_stateLock)
-            {
-                _lastDecisionReason = $"Switch succeeded to {switchResult.TargetEmail}.";
-            }
-        }
-        else if (switchResult.Code == SwitchResultCodes.SwitchFailedRolledBack)
-        {
-            _safetyGate.Transition(RoutingSafetyGateState.SwitchFailed, $"Switch failed and was rolled back: {switchResult.Message}");
-            _candidateCooldowns[targetAccountId] = DateTime.UtcNow.AddSeconds(60);
-            _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after rolled back switch");
-            _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
-            lock (_stateLock)
-            {
                 _lastDecisionReason = $"Switch failed and was rolled back to {switchResult.PreviousEmail}.";
+                return;
+            }
+            if (!_manualSwitchPending && _safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
+                _safetyGate.Reset($"Switch deferred: {switchResult.Message}");
+            _lastDecisionReason = $"Switch deferred: {switchResult.Message}";
             }
         }
-        else
+        catch (Exception ex) when (switchResult.Success)
         {
-            _safetyGate.Reset($"Switch deferred: {switchResult.Message}");
             lock (_stateLock)
             {
-                _lastDecisionReason = $"Switch deferred: {switchResult.Message}";
+                if (_lastSuccessfulManualEpoch > planEpoch) return;
+                if (_safetyGate.State == RoutingSafetyGateState.ManualRecoveryRequired) return;
+                if (_safetyGate.State != RoutingSafetyGateState.Idle &&
+                    _safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
+                    _safetyGate.Reset("Automatic result could not be reconciled with active identity.");
+                if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
+                    _safetyGate.Transition(RoutingSafetyGateState.ManualRecoveryRequired,
+                        "Automatic result ownership check failed; manual recovery required.");
+                _config = _config with { AutoSwitchEnabled = false };
+                _lastDecisionReason = $"Automatic switch result could not be reconciled: {AG2Security.RedactSensitiveText(ex.Message)}";
             }
+        }
+        finally
+        {
+            if (publicationLease != null) await publicationLease.DisposeAsync().ConfigureAwait(false);
+            if (publicationLockHeld) publicationLock!.Release();
         }
     }
 

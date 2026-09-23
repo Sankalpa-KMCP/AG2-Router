@@ -55,8 +55,10 @@ public static class AG2TelemetryNormalizer
                 : (!string.IsNullOrWhiteSpace(cfg.ModelOrTier) ? cfg.ModelOrTier.Trim() : "Unknown Model");
 
             var q = cfg.QuotaInfo;
-            double fraction = q?.RemainingFraction is double f ? Math.Clamp(f, 0.0, 1.0) : 1.0;
-            bool isExhausted = (q?.IsExhausted == true) || fraction <= 0.0;
+            double? fraction = q?.RemainingFraction is double f && double.IsFinite(f)
+                ? Math.Clamp(f, 0.0, 1.0)
+                : null;
+            bool isExhausted = (q?.IsExhausted == true) || fraction == 0.0;
 
             models.Add(new ModelQuotaDto(
                 Label: label,
@@ -206,31 +208,17 @@ public static class AG2TelemetryNormalizer
         }
 
         var groups = new List<(string Key, List<ModelQuotaDto> Items)>();
-        var keyIndex = new Dictionary<string, int>(StringComparer.Ordinal);
-
-        foreach (var model in models)
+        for (int row = 0; row < models.Count; row++)
         {
-            string key;
-            if (!string.IsNullOrWhiteSpace(model.ModelOrTier))
-            {
-                key = $"tier:{model.ModelOrTier.Trim().ToLowerInvariant()}";
-            }
-            else
-            {
-                string cleanLabel = CleanModelLabel(model.Label).ToLowerInvariant();
-                string reset = string.IsNullOrWhiteSpace(model.ResetTime) ? "none" : model.ResetTime.Trim();
-                key = $"label:{cleanLabel}:{reset}";
-            }
-
-            if (keyIndex.TryGetValue(key, out int index))
-            {
-                groups[index].Items.Add(model);
-            }
-            else
-            {
-                keyIndex[key] = groups.Count;
-                groups.Add((key, new List<ModelQuotaDto> { model }));
-            }
+            var model = models[row];
+            // Neither a presentation label, model/tier, nor matching reset instant
+            // proves that two source rows share one capacity pool.
+            string? tier = string.IsNullOrWhiteSpace(model.ModelOrTier)
+                ? null : model.ModelOrTier.Trim().ToLowerInvariant();
+            string baseKey = tier != null ? $"tier:{tier}" : $"row:{row}";
+            string key = groups.Any(g => g.Key == baseKey)
+                ? $"{baseKey}:row:{row}" : baseKey;
+            groups.Add((key, new List<ModelQuotaDto> { model }));
         }
 
         var canonical = new List<CanonicalModelQuotaDto>(groups.Count);
@@ -252,7 +240,8 @@ public static class AG2TelemetryNormalizer
                 }
             }
 
-            var validFractions = items.Where(m => m.RemainingFraction.HasValue).Select(m => m.RemainingFraction!.Value).ToList();
+            var validFractions = items.Where(m => m.RemainingFraction.HasValue && double.IsFinite(m.RemainingFraction.Value))
+                .Select(m => m.RemainingFraction!.Value).ToList();
             double? remainingFraction = validFractions.Count > 0 ? Math.Clamp(validFractions.Min(), 0.0, 1.0) : null;
             bool isExhausted = items.Any(m => m.IsExhausted) || (remainingFraction.HasValue && remainingFraction.Value <= 0.0);
             string? resetTime = SelectLatestResetTime(items.Select(m => m.ResetTime));

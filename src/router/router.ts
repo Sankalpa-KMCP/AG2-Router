@@ -98,15 +98,10 @@ export class QuotaRouter {
     // Calculate current account usable quota fraction
     let currentQuotaFraction: number | null = null;
     if (quotaSnapshot && quotaSnapshot.models.length > 0) {
-      // Usable quota is the lowest available High/Thinking model fraction
-      // or average of valid models
-      const fractions = quotaSnapshot.models
-        .filter((m) => !m.isExhausted)
-        .map((m) => m.remainingFraction);
-      if (fractions.length > 0) {
-        currentQuotaFraction = Math.min(...fractions);
-      } else {
+      if (quotaSnapshot.models.some(m => m.isExhausted || m.remainingFraction === 0)) {
         currentQuotaFraction = 0;
+      } else if (quotaSnapshot.models.every(m => m.remainingFraction !== null && Number.isFinite(m.remainingFraction))) {
+        currentQuotaFraction = Math.min(...quotaSnapshot.models.map(m => m.remainingFraction!));
       }
     }
 

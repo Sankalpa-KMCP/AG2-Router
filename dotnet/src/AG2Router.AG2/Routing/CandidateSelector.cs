@@ -28,6 +28,13 @@ public static class CandidateSelector
         double lowThresholdFraction = config.LowQuotaThresholdPercent / 100.0;
         double minCandidateFraction = config.MinimumCandidateQuotaPercent / 100.0;
 
+        if (currentAccountId == null ||
+            !currentQuotaFraction.HasValue || !double.IsFinite(currentQuotaFraction.Value))
+        {
+            return new SelectionResult(false, "Current account quota is unknown; automatic switching requires observed low quota.",
+                currentAccountId, null, null, Array.Empty<CandidateEvaluation>());
+        }
+
         // 1. Check if current account quota is healthy
         if (currentAccountId != null && currentQuotaFraction.HasValue)
         {
@@ -119,7 +126,7 @@ public static class CandidateSelector
                             .Select(m => m.RemainingFraction!.Value)
                             .ToList();
 
-                        if (validCandFractions.Count == 0)
+                        if (validCandFractions.Count != matchingModels.Count)
                         {
                             isEligible = false;
                             ineligibilityReason = $"Relevant model '{reqKey}' quota is unknown";

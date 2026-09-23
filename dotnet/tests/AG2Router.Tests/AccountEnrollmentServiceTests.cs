@@ -11,6 +11,80 @@ namespace AG2Router.Tests;
 
 public class AccountEnrollmentServiceTests : IDisposable
 {
+    [Fact]
+    public async Task CredentialRotationWithSameUsernameDoesNotCommitCurrentSession()
+    {
+        const string email = "rotation@example.com";
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email, Encoding.UTF8.GetBytes("{\"token\":\"old-synthetic\"}"));
+        int reads = 0;
+        _mockAdapter.GetCurrentAccountFunc = _ => {
+            if (Interlocked.Increment(ref reads) == 2)
+                _winCredStore.Seed("gemini:antigravity", email, Encoding.UTF8.GetBytes("{\"token\":\"rotated-synthetic\"}"));
+            return Task.FromResult<AccountIdentityDto?>(new AccountIdentityDto(email, "Synthetic"));
+        };
+
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+        await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync());
+        Assert.Null(await _accountStore.GetAccountByEmailAsync(email));
+        Assert.Null(await _accountStore.GetActiveAccountIdAsync());
+        Assert.Empty(await _sessionVault.ListStoredAccountIdsAsync());
+    }
+
+    [Fact]
+    public async Task CredentialRotationRestoresExistingMetadataWithoutInventingVaultAvailability()
+    {
+        const string email = "existing-rotation@example.com";
+        var previous = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: email, Name: "Original", Priority: 2, HasVaultedSession: false));
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email, Encoding.UTF8.GetBytes("{\"token\":\"old-synthetic\"}"));
+        int reads = 0;
+        _mockAdapter.GetCurrentAccountFunc = _ => {
+            if (Interlocked.Increment(ref reads) == 2)
+                _winCredStore.Seed("gemini:antigravity", email, Encoding.UTF8.GetBytes("{\"token\":\"rotated-synthetic\"}"));
+            return Task.FromResult<AccountIdentityDto?>(new AccountIdentityDto(email, "Synthetic"));
+        };
+
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+        await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync(
+            new EnrollmentOptions(Name: "Incorrect replacement", Priority: 9)));
+
+        Assert.Equal(previous, await _accountStore.GetAccountAsync(previous.Id));
+        Assert.Null(await _accountStore.GetActiveAccountIdAsync());
+        Assert.False(await _sessionVault.HasSessionAsync(previous.Id));
+    }
+
+    [Fact]
+    public async Task DeletionCannotPassEnrollmentFinalIdentityCommit()
+    {
+        const string email = "shared-ownership@example.com";
+        _winCredStore.Seed("gemini:antigravity", email, Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int reads = 0;
+        _mockAdapter.GetCurrentAccountFunc = async _ => {
+            if (Interlocked.Increment(ref reads) == 2) {
+                entered.TrySetResult();
+                await release.Task;
+            }
+            return new AccountIdentityDto(email, "Synthetic");
+        };
+        var enrollment = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore)
+            .EnrollCurrentAccountAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var account = await _accountStore.GetAccountByEmailAsync(email);
+        Assert.NotNull(account);
+        var deletion = new AccountRemovalService(_accountStore, _sessionVault).RemoveAsync(account.Id);
+        Assert.False(deletion.IsCompleted);
+        release.TrySetResult();
+        var result = await enrollment.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.True(result.Success);
+        await Assert.ThrowsAsync<AccountRemovalConflictException>(() => deletion.WaitAsync(TimeSpan.FromSeconds(3)));
+        Assert.Equal(account.Id, await _accountStore.GetActiveAccountIdAsync());
+        Assert.True(await _sessionVault.HasSessionAsync(account.Id));
+    }
+
     private readonly string _tempDir;
     private readonly InMemoryWinCredStore _winCredStore;
     private readonly FakeDpapiProvider _fakeDpapi;
@@ -438,6 +512,8 @@ public class AccountEnrollmentServiceTests : IDisposable
 
     private sealed class FailUpdateAccountStore(IAccountStore inner) : IAccountStore
     {
+        public Task<bool> RestoreAccountIfUnchangedAsync(AccountMetadata expectedCurrent, AccountMetadata previous, CancellationToken cancellationToken = default) =>
+            inner.RestoreAccountIfUnchangedAsync(expectedCurrent, previous, cancellationToken);
         public Task<IReadOnlyList<AccountMetadata>> ListAccountsAsync(CancellationToken cancellationToken = default) =>
             inner.ListAccountsAsync(cancellationToken);
         public Task<AccountMetadata?> GetAccountAsync(string id, CancellationToken cancellationToken = default) =>
@@ -471,6 +547,8 @@ public class AccountEnrollmentServiceTests : IDisposable
 
     private sealed class BlockingFailUpdateAccountStore(IAccountStore inner) : IAccountStore
     {
+        public Task<bool> RestoreAccountIfUnchangedAsync(AccountMetadata expectedCurrent, AccountMetadata previous, CancellationToken cancellationToken = default) =>
+            inner.RestoreAccountIfUnchangedAsync(expectedCurrent, previous, cancellationToken);
         private readonly TaskCompletionSource _release =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -519,6 +597,8 @@ public class AccountEnrollmentServiceTests : IDisposable
 
     private sealed class RejectActiveCasAccountStore(IAccountStore inner) : IAccountStore
     {
+        public Task<bool> RestoreAccountIfUnchangedAsync(AccountMetadata expectedCurrent, AccountMetadata previous, CancellationToken cancellationToken = default) =>
+            inner.RestoreAccountIfUnchangedAsync(expectedCurrent, previous, cancellationToken);
         public Task<IReadOnlyList<AccountMetadata>> ListAccountsAsync(CancellationToken cancellationToken = default) =>
             inner.ListAccountsAsync(cancellationToken);
         public Task<AccountMetadata?> GetAccountAsync(string id, CancellationToken cancellationToken = default) =>
@@ -596,6 +676,22 @@ public sealed class AccountRemovalServiceTests : IDisposable
         Assert.Equal([1, 2, 3], await vault.GetSessionAsync(account.Id));
     }
 
+    [Fact]
+    public async Task MetadataWriteAndReadbackFailureIsExplicitAndRestoresVault()
+    {
+        Directory.CreateDirectory(_directory);
+        var writer = new CorruptingFailSecondWrite();
+        var store = new LocalMetadataAccountStore(Path.Combine(_directory, "accounts.json"), writer);
+        var account = await store.AddAccountAsync(new CreateAccountInput("target@example.com"));
+        var vault = new SessionVault(Path.Combine(_directory, "vault"), new FakeDpapiProvider());
+        await vault.SaveSessionAsync(account.Id, [1, 2, 3]);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new AccountRemovalService(store, vault).RemoveAsync(account.Id));
+        Assert.Contains("manual", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([1, 2, 3], await vault.GetSessionAsync(account.Id));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directory)) Directory.Delete(_directory, recursive: true);
@@ -610,6 +706,21 @@ public sealed class AccountRemovalServiceTests : IDisposable
             if (Interlocked.Increment(ref _writes) == 2)
                 throw new IOException("synthetic metadata removal failure");
             return _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+        }
+    }
+
+    private sealed class CorruptingFailSecondWrite : IDurableFileWriter
+    {
+        private readonly DurableFileWriter _inner = new();
+        private int _writes;
+        public async Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _writes) == 2)
+            {
+                await File.WriteAllTextAsync(destinationPath, "{invalid synthetic json", cancellationToken);
+                throw new IOException("synthetic uncertain metadata replacement");
+            }
+            await _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
         }
     }
 }

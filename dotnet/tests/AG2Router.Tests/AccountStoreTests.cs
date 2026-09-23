@@ -326,6 +326,28 @@ public class AccountStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task LocalMetadataStore_ConditionalRestorePreservesNewerEditAndRestoresExactPriorSnapshot()
+    {
+        string filePath = Path.Combine(_tempDir, "restore-accounts.json");
+        var first = new LocalMetadataAccountStore(filePath);
+        var previous = await first.AddAccountAsync(new CreateAccountInput(
+            Email: "conditional-restore@example.com", Name: "Before", HasVaultedSession: false));
+        var written = await first.UpdateAccountAsync(previous.Id, new UpdateAccountInput(
+            Name: "During capture", ValidationStatus: AccountValidationStatus.Valid,
+            HasVaultedSession: true, LastActiveAt: DateTimeOffset.UtcNow.ToString("O")));
+        Assert.NotNull(written);
+
+        var second = new LocalMetadataAccountStore(filePath);
+        await second.UpdateAccountAsync(previous.Id, new UpdateAccountInput(Notes: "Newer independent edit"));
+        Assert.False(await first.RestoreAccountIfUnchangedAsync(written!, previous));
+        Assert.Equal("Newer independent edit", (await first.GetAccountAsync(previous.Id))!.Notes);
+
+        var current = await first.GetAccountAsync(previous.Id);
+        Assert.True(await first.RestoreAccountIfUnchangedAsync(current!, previous));
+        Assert.Equal(previous, await second.GetAccountAsync(previous.Id));
+    }
+
+    [Fact]
     public void LocalMetadataStore_DefaultPathMatchesSharedDataDirectoryContract()
     {
         string cwd = Path.Combine(_tempDir, "cwd");

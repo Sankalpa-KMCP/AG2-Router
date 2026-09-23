@@ -6,6 +6,39 @@ namespace AG2Router.Tests;
 
 public class CandidateSelectorTests
 {
+    [Fact]
+    public void UnknownCurrentQuotaNeverAuthorizesAutomaticMutation()
+    {
+        var current = CreateAccount("current");
+        var candidate = CreateAccount("candidate");
+        var selection = CandidateSelector.SelectBestCandidate("current", null,
+            [current, candidate], new Dictionary<string, double> { ["candidate"] = 0.9 },
+            new RouterConfigDto(), new HashSet<string> { "current", "candidate" });
+        Assert.False(selection.ShouldSwitch);
+        Assert.Null(selection.BestCandidate);
+        Assert.Contains("unknown", selection.Reason);
+    }
+
+    [Fact]
+    public void MixedKnownAndUnknownRelevantPoolsCannotProveCandidateCapacity()
+    {
+        var current = CreateAccount("current");
+        var candidate = CreateAccount("candidate");
+        var modelQuotas = new Dictionary<string, IReadOnlyList<ModelQuotaDto>> {
+            ["candidate"] = [
+                new("Known", "model", 0.9, "2026-09-21T18:00:00Z", false),
+                new("Unknown", "model", null, "2026-09-21T20:00:00Z", false),
+                new("Unrelated", "other", 1.0, null, false)
+            ]
+        };
+        var selection = CandidateSelector.SelectBestCandidate("current", 0.05,
+            [current, candidate], new Dictionary<string, double> { ["candidate"] = 0.9 },
+            new RouterConfigDto(), new HashSet<string> { "current", "candidate" },
+            accountModelQuotas: modelQuotas, relevantModelKeys: ["model"]);
+        Assert.False(selection.ShouldSwitch);
+        Assert.Contains("unknown", Assert.Single(selection.Candidates).IneligibilityReason);
+    }
+
     private static AccountMetadata CreateAccount(
         string id,
         string email = "test@example.com",

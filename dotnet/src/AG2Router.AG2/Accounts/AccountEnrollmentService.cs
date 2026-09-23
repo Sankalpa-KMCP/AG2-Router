@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text.Json;
 using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Security;
@@ -215,7 +216,10 @@ public class AccountEnrollmentService
                             if (freshAccount != null &&
                                 string.Equals(freshAccount.Email?.Trim(), email, StringComparison.OrdinalIgnoreCase) &&
                                 freshCred != null &&
-                                string.Equals(freshCred.UserName?.Trim(), email, StringComparison.OrdinalIgnoreCase))
+                                string.Equals(freshCred.UserName?.Trim(), email, StringComparison.OrdinalIgnoreCase) &&
+                                freshCred.Blob is { Length: > 0 } freshBlob &&
+                                freshBlob.Length == cred.Blob.Length &&
+                                CryptographicOperations.FixedTimeEquals(freshBlob, cred.Blob))
                             {
                                 liveIdentityStillCurrent = true;
                             }
@@ -231,6 +235,19 @@ public class AccountEnrollmentService
                     catch
                     {
                         liveIdentityStillCurrent = false;
+                    }
+
+                    if (!liveIdentityStillCurrent)
+                    {
+                        using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                        if (!await _sessionVault.RestoreIfCurrentAsync(vaultReceipt!, recovery.Token).ConfigureAwait(false))
+                            throw new AccountEnrollmentException("The active session changed and vault compensation was uncertain; manual recovery is required.");
+                        bool metadataRestored = isNew
+                            ? await _accountStore.RemoveAccountIfUnchangedAsync(account, recovery.Token).ConfigureAwait(false)
+                            : await _accountStore.RestoreAccountIfUnchangedAsync(account, existing!, recovery.Token).ConfigureAwait(false);
+                        if (!metadataRestored)
+                            throw new AccountEnrollmentException("The active session changed and account metadata could not be restored safely; manual recovery is required.");
+                        throw new AccountEnrollmentException("The active session changed during capture; current-session enrollment was not committed.");
                     }
 
                     bool activeUpdated = false;
@@ -288,7 +305,7 @@ public class AccountEnrollmentService
         }
     }
 
-    private string GetEnrollmentResourcePath() => $"{_sessionVault.GetVaultPath()}.enrollment";
+    private string GetEnrollmentResourcePath() => $"{_sessionVault.GetVaultPath()}.switch";
 }
 
 public sealed record AccountRemovalResult(bool VaultRecordDeleted);
@@ -336,7 +353,22 @@ public sealed class AccountRemovalService(IAccountStore accountStore, SessionVau
                         currentMetadata = await accountStore.GetAccountAsync(accountId, CancellationToken.None)
                             .ConfigureAwait(false);
                     }
-                    catch { }
+                    catch (Exception readError)
+                    {
+                        using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                        try
+                        {
+                            await sessionVault.RestoreRemovedIfAbsentAsync(receipt, recovery.Token).ConfigureAwait(false);
+                        }
+                        catch (Exception restoreError)
+                        {
+                            throw new InvalidOperationException(
+                                "Account removal outcome is unknown and vault restoration failed; manual recovery is required.",
+                                new AggregateException(readError, restoreError));
+                        }
+                        throw new InvalidOperationException(
+                            "Account removal outcome is unknown after metadata readback failed; manual review is required.", readError);
+                    }
 
                     if (currentMetadata != null)
                     {
