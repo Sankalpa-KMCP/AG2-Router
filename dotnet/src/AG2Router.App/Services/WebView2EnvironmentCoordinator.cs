@@ -27,6 +27,7 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
     private TEnv? _currentEnvironment;
     private TaskCompletionSource<bool>? _currentExitTcs;
     private uint? _activeBrowserPid;
+    private long _generation;
 
     public WebView2EnvironmentCoordinatorCore(
         Func<CancellationToken, Task<TEnv>> environmentFactory,
@@ -105,7 +106,9 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
             {
                 try
                 {
-                    createdEnv = await _environmentFactory(ct).ConfigureAwait(false);
+                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+                    createdEnv = await _environmentFactory(timeoutCts.Token).ConfigureAwait(false);
                     break;
                 }
                 catch (Exception ex) when (_isLockContentionException(ex))
@@ -128,6 +131,12 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
                 );
             }
 
+            long currentGen;
+            lock (_stateLock)
+            {
+                currentGen = ++_generation;
+            }
+
             // 5. Wire exit notification (RunContinuationsAsynchronously is essential to avoid re-entering COM state)
             var newExitTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -143,7 +152,7 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
                 lock (_stateLock)
                 {
                     // Guard against late-firing events from older environments
-                    if (ReferenceEquals(_currentEnvironment, createdEnv))
+                    if (ReferenceEquals(_currentEnvironment, createdEnv) && _generation == currentGen)
                     {
                         _currentEnvironment = null;
                     }

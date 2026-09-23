@@ -1,6 +1,6 @@
 <script lang="ts">
   interface Props {
-    percent: number;
+    percent: number | null;
     size?: number;
     strokeWidth?: number;
     isExhausted?: boolean;
@@ -15,12 +15,15 @@
     label = ''
   }: Props = $props();
 
-  const clampedPercent = $derived(Math.max(0, Math.min(100, Math.round(percent))));
+  const isUnknown = $derived(percent === null || !Number.isFinite(percent));
+  const safePercent = $derived(!isUnknown && percent !== null ? percent : 0);
+  const clampedPercent = $derived(Math.max(0, Math.min(100, Math.round(safePercent))));
   const radius = $derived((size - strokeWidth) / 2);
   const circumference = $derived(2 * Math.PI * radius);
   const strokeDashoffset = $derived(circumference - (clampedPercent / 100) * circumference);
 
   const strokeColor = $derived.by(() => {
+    if (isUnknown && !isExhausted) return 'var(--ring-track)';
     if (isExhausted || clampedPercent <= 0) return 'var(--ring-danger)';
     if (clampedPercent <= 15) return 'var(--ring-warning)';
     return 'var(--ring-healthy)';
@@ -29,11 +32,11 @@
 
 <div
   class="progress-ring-container"
-  role="progressbar"
-  aria-valuenow={clampedPercent}
+  role={isUnknown && !isExhausted ? 'status' : 'progressbar'}
+  aria-valuenow={isUnknown && !isExhausted ? undefined : clampedPercent}
   aria-valuemin={0}
   aria-valuemax={100}
-  aria-label={label ? `${label}: ${clampedPercent}% remaining` : `${clampedPercent}% remaining`}
+  aria-label={isUnknown && !isExhausted ? `${label || 'Model quota'}: unknown` : label ? `${label}: ${clampedPercent}% remaining` : `${clampedPercent}% remaining`}
 >
   <svg
     width={size}
@@ -67,7 +70,7 @@
   </svg>
   <div class="progress-ring-content">
     <span class="progress-ring-value" style="font-size: {size >= 64 ? 14 : 11}px;">
-      {clampedPercent}%
+      {isUnknown && !isExhausted ? '—' : `${clampedPercent}%`}
     </span>
   </div>
 </div>

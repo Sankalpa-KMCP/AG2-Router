@@ -141,11 +141,15 @@ public partial class App : System.Windows.Application
                 processLifecycle);
 
             Log("Initializing NativeAutoRouter and AutostartService...");
-            _autoRouter = new NativeAutoRouter(_accountStore, _sessionVault, _ag2Adapter, _switchCoordinator);
+            string configPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "config.json");
+            _autoRouter = new NativeAutoRouter(_accountStore, _sessionVault, _ag2Adapter, _switchCoordinator, configFilePath: configPath);
             _autostartService = new WindowsRegistryAutostartService(new WindowsRegistryAccessor());
 
             Log("Initializing TelemetryPollingCoordinator...");
-            _telemetryCoordinator = new TelemetryPollingCoordinator(_ag2Adapter, autoRouter: _autoRouter);
+            _telemetryCoordinator = new TelemetryPollingCoordinator(
+                _ag2Adapter,
+                interval: TimeSpan.FromMilliseconds(_autoRouter.GetConfig().PollingIntervalMs),
+                autoRouter: _autoRouter);
             _telemetryCoordinator.Start();
 
             Log("Starting loopback server...");
@@ -158,7 +162,8 @@ public partial class App : System.Windows.Application
                 enrollmentService: _enrollmentService,
                 switchCoordinator: _switchCoordinator,
                 autoRouter: _autoRouter,
-                autostartService: _autostartService);
+                autostartService: _autostartService,
+                onPollingIntervalChanged: interval => _telemetryCoordinator?.UpdateInterval(interval));
 
             var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
             Log($"Loopback server bound to: {dashboardUrl}");
@@ -259,6 +264,22 @@ public partial class App : System.Windows.Application
         if (_isShuttingDown) return;
         _isShuttingDown = true;
 
+        if (_switchCoordinator != null)
+        {
+            try
+            {
+                await _switchCoordinator.CoordinateShutdownAsync(TimeSpan.FromSeconds(15));
+            }
+            catch (TimeoutException ex)
+            {
+                Log($"Shutdown deferred: {ex.Message}");
+                _isShuttingDown = false;
+                System.Windows.MessageBox.Show(ex.Message, "AG2 Router Switch Recovery",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+        }
+
         // Clean up UI & Tray icon immediately to eliminate ghost icons
         _trayIconManager?.Dispose();
         _trayIconManager = null;
@@ -291,6 +312,8 @@ public partial class App : System.Windows.Application
 
         _dashboardManager?.CloseDashboard();
         _dashboardManager = null;
+
+        _switchCoordinator = null;
 
         // Stop in-process loopback host gracefully
         if (_loopbackServer != null)

@@ -3,6 +3,7 @@ using System.IO;
 using System.Windows;
 using AG2Router.App.Diagnostics;
 using AG2Router.App.Lifecycle;
+using AG2Router.App.Services;
 using Xunit;
 
 namespace AG2Router.Tests;
@@ -505,4 +506,33 @@ public class DashboardLifecycleTests
     private sealed record PersistenceObservation(
         string Destination,
         CapturedJsError[] Snapshot);
+}
+
+public sealed class WebViewRecoveryPolicyTests
+{
+    [Theory]
+    [InlineData(WebViewFailureKind.Navigation, WebViewRecoveryAction.Reload)]
+    [InlineData(WebViewFailureKind.Initialization, WebViewRecoveryAction.Recreate)]
+    [InlineData(WebViewFailureKind.Process, WebViewRecoveryAction.Recreate)]
+    public void EachFailureClassConsumesSharedBoundedBudget(
+        WebViewFailureKind kind, WebViewRecoveryAction firstAction)
+    {
+        var policy = new WebViewRecoveryPolicy();
+        Assert.Equal(firstAction, policy.RecordFailure(kind));
+        Assert.Equal(WebViewRecoveryAction.Recreate, policy.RecordFailure(WebViewFailureKind.Process));
+        Assert.Equal(WebViewRecoveryAction.ManualRetry, policy.RecordFailure(WebViewFailureKind.Initialization));
+        Assert.Equal(WebViewRecoveryAction.ManualRetry, policy.RecordFailure(WebViewFailureKind.Navigation));
+    }
+
+    [Fact]
+    public void SuccessAndManualRetryResetBudget()
+    {
+        var policy = new WebViewRecoveryPolicy(1);
+        policy.RecordFailure(WebViewFailureKind.Navigation);
+        Assert.Equal(WebViewRecoveryAction.ManualRetry, policy.RecordFailure(WebViewFailureKind.Process));
+        policy.RecordSuccess();
+        Assert.Equal(WebViewRecoveryAction.Recreate, policy.RecordFailure(WebViewFailureKind.Process));
+        policy.ResetForManualRetry();
+        Assert.Equal(WebViewRecoveryAction.Reload, policy.RecordFailure(WebViewFailureKind.Navigation));
+    }
 }

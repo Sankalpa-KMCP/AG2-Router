@@ -8,6 +8,7 @@ using AG2Router.App.Diagnostics;
 using AG2Router.App.Lifecycle;
 using AG2Router.App.Services;
 using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
 
 namespace AG2Router.App.Views;
 
@@ -23,6 +24,10 @@ public partial class MainWindow : Window, IDashboardWindow
     private CoreWebView2DevToolsProtocolEventReceiver? _consoleReceiver;
     private bool _isWebViewInitialized;
     private bool _isDisposed;
+    private readonly WebViewRecoveryPolicy _recoveryPolicy = new();
+    private bool _recoveryInProgress;
+    private WebViewFailureKind? _pendingRecoveryKind;
+    private WebViewFailureKind? _exhaustedFailureKind;
 
     public uint? BrowserProcessId { get; private set; }
 
@@ -97,7 +102,7 @@ public partial class MainWindow : Window, IDashboardWindow
             await DashboardWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Runtime.enable", "{}");
 
             // 5. Monitor navigation and process failures
-            DashboardWebView.CoreWebView2.NavigationCompleted += (s, e) =>
+            DashboardWebView.CoreWebView2.NavigationCompleted += async (s, e) =>
             {
                 if (!e.IsSuccess)
                 {
@@ -105,15 +110,24 @@ public partial class MainWindow : Window, IDashboardWindow
                         "NavigationFailure",
                         $"Navigation failed with status: {e.WebErrorStatus}"
                     );
+
+                    await RecoverWebViewAsync(WebViewFailureKind.Navigation, e.WebErrorStatus.ToString());
+                }
+                else
+                {
+                    _recoveryPolicy.RecordSuccess();
+                    _exhaustedFailureKind = null;
+                    ErrorOverlay.Visibility = Visibility.Collapsed;
                 }
             };
 
-            DashboardWebView.CoreWebView2.ProcessFailed += (s, e) =>
+            DashboardWebView.CoreWebView2.ProcessFailed += async (s, e) =>
             {
                 JsRuntimeDiagnostics.RecordError(
                     "ProcessFailed",
                     $"Process {e.ProcessFailedKind} exited with code {e.ExitCode}"
                 );
+                await RecoverWebViewAsync(WebViewFailureKind.Process, e.ProcessFailedKind.ToString());
             };
 
             DashboardWebView.CoreWebView2.Navigate(_dashboardUrl);
@@ -126,13 +140,85 @@ public partial class MainWindow : Window, IDashboardWindow
         catch (Exception ex)
         {
             JsRuntimeDiagnostics.RecordError("InitializationError", ex.Message, ex.StackTrace);
-            System.Windows.MessageBox.Show(
-                $"Failed to initialize WebView2 dashboard runtime: {ex.Message}\n\nPlease ensure the Microsoft Edge WebView2 Runtime is installed.",
-                "AG2 Router Initialization Error",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error
-            );
+            if (_recoveryInProgress) throw;
+            await RecoverWebViewAsync(WebViewFailureKind.Initialization, ex.Message);
         }
+    }
+
+    private async Task RecoverWebViewAsync(WebViewFailureKind kind, string detail)
+    {
+        if (_isDisposed) return;
+        if (_recoveryInProgress)
+        {
+            if (kind == WebViewFailureKind.Process) _pendingRecoveryKind = kind;
+            return;
+        }
+        _recoveryInProgress = true;
+        try
+        {
+            while (!_isDisposed)
+            {
+                var action = _recoveryPolicy.RecordFailure(kind);
+                if (action == WebViewRecoveryAction.ManualRetry)
+                {
+                    _exhaustedFailureKind = kind;
+                    ErrorOverlayMessage.Text = $"Dashboard recovery stopped after repeated {kind.ToString().ToLowerInvariant()} failures ({detail}). Retry manually when the problem is resolved.";
+                    ErrorOverlay.Visibility = Visibility.Visible;
+                    return;
+                }
+
+                await Task.Delay(500);
+                if (_isDisposed) return;
+                try
+                {
+                    if (action == WebViewRecoveryAction.Reload && DashboardWebView.CoreWebView2 != null)
+                        DashboardWebView.CoreWebView2.Navigate(_dashboardUrl);
+                    else
+                    {
+                        RecreateWebViewControl();
+                        await InitializeWebViewAsync();
+                    }
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    JsRuntimeDiagnostics.RecordError("RecoveryError", ex.Message, ex.StackTrace);
+                    kind = WebViewFailureKind.Initialization;
+                    detail = ex.Message;
+                }
+            }
+        }
+        finally
+        {
+            _recoveryInProgress = false;
+            if (!_isDisposed && _pendingRecoveryKind is { } pending)
+            {
+                _pendingRecoveryKind = null;
+                await RecoverWebViewAsync(pending, "WebView process failed during recovery");
+            }
+        }
+    }
+
+    private void RecreateWebViewControl()
+    {
+        var old = DashboardWebView;
+        if (_exceptionReceiver != null)
+        {
+            _exceptionReceiver.DevToolsProtocolEventReceived -= OnExceptionThrown;
+            _exceptionReceiver = null;
+        }
+        if (_consoleReceiver != null)
+        {
+            _consoleReceiver.DevToolsProtocolEventReceived -= OnConsoleAPICalled;
+            _consoleReceiver = null;
+        }
+        WebView2EnvironmentCoordinator.NotifyWindowClosing(BrowserProcessId);
+        BrowserProcessId = null;
+        (old.Parent as System.Windows.Controls.Panel)?.Children.Remove(old);
+        old.Dispose();
+        DashboardWebView = new WebView2();
+        ((Grid)Content).Children.Insert(0, DashboardWebView);
+        _isWebViewInitialized = false;
     }
 
     private void OnExceptionThrown(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
@@ -227,6 +313,39 @@ public partial class MainWindow : Window, IDashboardWindow
             catch
             {
                 // Ignore disposal errors on teardown
+            }
+        }
+    }
+
+    private void OnRetryConnectionClicked(object sender, RoutedEventArgs e)
+    {
+        _recoveryPolicy.ResetForManualRetry();
+        ErrorOverlay.Visibility = Visibility.Collapsed;
+        if (_isDisposed) return;
+        if (_exhaustedFailureKind == WebViewFailureKind.Navigation && DashboardWebView.CoreWebView2 != null)
+        {
+            try
+            {
+                DashboardWebView.CoreWebView2.Navigate(_dashboardUrl);
+            }
+            catch (Exception ex)
+            {
+                JsRuntimeDiagnostics.RecordError("NavigationRetryError", ex.Message, ex.StackTrace);
+                _ = RecoverWebViewAsync(WebViewFailureKind.Navigation, ex.Message);
+            }
+        }
+        else
+        {
+            _exhaustedFailureKind = null;
+            try
+            {
+                RecreateWebViewControl();
+                _ = InitializeWebViewAsync();
+            }
+            catch (Exception ex)
+            {
+                JsRuntimeDiagnostics.RecordError("ManualRecoveryError", ex.Message, ex.StackTrace);
+                _ = RecoverWebViewAsync(WebViewFailureKind.Initialization, ex.Message);
             }
         }
     }

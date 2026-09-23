@@ -7,7 +7,6 @@
   import RoutingConfigSection from './lib/components/RoutingConfigSection.svelte';
   import ActivityLogSection from './lib/components/ActivityLogSection.svelte';
   import ConnectAccountModal from './lib/components/ConnectAccountModal.svelte';
-  import SwitchPlanModal from './lib/components/SwitchPlanModal.svelte';
   import DeleteAccountModal from './lib/components/DeleteAccountModal.svelte';
   import ExecuteSwitchConfirmModal from './lib/components/ExecuteSwitchConfirmModal.svelte';
   import { api } from './lib/api/client.js';
@@ -19,8 +18,7 @@
   import type {
     SystemStatusDto,
     AccountMetadata,
-    RouterConfigDto,
-    SwitchPlanDto
+    RouterConfigDto
   } from './lib/api/types.js';
 
   // Application State
@@ -45,12 +43,6 @@
 
   // Modal State
   let isConnectModalOpen = $state<boolean>(false);
-
-  let planModalOpen = $state<boolean>(false);
-  let planTargetAccount = $state<AccountMetadata | null>(null);
-  let planData = $state<SwitchPlanDto | null>(null);
-  let isPlanLoading = $state<boolean>(false);
-  let planError = $state<string | null>(null);
 
   let deleteModalOpen = $state<boolean>(false);
   let deleteTargetAccount = $state<AccountMetadata | null>(null);
@@ -118,9 +110,11 @@
 
   // Polling routine
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let configMutationFence = 0;
 
   async function refreshAll() {
     isRefreshing = true;
+    const capturedFence = configMutationFence;
     try {
       const [statusRes, accountsRes, configRes] = await Promise.all([
         api.getStatus().catch(() => null),
@@ -136,7 +130,7 @@
         totalAccountsCount = accountsRes.totalCount ?? accounts.length;
         activeAccountId = accountsRes.activeAccountId || null;
       }
-      if (configRes && configRes.config) {
+      if (configRes && configRes.config && configMutationFence <= capturedFence) {
         routerConfig = configRes.config;
       }
 
@@ -183,26 +177,6 @@
     await refreshAll();
   }
 
-  function handleOpenPlanSwitch(account: AccountMetadata) {
-    planTargetAccount = account;
-    planData = null;
-    planError = null;
-    isPlanLoading = true;
-    planModalOpen = true;
-
-    api.planSwitch(account.id)
-      .then(res => {
-        planData = res.plan;
-        logActivity(`Evaluated switch readiness for ${account.email}: ${res.plan.ready ? 'READY' : 'BLOCKED'}`);
-      })
-      .catch(err => {
-        planError = err instanceof Error ? err.message : 'Switch evaluation error';
-      })
-      .finally(() => {
-        isPlanLoading = false;
-      });
-  }
-
   function handleOpenExecuteSwitch(account: AccountMetadata) {
     switchTargetAccount = account;
     switchModalOpen = true;
@@ -245,6 +219,7 @@
     minimumCandidateQuotaPercent: number;
     pollingIntervalMs: number;
   }) {
+    configMutationFence++;
     const res = await api.saveConfig(updated);
     if (res.success && res.config) {
       routerConfig = res.config;
@@ -357,7 +332,6 @@
           {accounts}
           onSaveCurrent={handleSaveCurrentAccount}
           onOpenConnect={() => (isConnectModalOpen = true)}
-          onPlanSwitch={handleOpenPlanSwitch}
           onExecuteSwitch={handleOpenExecuteSwitch}
           onDeleteAccount={handleOpenDelete}
           onUpdateAlias={handleUpdateAlias}
@@ -369,7 +343,6 @@
           {accounts}
           onSaveCurrent={handleSaveCurrentAccount}
           onOpenConnect={() => (isConnectModalOpen = true)}
-          onPlanSwitch={handleOpenPlanSwitch}
           onExecuteSwitch={handleOpenExecuteSwitch}
           onDeleteAccount={handleOpenDelete}
           onUpdateAlias={handleUpdateAlias}
@@ -411,15 +384,6 @@
   isOpen={isConnectModalOpen}
   onClose={() => (isConnectModalOpen = false)}
   onSubmit={handleConnectAccount}
-/>
-
-<SwitchPlanModal
-  isOpen={planModalOpen}
-  targetAccount={planTargetAccount}
-  plan={planData}
-  isLoading={isPlanLoading}
-  error={planError}
-  onClose={() => (planModalOpen = false)}
 />
 
 <ExecuteSwitchConfirmModal

@@ -9,5 +9,12 @@
         Background="#FFFFFF">
     <Grid Background="#FFFFFF">
         <wv2:WebView2 x:Name="DashboardWebView" />
+        <Grid x:Name="ErrorOverlay" Background="#FAFAFA" Visibility="Collapsed">
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="420">
+                <TextBlock Text="Dashboard Connection Failed" FontSize="18" FontWeight="SemiBold" Foreground="#111827" HorizontalAlignment="Center" Margin="0,0,0,8" />
+                <TextBlock x:Name="ErrorOverlayMessage" Text="Could not connect to the AG2 Router loopback service." TextWrapping="Wrap" TextAlignment="Center" Foreground="#4B5563" FontSize="13" Margin="0,0,0,16" />
+                <Button x:Name="RetryButton" Content="Retry Connection" Click="OnRetryConnectionClicked" Width="140" Height="34" Background="#2563EB" Foreground="#FFFFFF" FontWeight="Medium" BorderThickness="0" Cursor="Hand" HorizontalAlignment="Center" />
+            </StackPanel>
+        </Grid>
     </Grid>
 </Window>
