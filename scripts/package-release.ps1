@@ -34,6 +34,19 @@ Write-Host "====================================================" -ForegroundCol
 Write-Host "AG2 Router Release Packaging: Version $Version ($Configuration)" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
+# Frontend output is generated source for the published wwwroot payload. Always
+# regenerate it before publishing, including standalone packaging invocations.
+Write-Host "Building dashboard assets for the release payload..."
+Push-Location $RepoRoot
+try {
+    & npm run build
+    if ($LASTEXITCODE -ne 0) {
+        throw "npm run build failed with exit code $LASTEXITCODE"
+    }
+} finally {
+    Pop-Location
+}
+
 # 1. Clean previous publish and staging outputs
 if (Test-Path $PublishDir) {
     Write-Host "[1/6] Cleaning prior publish directory: $PublishDir"

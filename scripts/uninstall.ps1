@@ -30,31 +30,48 @@ if (-not $NormalizedExpected.StartsWith([System.IO.Path]::GetFullPath($env:LOCAL
     throw "Security Preflight Failure: Target directory '$ExpectedInstallDir' is not the authorized per-user installation path (%LOCALAPPDATA%\Programs\AG2Router). Aborting uninstallation."
 }
 
-# 2. Graceful Process Shutdown
+# 2. Graceful Process Shutdown via Named Mutex and Process Check
+$sessionMutex = $null
+$mutexHeld = [System.Threading.Mutex]::TryOpenExisting("Local\AG2Router_Session_Mutex", [ref]$sessionMutex)
+if ($mutexHeld -and $sessionMutex) {
+    $sessionMutex.Dispose()
+}
 $runningProcesses = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
-if ($runningProcesses) {
+
+if ($mutexHeld -or $runningProcesses) {
     Write-Host "Detected running AG2 Router instance. Requesting graceful shutdown (--exit)..."
     if (Test-Path $ExePath) {
         try {
-            $exitProcess = Start-Process -FilePath $ExePath -ArgumentList "--exit" -Wait -PassThru -WindowStyle Hidden
+            $exitProcess = Start-Process -FilePath $ExePath -ArgumentList "--exit" -PassThru -WindowStyle Hidden
+            if (-not $exitProcess.WaitForExit(5000)) {
+                throw "Shutdown request (--exit) did not finish within five seconds. Uninstallation aborted."
+            }
             if ($exitProcess.ExitCode -ne 0) {
-                Write-Warning "Shutdown request (--exit) returned exit code $($exitProcess.ExitCode)"
+                throw "Shutdown request (--exit) returned exit code $($exitProcess.ExitCode). Uninstallation aborted."
             }
         } catch {
-            Write-Warning "Failed to invoke --exit signal: $_"
+            throw "Failed to complete --exit shutdown request. Uninstallation aborted: $_"
         }
+    } else {
+        throw "AG2 Router is running but its shutdown executable is missing. Uninstallation aborted."
     }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $stillRunning = $true
     while ($sw.ElapsedMilliseconds -lt 5000) {
+        $testMutex = $null
+        $mHeld = [System.Threading.Mutex]::TryOpenExisting("Local\AG2Router_Session_Mutex", [ref]$testMutex)
+        if ($mHeld -and $testMutex) { $testMutex.Dispose() }
         $remaining = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
-        if (-not $remaining) { break }
+        if (-not $mHeld -and -not $remaining) {
+            $stillRunning = $false
+            break
+        }
         Start-Sleep -Milliseconds 250
     }
 
-    $stillRunning = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
     if ($stillRunning) {
-        throw "AG2 Router is currently running and could not be gracefully closed. Please exit AG2 Router from the system tray before proceeding."
+        throw "AG2 Router is currently running and could not be gracefully closed within 5 seconds. Please exit AG2 Router from the system tray before proceeding."
     }
     Write-Host "  [OK] Process closed gracefully." -ForegroundColor Green
 }

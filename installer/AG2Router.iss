@@ -42,11 +42,56 @@ Name: "{autoprograms}\AG2 Router"; Filename: "{app}\AG2Router.exe"; WorkingDir: 
 [Run]
 Filename: "{app}\AG2Router.exe"; Description: "{cm:LaunchProgram,AG2 Router}"; Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-; Gracefully signal running instance to exit and wait boundedly for primary termination before uninstallation begins
-Filename: "{app}\AG2Router.exe"; Parameters: "--exit"; Flags: runhidden skipifdoesntexist
-
 [Code]
+const
+  SYNCHRONIZE = $00100000;
+  SessionMutexName = 'Local\AG2Router_Session_Mutex';
+
+var
+  HasBackup: Boolean;
+  InstallCompleted: Boolean;
+
+function OpenMutexW(dwDesiredAccess: DWORD; bInheritHandle: BOOL; lpName: String): THandle;
+external 'OpenMutexW@kernel32.dll stdcall';
+
+function CloseHandle(hObject: THandle): BOOL;
+external 'CloseHandle@kernel32.dll stdcall';
+
+function MoveFileW(lpExistingFileName, lpNewFileName: String): BOOL;
+external 'MoveFileW@kernel32.dll stdcall';
+
+function IsSessionMutexHeld(): Boolean;
+var
+  hMutex: THandle;
+begin
+  Result := False;
+  hMutex := OpenMutexW(SYNCHRONIZE, False, SessionMutexName);
+  if hMutex <> 0 then
+  begin
+    Result := True;
+    CloseHandle(hMutex);
+  end;
+end;
+
+function WaitForSessionMutexRelease(TimeoutMs: Integer): Boolean;
+var
+  Elapsed: Integer;
+begin
+  Result := False;
+  Elapsed := 0;
+  while Elapsed < TimeoutMs do
+  begin
+    if not IsSessionMutexHeld() then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(250);
+    Elapsed := Elapsed + 250;
+  end;
+  Result := not IsSessionMutexHeld();
+end;
+
 // Prerequisite check for Microsoft Edge WebView2 Evergreen Runtime & per-user validation
 function InitializeSetup(): Boolean;
 var
@@ -85,6 +130,56 @@ begin
            'The system tray and background routing will function, but the dashboard UI requires WebView2.' + #13#10 +
            'You can install it from: https://developer.microsoft.com/en-us/microsoft-edge/webview2/',
            mbInformation, MB_OK);
+  end;
+end;
+
+// A failed exit request must stop uninstall before files or registrations are removed.
+function InitializeUninstall(): Boolean;
+var
+  InstalledExe: String;
+  ResultCode: Integer;
+begin
+  Result := True;
+  if IsSessionMutexHeld() then
+  begin
+    InstalledExe := ExpandConstant('{app}\AG2Router.exe');
+    if not FileExists(InstalledExe) then
+    begin
+      MsgBox('AG2 Router is currently running but its shutdown executable is missing.' + #13#10 +
+             'Please exit AG2 Router before proceeding with uninstallation.',
+             mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
+    if not Exec(InstalledExe, '--exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      MsgBox('AG2 Router shutdown command could not be started.' + #13#10 +
+             'Please exit AG2 Router from the system tray before uninstalling.',
+             mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
+    if ResultCode <> 0 then
+    begin
+      MsgBox('AG2 Router could not be closed safely (exit code ' + IntToStr(ResultCode) + ').' + #13#10 +
+             'Please exit AG2 Router from the system tray before uninstalling.',
+             mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
+    if not WaitForSessionMutexRelease(5000) then
+    begin
+      MsgBox('AG2 Router is currently running and could not be gracefully closed within 5 seconds.' + #13#10 +
+             'Please exit AG2 Router from the system tray before uninstalling.',
+             mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
+    Sleep(250);
   end;
 end;
 
@@ -151,38 +246,98 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  InstalledExe := ExpandConstant('{app}\AG2Router.exe');
-  if FileExists(InstalledExe) then
+  if IsSessionMutexHeld() then
   begin
-    // Request graceful shutdown and wait boundedly for primary instance termination via AG2Router.exe --exit
-    if Exec(InstalledExe, '--exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    InstalledExe := ExpandConstant('{app}\AG2Router.exe');
+    if not FileExists(InstalledExe) then
     begin
-      if ResultCode <> 0 then
-      begin
-        Result := 'AG2 Router is currently running and could not be gracefully closed.' + #13#10 +
-                  'Please exit AG2 Router from the system tray before proceeding with installation.';
-      end
-      else
-      begin
-        // Allow brief pause for OS process handle closure and file unlocks before extraction
-        Sleep(250);
-      end;
-    end
-    else
-    begin
-      Result := 'Failed to execute AG2 Router shutdown command (--exit).';
+      Result := 'AG2 Router is currently running but its shutdown executable is missing.' + #13#10 +
+                'Please exit AG2 Router before proceeding with installation.';
+      Exit;
     end;
+
+    // Request graceful shutdown and wait boundedly for primary instance termination via AG2Router.exe --exit
+    if not Exec(InstalledExe, '--exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      Result := 'Failed to execute AG2 Router shutdown command (--exit).' + #13#10 +
+                'Please exit AG2 Router from the system tray before proceeding with installation.';
+      Exit;
+    end;
+
+    if ResultCode <> 0 then
+    begin
+      Result := 'AG2 Router shutdown command returned exit code ' + IntToStr(ResultCode) + '.' + #13#10 +
+                'Please exit AG2 Router from the system tray before proceeding with installation.';
+      Exit;
+    end;
+
+    // Poll mutex up to 20 times (5000 ms)
+    if not WaitForSessionMutexRelease(5000) then
+    begin
+      Result := 'AG2 Router is currently running and could not be gracefully closed within 5 seconds.' + #13#10 +
+                'Please exit AG2 Router from the system tray before proceeding with installation.';
+      Exit;
+    end;
+
+    // Allow brief pause for OS process handle closure and file unlocks before extraction
+    Sleep(250);
   end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  AppDir, BackupDir: String;
 begin
-  if CurStep = ssPostInstall then
+  if CurStep = ssInstall then
   begin
+    AppDir := ExpandConstant('{app}');
+    BackupDir := AppDir + '.bak';
+    HasBackup := False;
+    InstallCompleted := False;
+
+    if DirExists(AppDir) then
+    begin
+      if DirExists(BackupDir) then
+        DelTree(BackupDir, True, True, True);
+
+      if MoveFileW(AppDir, BackupDir) then
+        HasBackup := True;
+    end;
+  end
+  else if CurStep = ssPostInstall then
+  begin
+    AppDir := ExpandConstant('{app}');
+    BackupDir := AppDir + '.bak';
+
+    if FileExists(AppDir + '\AG2Router.exe') then
+    begin
+      if HasBackup and DirExists(BackupDir) then
+      begin
+        DelTree(BackupDir, True, True, True);
+      end;
+      InstallCompleted := True;
+    end;
+
     CleanLegacyScriptUninstallRegistration();
   end;
 end;
 
+procedure DeinitializeSetup();
+var
+  AppDir, BackupDir: String;
+begin
+  AppDir := ExpandConstant('{app}');
+  BackupDir := AppDir + '.bak';
+
+  if HasBackup and (not InstallCompleted) then
+  begin
+    if DirExists(AppDir) then
+      DelTree(AppDir, True, True, True);
+
+    if DirExists(BackupDir) then
+      MoveFileW(BackupDir, AppDir);
+  end;
+end;
 
 // Startup ownership verification during uninstall
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

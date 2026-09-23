@@ -243,8 +243,10 @@ public class ReleasePackagingTests
         Assert.Contains("function PrepareToInstall", issContent);
         Assert.Contains("'--exit'", issContent);
 
-        // Verify uninstaller graceful shutdown
-        Assert.Contains("Filename: \"{app}\\AG2Router.exe\"; Parameters: \"--exit\"", issContent);
+        // Verify uninstaller graceful shutdown via InitializeUninstall
+        Assert.Contains("function InitializeUninstall(): Boolean", issContent);
+        Assert.Contains("'--exit'", issContent);
+        Assert.DoesNotContain("[UninstallRun]", issContent);
     }
 
     #endregion
@@ -444,6 +446,61 @@ public class ReleasePackagingTests
         Assert.True(runKeyDeletePos > 0);
         string deleteSection = issContent.Substring(runKeyDeletePos);
         Assert.DoesNotContain("CurStepChanged", deleteSection);
+    }
+
+    [Fact]
+    public void InnoSetup_And_InstallScripts_CoordinateWithSessionMutexAndFailClosed()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+        string installScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "install.ps1"));
+        string uninstallScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "uninstall.ps1"));
+
+        // 1. Inno Setup mutex imports and coordination
+        Assert.Contains("OpenMutexW", issContent);
+        Assert.Contains("CloseHandle", issContent);
+        Assert.Contains(@"Local\AG2Router_Session_Mutex", issContent);
+        Assert.Contains("function IsSessionMutexHeld(): Boolean", issContent);
+        Assert.Contains("function WaitForSessionMutexRelease", issContent);
+        Assert.Contains("if IsSessionMutexHeld() then", issContent);
+
+        // 2. Inno Setup PrepareToInstall & InitializeUninstall fail-closed guards
+        Assert.Contains("function PrepareToInstall", issContent);
+        Assert.Contains("function InitializeUninstall(): Boolean", issContent);
+
+        // 3. install.ps1 mutex check and fail-closed guards
+        Assert.Contains(@"Local\AG2Router_Session_Mutex", installScript);
+        Assert.Contains("[System.Threading.Mutex]::TryOpenExisting", installScript);
+        Assert.Contains("Installation aborted", installScript);
+
+        // 4. uninstall.ps1 mutex check and fail-closed guards
+        Assert.Contains(@"Local\AG2Router_Session_Mutex", uninstallScript);
+        Assert.Contains("[System.Threading.Mutex]::TryOpenExisting", uninstallScript);
+        Assert.Contains("Uninstallation aborted", uninstallScript);
+    }
+
+    [Fact]
+    public void InnoSetup_ImplementsAtomicStagedUpgradeWithRollback()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+
+        // 1. Win32 MoveFileW import for atomic directory moves
+        Assert.Contains("MoveFileW", issContent);
+
+        // 2. ssInstall stages existing app to backup
+        Assert.Contains("CurStep = ssInstall", issContent);
+        Assert.Contains(".bak", issContent);
+        Assert.Contains("HasBackup := True", issContent);
+
+        // 3. ssPostInstall verifies executable and cleans backup
+        Assert.Contains("CurStep = ssPostInstall", issContent);
+        Assert.Contains("InstallCompleted := True", issContent);
+
+        // 4. DeinitializeSetup restores backup if install was incomplete
+        Assert.Contains("procedure DeinitializeSetup()", issContent);
+        Assert.Contains("HasBackup and (not InstallCompleted)", issContent);
+        Assert.Contains("MoveFileW(BackupDir, AppDir)", issContent);
     }
 
     #endregion
