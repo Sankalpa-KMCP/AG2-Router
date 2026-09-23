@@ -468,7 +468,8 @@ public class NativeAutoRouter : INativeAutoRouter
                     }
                     await using var lease = await CrossProcessFileLease.AcquireAsync(cooldownResource, cancellationToken)
                         .ConfigureAwait(false);
-                    if (RecoveryQuarantineRegistry.Get(cooldownResource).IsMarked || _sessionVault.IsQuarantined)
+                    if (RecoveryQuarantineRegistry.Get(cooldownResource).IsMarked ||
+                        RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked)
                     {
                         lock (_stateLock) RequireManualRecovery("Account lifecycle is unresolved; manual recovery is required.");
                         return new SelectionResult(false, "Account lifecycle is unresolved; manual recovery is required.",
@@ -597,7 +598,8 @@ public class NativeAutoRouter : INativeAutoRouter
                 }
                 await using var lease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken)
                     .ConfigureAwait(false);
-                if (RecoveryQuarantineRegistry.Get(switchResource).IsMarked || _sessionVault.IsQuarantined)
+                if (RecoveryQuarantineRegistry.Get(switchResource).IsMarked ||
+                    RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked)
                 {
                     lock (_stateLock) RequireManualRecovery("Account lifecycle is unresolved; manual recovery is required.");
                     return new SelectionResult(false, "Account lifecycle is unresolved; manual recovery is required.",
