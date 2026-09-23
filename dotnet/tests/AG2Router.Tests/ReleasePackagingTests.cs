@@ -274,6 +274,19 @@ public class ReleasePackagingTests
     }
 
     [Fact]
+    public void WindowsCi_CompilesInstallerWithPinnedCompilerBeforeTagging()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string workflow = File.ReadAllText(Path.Combine(repoRoot, ".github", "workflows", "dotnet-ci.yml"));
+
+        Assert.Contains("./scripts/provision-inno.ps1 -PinnedVersion 6.4.0", workflow);
+        Assert.Contains("& '${{ steps.inno.outputs.iscc_path }}' /O-", workflow);
+        Assert.Contains("/DSourceDir=$source", workflow);
+        Assert.Contains("installer/AG2Router.iss", workflow);
+        Assert.Contains("if ($LASTEXITCODE -ne 0)", workflow);
+    }
+
+    [Fact]
     public void PackageRelease_InstallerRequiredModeFailsClosed()
     {
         string repoRoot = FindRepositoryRoot();
@@ -299,7 +312,7 @@ public class ReleasePackagingTests
         var versionMatch = Regex.Match(propsContent, @"<Version>(?<ver>[^<]+)</Version>");
         Assert.True(versionMatch.Success, "Directory.Build.props must specify <Version>");
         string canonicalVersion = versionMatch.Groups["ver"].Value.Trim();
-        Assert.Equal("0.2.1", canonicalVersion);
+        Assert.Equal("0.2.2", canonicalVersion);
 
         // Assembly, File, and Informational versions must match canonical version
         Assert.Contains($"<AssemblyVersion>{canonicalVersion}</AssemblyVersion>", propsContent);
@@ -496,7 +509,7 @@ public class ReleasePackagingTests
         string preparation = issContent.Split("function PrepareToInstall(var NeedsRestart: Boolean): String;")[1]
             .Split("procedure CurStepChanged(CurStep: TSetupStep);")[0];
         Assert.Contains("if DirExists(BackupDir) then", preparation);
-        Assert.Contains("if not MoveFileW(AppDir, BackupDir) then", preparation);
+        Assert.Contains("if MoveFileW(AppDir, BackupDir) = 0 then", preparation);
         Assert.Contains("No application files were overwritten", preparation);
         Assert.Contains(".bak", issContent);
         Assert.Contains("HasBackup := True", issContent);
@@ -511,7 +524,8 @@ public class ReleasePackagingTests
         Assert.Contains("HasBackup and (not InstallCompleted)", issContent);
         Assert.Contains("MoveFileW(BackupDir, AppDir)", issContent);
         Assert.Contains("not DelTree(AppDir, True, True, True)", issContent);
-        Assert.Contains("not MoveFileW(BackupDir, AppDir)", issContent);
+        Assert.Contains("if DirExists(BackupDir) then", issContent);
+        Assert.Contains("if MoveFileW(BackupDir, AppDir) = 0 then", issContent);
         Assert.Contains("remains in the sibling .bak directory", issContent);
     }
 

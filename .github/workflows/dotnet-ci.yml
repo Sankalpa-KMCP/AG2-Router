@@ -28,3 +28,21 @@ jobs:
 
       - name: Run unit tests
         run: dotnet test dotnet/AG2Router.sln -c Release --no-build --verbosity normal
+
+      - name: Provision pinned Inno Setup
+        id: inno
+        shell: pwsh
+        run: ./scripts/provision-inno.ps1 -PinnedVersion 6.4.0
+
+      - name: Compile installer before release tagging
+        shell: pwsh
+        run: |
+          [xml]$props = Get-Content 'dotnet/Directory.Build.props'
+          $version = $props.Project.PropertyGroup.Version
+          $source = Join-Path $env:RUNNER_TEMP 'ag2-inno-compile-source'
+          New-Item -ItemType Directory -Path $source -Force | Out-Null
+          [System.IO.File]::WriteAllText((Join-Path $source 'AG2Router.exe'), 'compile-only fixture')
+          & '${{ steps.inno.outputs.iscc_path }}' /O- "/DAppVersion=$version" "/DSourceDir=$source" installer/AG2Router.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned Inno installer compilation failed with exit code $LASTEXITCODE"
+          }

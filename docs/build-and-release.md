@@ -32,7 +32,7 @@ Other version-bearing files and release names must agree at release time, but co
 ## Validation pipelines
 
 - .github/workflows/ci.yml runs Node 20 and 22 on Windows and Ubuntu: install, typecheck, build, and Node tests.
-- .github/workflows/dotnet-ci.yml restores, builds, and tests the .NET solution on Windows.
+- .github/workflows/dotnet-ci.yml restores, builds, and tests the .NET solution on Windows, then compiles the installer with pinned Inno Setup 6.4.0 against disposable input without producing or running an installer. This is the pre-tag installer syntax gate.
 - .github/workflows/release.yml runs combined Node validation, .NET tests, provisions pinned Inno Setup, packages with an installer requirement, checks required outputs, and uploads workflow artifacts.
 
 The current release workflow uploads build artifacts; it does not itself create a GitHub Release or prove external publication/signing.

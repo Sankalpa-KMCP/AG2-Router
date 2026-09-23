@@ -2,7 +2,7 @@
 ; Per-user non-admin installation matching scripts/install.ps1 and scripts/uninstall.ps1 contracts
 
 #ifndef AppVersion
-#define AppVersion "0.2.1"
+#define AppVersion "0.2.2"
 #endif
 
 #ifndef SourceDir
@@ -303,7 +303,7 @@ begin
   end;
   if DirExists(AppDir) then
   begin
-    if not MoveFileW(AppDir, BackupDir) then
+    if MoveFileW(AppDir, BackupDir) = 0 then
     begin
       Result := 'Could not stage the prior installation. No application files were overwritten.';
       Exit;
@@ -356,8 +356,11 @@ begin
       Exit;
     end;
 
-    if DirExists(BackupDir) and (not MoveFileW(BackupDir, AppDir)) then
-      MsgBox('The complete prior installation could not be restored automatically. It remains in the sibling .bak directory for manual recovery.', mbError, MB_OK);
+    if DirExists(BackupDir) then
+    begin
+      if MoveFileW(BackupDir, AppDir) = 0 then
+        MsgBox('The complete prior installation could not be restored automatically. It remains in the sibling .bak directory for manual recovery.', mbError, MB_OK);
+    end;
   end;
 end;
 
