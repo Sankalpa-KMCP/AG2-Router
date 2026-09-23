@@ -204,12 +204,12 @@ public class AccountEnrollmentService
                     catch (VaultMutationUncertainException ex)
                     {
                         _lifecycleQuarantine.Mark();
-                        throw new AccountEnrollmentException(
+                        throw new RecoveryUncertainEnrollmentException(
                             "Vault save outcome is uncertain; manual recovery is required.", ex);
                     }
                     catch (OperationCanceledException ex) when (vaultCommitted)
                     {
-                        throw new AccountEnrollmentException(
+                        throw new RecoveryUncertainEnrollmentException(
                             "Account metadata commit did not complete within its deadline; manual recovery is required.", ex);
                     }
                     catch
@@ -224,12 +224,12 @@ public class AccountEnrollmentService
                         }
                         catch
                         {
-                            throw new AccountEnrollmentException(
+                            throw new RecoveryUncertainEnrollmentException(
                                 "Account metadata could not be read after a failed enrollment commit; manual recovery is required.");
                         }
 
                         if (currentMetadata == null)
-                            throw new AccountEnrollmentException(
+                            throw new RecoveryUncertainEnrollmentException(
                                 "Account metadata disappeared after a failed enrollment commit; manual recovery is required.");
 
                         bool metadataHasVaultedSession = currentMetadata.HasVaultedSession;
@@ -245,13 +245,13 @@ public class AccountEnrollmentService
                                             vaultReceipt!, recovery.Token)
                                         .ConfigureAwait(false);
                                     if (!restored)
-                                        throw new AccountEnrollmentException(
+                                        throw new RecoveryUncertainEnrollmentException(
                                             "Vault restoration could not be proven after a failed enrollment commit; manual recovery is required.");
                                 }
                                 catch (AccountEnrollmentException) { throw; }
                                 catch
                                 {
-                                    throw new AccountEnrollmentException(
+                                    throw new RecoveryUncertainEnrollmentException(
                                         "Vault restoration failed after a failed enrollment commit; manual recovery is required.");
                                 }
                             }
@@ -263,20 +263,20 @@ public class AccountEnrollmentService
                                     bool removed = await _accountStore.RemoveAccountIfUnchangedAsync(pending, recovery.Token)
                                         .ConfigureAwait(false);
                                     if (!removed)
-                                        throw new AccountEnrollmentException(
+                                        throw new RecoveryUncertainEnrollmentException(
                                             "Account metadata cleanup could not be proven after a failed enrollment commit; manual recovery is required.");
                                 }
                                 catch (AccountEnrollmentException) { throw; }
                                 catch
                                 {
-                                    throw new AccountEnrollmentException(
+                                    throw new RecoveryUncertainEnrollmentException(
                                         "Account metadata cleanup failed after a failed enrollment commit; manual recovery is required.");
                                 }
                             }
                         }
 
                         if (!metadataUnchanged)
-                            throw new AccountEnrollmentException(
+                            throw new RecoveryUncertainEnrollmentException(
                                 "Account metadata changed after a failed enrollment commit; manual recovery is required.");
 
                         throw;
@@ -322,19 +322,19 @@ public class AccountEnrollmentService
                         {
                             if (!await _sessionVault.RestoreIfCurrentAsync(vaultReceipt!, recovery.Token)
                                     .ConfigureAwait(false))
-                                throw new AccountEnrollmentException("The active session changed and vault compensation was uncertain; manual recovery is required.");
+                                throw new RecoveryUncertainEnrollmentException("The active session changed and vault compensation was uncertain; manual recovery is required.");
                             bool metadataRestored = isNew
                                 ? await _accountStore.RemoveAccountIfUnchangedAsync(account, recovery.Token)
                                     .ConfigureAwait(false)
                                 : await _accountStore.RestoreAccountIfUnchangedAsync(account, existing!, recovery.Token)
                                     .ConfigureAwait(false);
                             if (!metadataRestored)
-                                throw new AccountEnrollmentException("The active session changed and account metadata could not be restored safely; manual recovery is required.");
+                                throw new RecoveryUncertainEnrollmentException("The active session changed and account metadata could not be restored safely; manual recovery is required.");
                         }
                         catch (AccountEnrollmentException) { throw; }
                         catch (Exception ex)
                         {
-                            throw new AccountEnrollmentException(
+                            throw new RecoveryUncertainEnrollmentException(
                                 "The active session changed and compensation could not be proven; manual recovery is required.", ex);
                         }
                         throw new AccountEnrollmentException("The active session changed during capture; current-session enrollment was not committed.");
@@ -369,7 +369,7 @@ public class AccountEnrollmentService
                             }
                             catch
                             {
-                                throw new AccountEnrollmentException(
+                                throw new RecoveryUncertainEnrollmentException(
                                     "Active-account selection could not be verified after enrollment; manual recovery is required.");
                             }
                             activeUpdated = string.Equals(authoritativeActiveId, pending.Id, StringComparison.Ordinal);
@@ -408,6 +408,14 @@ public class AccountEnrollmentService
                 }
             }
         }
+        catch (RecoveryUncertainEnrollmentException ex)
+        {
+            _lifecycleQuarantine.Mark();
+            _sessionVault.QuarantineUnresolvedMutation();
+            // Keep the existing public exception type while using an internal
+            // marker to distinguish uncertain persistence from ordinary failure.
+            throw new AccountEnrollmentException(ex.Message, ex.InnerException ?? ex);
+        }
         catch (AccountEnrollmentException)
         {
             throw;
@@ -427,6 +435,12 @@ public class AccountEnrollmentService
     }
 
     private string GetEnrollmentResourcePath() => $"{_sessionVault.GetVaultPath()}.switch";
+
+    private sealed class RecoveryUncertainEnrollmentException : AccountEnrollmentException
+    {
+        public RecoveryUncertainEnrollmentException(string message) : base(message) { }
+        public RecoveryUncertainEnrollmentException(string message, Exception inner) : base(message, inner) { }
+    }
 }
 
 public sealed record AccountRemovalResult(bool VaultRecordDeleted);
@@ -542,10 +556,12 @@ public sealed class AccountRemovalService
                         }
                         catch (Exception restoreError)
                         {
+                            QuarantineUncertainRemoval();
                             throw new InvalidOperationException(
                                 "Account removal outcome is unknown and vault restoration failed; manual recovery is required.",
                                 new AggregateException(readError, restoreError));
                         }
+                        QuarantineUncertainRemoval();
                         throw new InvalidOperationException(
                             "Account removal outcome is unknown after metadata readback failed; manual review is required.", readError);
                     }
@@ -560,6 +576,7 @@ public sealed class AccountRemovalService
                         }
                         catch (Exception restoreError)
                         {
+                            QuarantineUncertainRemoval();
                             throw new InvalidOperationException(
                                 "Account removal compensation could not be proven; manual recovery is required.", restoreError);
                         }
@@ -578,5 +595,11 @@ public sealed class AccountRemovalService
     {
         if (lifecycleQuarantine.IsMarked || sessionVault.IsQuarantined)
             throw new InvalidOperationException("Account lifecycle is unresolved; manual recovery is required.");
+    }
+
+    private void QuarantineUncertainRemoval()
+    {
+        lifecycleQuarantine.Mark();
+        sessionVault.QuarantineUnresolvedMutation();
     }
 }

@@ -365,6 +365,127 @@ public class SessionVaultTests : IDisposable
         Assert.Equal(1, writer.WriteCount);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TimedOutLeaseWaitCannotOverwriteNewerVaultState(bool remove)
+    {
+        const string accountId = "acc_lease_race";
+        var dpapi = new FakeDpapiProvider();
+        var newerVault = new SessionVault(Path.Combine(_tempVaultDir, "newer"), dpapi);
+        await newerVault.SaveSessionAsync(accountId, "newer-session"u8.ToArray());
+        string newerEnvelope = await File.ReadAllTextAsync(newerVault.GetVaultPath());
+
+        var vault = new SessionVault(_tempVaultDir, dpapi)
+        {
+            MutationTimeout = TimeSpan.FromMilliseconds(80)
+        };
+        if (remove) await vault.SaveSessionAsync(accountId, "older-session"u8.ToArray());
+
+        var heldLease = await CrossProcessFileLease.AcquireAsync(vault.GetVaultPath(), CancellationToken.None);
+        try
+        {
+            Task oldOperation = remove
+                ? vault.RemoveSessionAsync(accountId)
+                : vault.SaveSessionAsync(accountId, "stale-session"u8.ToArray());
+            await Assert.ThrowsAsync<VaultMutationUncertainException>(
+                () => oldOperation.WaitAsync(TimeSpan.FromSeconds(2)));
+
+            // A different serialized owner publishes the newer state while the old
+            // operation is still waiting for this lease.
+            await File.WriteAllTextAsync(vault.GetVaultPath(), newerEnvelope);
+        }
+        finally
+        {
+            await heldLease.DisposeAsync();
+        }
+
+        var gate = PathLockRegistry.Get(vault.GetVaultPath());
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        gate.Release();
+        Assert.Equal(newerEnvelope, await File.ReadAllTextAsync(vault.GetVaultPath()));
+    }
+
+    [Fact]
+    public async Task RemovalWriterChangingExistingRecordRequiresQuarantine()
+    {
+        const string accountId = "acc_changed_during_removal";
+        var dpapi = new FakeDpapiProvider();
+        var newerVault = new SessionVault(Path.Combine(_tempVaultDir, "replacement"), dpapi);
+        await newerVault.SaveSessionAsync(accountId, "different-session"u8.ToArray());
+        string replacement = await File.ReadAllTextAsync(newerVault.GetVaultPath());
+
+        var vault = new SessionVault(_tempVaultDir, dpapi,
+            new ReplaceWithDifferentRecordThenFailWriter(replacement));
+        await vault.SaveSessionAsync(accountId, "original-session"u8.ToArray());
+
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => vault.RemoveSessionWithReceiptAsync(accountId));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => vault.SaveSessionAsync(accountId, "later-session"u8.ToArray()));
+        Assert.Equal(replacement, await File.ReadAllTextAsync(vault.GetVaultPath()));
+    }
+
+    [Fact]
+    public async Task TimedOutRemovalDoesNotStartLateCompensationWrite()
+    {
+        const string accountId = "acc_late_compensation";
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writer = new ReplacePauseThenThrowWriter(entered, release);
+        var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider(), writer)
+        {
+            MutationTimeout = TimeSpan.FromMilliseconds(80)
+        };
+        await vault.SaveSessionAsync(accountId, "original-session"u8.ToArray());
+
+        Task removal = vault.RemoveSessionWithReceiptAsync(accountId);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => removal.WaitAsync(TimeSpan.FromSeconds(2)));
+        release.TrySetResult();
+
+        var gate = PathLockRegistry.Get(vault.GetVaultPath());
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        gate.Release();
+        Assert.Equal(2, writer.WriteCount);
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => vault.SaveSessionAsync(accountId, "later-session"u8.ToArray()));
+    }
+
+    private sealed class ReplacePauseThenThrowWriter(TaskCompletionSource entered,
+        TaskCompletionSource release) : IDurableFileWriter
+    {
+        private readonly DurableFileWriter _inner = new();
+        public int WriteCount { get; private set; }
+
+        public async Task WriteAtomicAsync(string destinationPath, string content,
+            CancellationToken cancellationToken)
+        {
+            int write = ++WriteCount;
+            await _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+            if (write != 2) return;
+            entered.TrySetResult();
+            await release.Task; // deliberately ignores cancellation after replacement
+            throw new IOException("Synthetic late removal failure.");
+        }
+    }
+
+    private sealed class ReplaceWithDifferentRecordThenFailWriter(string replacement) : IDurableFileWriter
+    {
+        private readonly DurableFileWriter _inner = new();
+        private int _writes;
+        public async Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _writes) == 2)
+            {
+                await _inner.WriteAtomicAsync(destinationPath, replacement, cancellationToken);
+                throw new IOException("synthetic conflicting removal replacement");
+            }
+            await _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+        }
+    }
+
     private sealed class DelayedWriter(TaskCompletionSource entered, TaskCompletionSource release) : IDurableFileWriter
     {
         private readonly DurableFileWriter _inner = new();

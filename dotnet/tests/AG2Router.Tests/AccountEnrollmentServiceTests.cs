@@ -430,11 +430,14 @@ public class AccountEnrollmentServiceTests : IDisposable
         Task<EnrollmentResult> enrollmentTask = service.EnrollCurrentAccountAsync();
         await blockingStore.UpdateEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await _sessionVault.SaveSessionAsync(account.Id, newer);
+        string newerVaultEnvelope = File.ReadAllText(_sessionVault.GetVaultPath());
         blockingStore.ReleaseFailure();
 
         var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(() => enrollmentTask);
         Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(newer, await _sessionVault.GetSessionAsync(account.Id));
+        Assert.Equal(newerVaultEnvelope, File.ReadAllText(_sessionVault.GetVaultPath()));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => _sessionVault.GetSessionAsync(account.Id));
     }
 
     [Fact]
@@ -453,7 +456,9 @@ public class AccountEnrollmentServiceTests : IDisposable
         Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
         var pending = await _accountStore.GetAccountByEmailAsync("restore-failure@example.com");
         Assert.NotNull(pending);
-        Assert.True(await vault.HasSessionAsync(pending.Id));
+        Assert.Contains(pending.Id, File.ReadAllText(vault.GetVaultPath()));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => vault.HasSessionAsync(pending.Id));
     }
 
     [Fact]
@@ -485,7 +490,8 @@ public class AccountEnrollmentServiceTests : IDisposable
         Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
         var pending = await _accountStore.GetAccountByEmailAsync("remove-failure@example.com");
         Assert.NotNull(pending);
-        Assert.False(await _sessionVault.HasSessionAsync(pending.Id));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => _sessionVault.HasSessionAsync(pending.Id));
     }
 
     [Fact]
@@ -505,7 +511,9 @@ public class AccountEnrollmentServiceTests : IDisposable
         var committed = await store.GetAccountByEmailAsync(email);
         Assert.NotNull(committed);
         Assert.True(committed.HasVaultedSession);
-        Assert.True(await _sessionVault.HasSessionAsync(committed.Id));
+        Assert.Contains(committed.Id, File.ReadAllText(_sessionVault.GetVaultPath()));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => _sessionVault.HasSessionAsync(committed.Id));
     }
 
     [Fact]
@@ -742,7 +750,8 @@ public class AccountEnrollmentServiceTests : IDisposable
         Assert.NotNull(preserved);
         Assert.Equal("concurrent-crud", preserved.Notes);
         Assert.False(preserved.HasVaultedSession);
-        Assert.False(await _sessionVault.HasSessionAsync(pending.Id));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => _sessionVault.HasSessionAsync(pending.Id));
     }
 
     private sealed class ThrowingDpapiProvider : IDpapiProvider
@@ -1041,7 +1050,30 @@ public sealed class AccountRemovalServiceTests : IDisposable
         var error = await Assert.ThrowsAsync<InvalidOperationException>(
             () => new AccountRemovalService(store, vault).RemoveAsync(account.Id));
         Assert.Contains("manual", error.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal([1, 2, 3], await vault.GetSessionAsync(account.Id));
+        Assert.Contains(account.Id, File.ReadAllText(vault.GetVaultPath()));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => vault.GetSessionAsync(account.Id));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new AccountRemovalService(store, vault).RemoveAsync(account.Id));
+    }
+
+    [Fact]
+    public async Task UnprovedVaultRemovalQuarantinesLaterLifecycleAdmission()
+    {
+        var store = new InMemoryAccountStore();
+        var account = await store.AddAccountAsync(new CreateAccountInput("uncertain-removal@example.com"));
+        var vault = new SessionVault(Path.Combine(_directory, "uncertain-removal-vault"),
+            new FakeDpapiProvider(), new ReplaceThenFailAndRejectRestoreWriter());
+        await vault.SaveSessionAsync(account.Id, [1, 2, 3]);
+        var service = new AccountRemovalService(store, vault);
+
+        var failure = await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => service.RemoveAsync(account.Id));
+        Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.NotNull(await store.GetAccountAsync(account.Id));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.RemoveAsync(account.Id));
+        await Assert.ThrowsAsync<VaultMutationUncertainException>(
+            () => vault.SaveSessionAsync(account.Id, [4, 5, 6]));
     }
 
     [Fact]
@@ -1178,6 +1210,19 @@ public sealed class AccountRemovalServiceTests : IDisposable
             if (Interlocked.Increment(ref _writes) == 2)
                 throw new IOException("synthetic metadata removal failure");
             return _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+        }
+    }
+
+    private sealed class ReplaceThenFailAndRejectRestoreWriter : IDurableFileWriter
+    {
+        private readonly DurableFileWriter _inner = new();
+        private int _writes;
+        public async Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            int call = Interlocked.Increment(ref _writes);
+            if (call == 3) throw new IOException("synthetic restoration failure");
+            await _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+            if (call == 2) throw new IOException("synthetic post-replacement removal failure");
         }
     }
 
