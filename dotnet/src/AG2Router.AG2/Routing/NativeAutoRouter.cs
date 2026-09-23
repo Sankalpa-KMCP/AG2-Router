@@ -442,12 +442,38 @@ public class NativeAutoRouter : INativeAutoRouter
                 // Cooldown timer elapsed: check telemetry health before returning to IDLE
                 var probeStatus = await _adapter.GetStatusAsync(cancellationToken).ConfigureAwait(false);
                 string cooldownResource = _sessionVault.GetVaultPath() + ".switch";
+                if (RecoveryQuarantineRegistry.Get(cooldownResource).IsMarked)
+                {
+                    lock (_stateLock) RequireManualRecovery("Account lifecycle is unresolved; manual recovery is required.");
+                    return new SelectionResult(false, "Account lifecycle is unresolved; manual recovery is required.",
+                        _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                }
                 var cooldownLock = PathLockRegistry.Get(cooldownResource);
-                await cooldownLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                using var cooldownDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                cooldownDeadline.CancelAfter(TimeSpan.FromSeconds(15));
+                try { await cooldownLock.WaitAsync(cooldownDeadline.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    lock (_stateLock) RequireManualRecovery("Account lifecycle ownership did not become available.");
+                    return new SelectionResult(false, "Account lifecycle ownership did not become available.",
+                        _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                }
                 try
                 {
+                    if (RecoveryQuarantineRegistry.Get(cooldownResource).IsMarked)
+                    {
+                        lock (_stateLock) RequireManualRecovery("Account lifecycle is unresolved; manual recovery is required.");
+                        return new SelectionResult(false, "Account lifecycle is unresolved; manual recovery is required.",
+                            _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                    }
                     await using var lease = await CrossProcessFileLease.AcquireAsync(cooldownResource, cancellationToken)
                         .ConfigureAwait(false);
+                    if (RecoveryQuarantineRegistry.Get(cooldownResource).IsMarked || _sessionVault.IsQuarantined)
+                    {
+                        lock (_stateLock) RequireManualRecovery("Account lifecycle is unresolved; manual recovery is required.");
+                        return new SelectionResult(false, "Account lifecycle is unresolved; manual recovery is required.",
+                            _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                    }
                     string? activeAfterProbe = await _accountStore.GetActiveAccountIdAsync(cancellationToken)
                         .ConfigureAwait(false);
                     lock (_stateLock)
@@ -545,12 +571,38 @@ public class NativeAutoRouter : INativeAutoRouter
             Dictionary<string, IReadOnlyList<ModelQuotaDto>> observedModelSnapshot;
             RouterConfigDto configSnapshot;
             string switchResource = _sessionVault.GetVaultPath() + ".switch";
+            if (RecoveryQuarantineRegistry.Get(switchResource).IsMarked)
+            {
+                lock (_stateLock) RequireManualRecovery("Account lifecycle is unresolved; manual recovery is required.");
+                return new SelectionResult(false, "Account lifecycle is unresolved; manual recovery is required.",
+                    activeAccountId, null, null, Array.Empty<CandidateEvaluation>());
+            }
             var switchLock = PathLockRegistry.Get(switchResource);
-            await switchLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            using var ownershipDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            ownershipDeadline.CancelAfter(TimeSpan.FromSeconds(15));
+            try { await switchLock.WaitAsync(ownershipDeadline.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                lock (_stateLock) RequireManualRecovery("Account lifecycle ownership did not become available.");
+                return new SelectionResult(false, "Account lifecycle ownership did not become available.",
+                    activeAccountId, null, null, Array.Empty<CandidateEvaluation>());
+            }
             try
             {
+                if (RecoveryQuarantineRegistry.Get(switchResource).IsMarked)
+                {
+                    lock (_stateLock) RequireManualRecovery("Account lifecycle is unresolved; manual recovery is required.");
+                    return new SelectionResult(false, "Account lifecycle is unresolved; manual recovery is required.",
+                        activeAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                }
                 await using var lease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken)
                     .ConfigureAwait(false);
+                if (RecoveryQuarantineRegistry.Get(switchResource).IsMarked || _sessionVault.IsQuarantined)
+                {
+                    lock (_stateLock) RequireManualRecovery("Account lifecycle is unresolved; manual recovery is required.");
+                    return new SelectionResult(false, "Account lifecycle is unresolved; manual recovery is required.",
+                        activeAccountId, null, null, Array.Empty<CandidateEvaluation>());
+                }
                 var activeAfterQuota = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
                 var activeMetadataAfterQuota = activeAfterQuota == null ? null :
                     await _accountStore.GetAccountAsync(activeAfterQuota, cancellationToken).ConfigureAwait(false);

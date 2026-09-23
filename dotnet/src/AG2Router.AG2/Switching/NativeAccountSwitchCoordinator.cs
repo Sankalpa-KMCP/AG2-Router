@@ -23,6 +23,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     private readonly TimeSpan _verificationTimeout;
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _rollbackTimeout;
+    private readonly TimeSpan _transactionTimeout;
+    private readonly RecoveryQuarantine _recoveryQuarantine;
     private readonly object _statusLock = new();
     private readonly CancellationTokenSource _shutdownCts = new();
     private volatile bool _isShuttingDown;
@@ -42,7 +44,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         TimeSpan? processTimeout = null,
         TimeSpan? verificationTimeout = null,
         TimeSpan? pollInterval = null,
-        TimeSpan? rollbackTimeout = null)
+        TimeSpan? rollbackTimeout = null,
+        TimeSpan? transactionTimeout = null)
     {
         _accountStore = accountStore ?? throw new ArgumentNullException(nameof(accountStore));
         _sessionVault = sessionVault ?? throw new ArgumentNullException(nameof(sessionVault));
@@ -55,12 +58,28 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(200);
         _rollbackTimeout = rollbackTimeout ?? (_processTimeout + _verificationTimeout + TimeSpan.FromSeconds(10));
         if (_rollbackTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(rollbackTimeout));
+        _transactionTimeout = transactionTimeout ??
+            (_processTimeout + _verificationTimeout + _rollbackTimeout + TimeSpan.FromSeconds(30));
+        if (_transactionTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(transactionTimeout));
+        _recoveryQuarantine = RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
     }
 
     public NativeSwitchStatus GetStatus()
     {
         lock (_statusLock)
         {
+            if (_recoveryQuarantine.IsMarked)
+            {
+                string now = DateTimeOffset.UtcNow.ToString("O");
+                var uncertain = _lastResult?.ManualRecoveryRequired == true
+                    ? _lastResult
+                    : new NativeSwitchResult(_activeTransactionId, false,
+                        SwitchResultCodes.SwitchFailedRollbackFailed, NativeSwitchStates.Failed,
+                        string.Empty, null, null, null,
+                        "Switch outcome is unresolved; manual recovery is required.",
+                        [], now, now, ManualRecoveryRequired: true);
+                return new NativeSwitchStatus(_activeTransactionId, NativeSwitchStates.Failed, uncertain);
+            }
             return new NativeSwitchStatus(_activeTransactionId, _currentState, _lastResult);
         }
     }
@@ -86,17 +105,63 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     public async Task<NativeSwitchResult> SwitchAsync(
         string targetAccountId,
         CancellationToken cancellationToken = default)
-        => await SwitchCoreAsync(targetAccountId, null, null, cancellationToken).ConfigureAwait(false);
+        => await ObserveSwitchAsync(targetAccountId, null, null, cancellationToken).ConfigureAwait(false);
 
     public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
         CancellationToken cancellationToken = default)
-        => SwitchCoreAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, cancellationToken);
+        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, cancellationToken);
+
+    private async Task<NativeSwitchResult> ObserveSwitchAsync(
+        string targetAccountId, string? expectedActiveAccountId, Func<bool>? planIsCurrent,
+        CancellationToken cancellationToken)
+    {
+        if (_recoveryQuarantine.IsMarked)
+            return RecoveryUncertain(targetAccountId);
+
+        // The inner task owns every switch gate/lease until it actually finishes.
+        // Timeout detaches only the caller, never the mutation or its serialization.
+        Task<NativeSwitchResult> operation = SwitchCoreAsync(
+            targetAccountId, expectedActiveAccountId, planIsCurrent, cancellationToken);
+        try
+        {
+            return await operation.WaitAsync(_transactionTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            if (operation.IsCompleted)
+                return await operation.ConfigureAwait(false);
+            _recoveryQuarantine.Mark();
+            var uncertain = RecoveryUncertain(targetAccountId);
+            lock (_statusLock)
+            {
+                _currentState = NativeSwitchStates.Failed;
+                _lastResult = uncertain;
+            }
+            _ = operation.ContinueWith(static completed => _ = completed.Exception,
+                CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+            return uncertain;
+        }
+    }
+
+    private NativeSwitchResult RecoveryUncertain(string? targetAccountId)
+    {
+        string now = DateTimeOffset.UtcNow.ToString("O");
+        string? activeTransactionId;
+        lock (_statusLock) activeTransactionId = _activeTransactionId;
+        return new NativeSwitchResult(activeTransactionId, false,
+            SwitchResultCodes.SwitchFailedRollbackFailed, NativeSwitchStates.Failed,
+            targetAccountId?.Trim() ?? string.Empty, null, null, null,
+            "Switch outcome is unresolved; manual recovery is required before another switch.",
+            [], now, now, ManualRecoveryRequired: true);
+    }
 
     private async Task<NativeSwitchResult> SwitchCoreAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool>? planIsCurrent,
         CancellationToken cancellationToken)
     {
+        if (_recoveryQuarantine.IsMarked)
+            return RecoveryUncertain(targetAccountId);
         string requestedId = targetAccountId?.Trim() ?? string.Empty;
         string now = DateTimeOffset.UtcNow.ToString("O");
         bool entered;
@@ -144,14 +209,24 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
             string switchResource = _sessionVault.GetVaultPath() + ".switch";
             var switchLock = PathLockRegistry.Get(switchResource);
-            await switchLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!await switchLock.WaitAsync(_transactionTimeout, cancellationToken).ConfigureAwait(false))
+            {
+                _recoveryQuarantine.Mark();
+                return RecoveryUncertain(requestedId);
+            }
 
             SetActive(transactionId, NativeSwitchStates.Preflight);
             try
             {
+            if (_recoveryQuarantine.IsMarked)
+                throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                    "Account lifecycle is unresolved; manual recovery is required.");
             switchLease = await CrossProcessFileLease
                 .AcquireAsync(switchResource, cancellationToken)
                 .ConfigureAwait(false);
+            if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
+                throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                    "Account lifecycle is unresolved; manual recovery is required.");
 
             if (planIsCurrent != null && !planIsCurrent())
                 throw new SwitchRejectedException(SwitchResultCodes.Cancelled, "Automatic switch plan became stale.");
@@ -301,6 +376,9 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken,
                     async token =>
                     {
+                        if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
+                            throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                                "Account lifecycle is unresolved at the process-stop boundary.");
                         string? authoritativeId = await _accountStore.GetActiveAccountIdAsync(token)
                             .ConfigureAwait(false);
                         var live = await _adapter.GetCurrentAccountAsync(token).ConfigureAwait(false);
@@ -308,6 +386,17 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                             !SourceIdentityMatches(sourceAccount, live))
                             throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
                                 "Live or active identity changed at the process-stop boundary.");
+                        var stopActivity = await _adapter.GetActivityStateAsync(token).ConfigureAwait(false);
+                        if (stopActivity.RunningTrajectories > 0 ||
+                            string.Equals(stopActivity.State, "BUSY", StringComparison.OrdinalIgnoreCase))
+                            throw new SwitchRejectedException(SwitchResultCodes.Ag2Busy,
+                                "Antigravity became busy at the process-stop boundary.");
+                        if (!string.Equals(stopActivity.State, "IDLE", StringComparison.OrdinalIgnoreCase))
+                            throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
+                                "Antigravity activity was not proven idle at the process-stop boundary.");
+                        if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
+                            throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                                "Account lifecycle became unresolved at the process-stop boundary.");
                     })
                     .ConfigureAwait(false);
             }
@@ -666,13 +755,16 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         lock (_statusLock)
         {
             _activeTransactionId = transactionId;
-            _currentState = state;
+            if (!_recoveryQuarantine.IsMarked) _currentState = state;
         }
     }
 
     private void SetState(string state)
     {
-        lock (_statusLock) { _currentState = state; }
+        lock (_statusLock)
+        {
+            if (!_recoveryQuarantine.IsMarked) _currentState = state;
+        }
     }
 
     private NativeSwitchResult Terminal(
@@ -695,6 +787,18 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             ManualRecoveryRequired: code == SwitchResultCodes.SwitchFailedRollbackFailed);
         lock (_statusLock)
         {
+            if (_recoveryQuarantine.IsMarked)
+            {
+                result = result with
+                {
+                    Success = false,
+                    Code = SwitchResultCodes.SwitchFailedRollbackFailed,
+                    State = NativeSwitchStates.Failed,
+                    ManualRecoveryRequired = true,
+                    Message = "Switch outcome remained quarantined after a deadline; manual recovery is required."
+                };
+                state = NativeSwitchStates.Failed;
+            }
             _currentState = state;
             _lastResult = result;
         }
