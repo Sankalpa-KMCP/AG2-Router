@@ -10,6 +10,34 @@ namespace AG2Router.Tests;
 public class LoopbackServerTests
 {
     [Fact]
+    public async Task StatusEndpointSerializesNonFiniteQuotaAsUnknownInsteadOf500()
+    {
+        var server = new LoopbackServer();
+        try
+        {
+            await server.StartAsync(0, statusProvider: () => new SystemStatusDto(
+                "ok", new Ag2StatusDto(true, "HEALTHY", null, "ok"),
+                new RouterStatusDto("IDLE", false, null, null, null, null, null, new RouterConfigDto()),
+                new TelemetryDto(null, new QuotaSnapshotDto("now",
+                    [new ModelQuotaDto("A", "a", double.NaN, null, false)], null, null,
+                    [new CanonicalModelQuotaDto("a", "A", "a", double.PositiveInfinity, null, false, ["Standard"])]),
+                    null, double.NegativeInfinity, null)));
+            using var client = new HttpClient();
+            using var response = await client.GetAsync($"{server.BoundUrl}/api/status");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var telemetry = json.RootElement.GetProperty("telemetry");
+            Assert.Equal(JsonValueKind.Null, telemetry.GetProperty("totalAvailableQuotaPercent").ValueKind);
+            var quota = telemetry.GetProperty("quota");
+            Assert.Equal(JsonValueKind.Null, quota.GetProperty("models")[0].GetProperty("remainingFraction").ValueKind);
+            Assert.Equal(JsonValueKind.Null, quota.GetProperty("canonicalModels")[0].GetProperty("remainingFraction").ValueKind);
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+    }
+    [Fact]
     public async Task LoopbackServer_StartsOnEphemeralPort_AndServesStaticAssets()
     {
         var server = new LoopbackServer();

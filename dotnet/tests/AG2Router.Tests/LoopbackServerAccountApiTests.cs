@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Vault;
 using AG2Router.App.Server;
@@ -95,6 +96,32 @@ public class LoopbackServerAccountApiTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task GetAccounts_ReportsVaultAvailabilityOnlyAfterSuccessfulDecryption()
+    {
+        await EnsureServerStartedAsync();
+        var account = await _accountStore.AddAccountAsync(new CreateAccountInput("vaulted@example.com"));
+        await _sessionVault.SaveSessionAsync(account.Id, "synthetic-session"u8.ToArray());
+        Assert.True(await ReadAvailabilityAsync(account.Id));
+
+        var path = _sessionVault.GetVaultPath();
+        var document = JsonNode.Parse(await File.ReadAllTextAsync(path))!;
+        document["records"]![account.Id]!["encryptedPayloadBase64"] = "AAAA";
+        await File.WriteAllTextAsync(path, document.ToJsonString());
+        Assert.True(await _sessionVault.HasSessionAsync(account.Id));
+        Assert.False(await ReadAvailabilityAsync(account.Id));
+    }
+
+    private async Task<bool> ReadAvailabilityAsync(string accountId)
+    {
+        using var response = await _client.GetAsync("/api/accounts");
+        response.EnsureSuccessStatusCode();
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return json.RootElement.GetProperty("accounts").EnumerateArray()
+            .Single(account => account.GetProperty("id").GetString() == accountId)
+            .GetProperty("hasVaultedSession").GetBoolean();
+    }
+
+    [Fact]
     public async Task PostAccount_WithValidInput_Returns201_AndCreatesAccount()
     {
         await EnsureServerStartedAsync();
@@ -157,7 +184,7 @@ public class LoopbackServerAccountApiTests : IAsyncDisposable
 
         _mockAdapter.CurrentAccount = new AccountIdentityDto("enrolled@example.com", "Enrolled User");
         byte[] validBlob = Encoding.UTF8.GetBytes("{\"token\":\"fake-token-12345\",\"auth_method\":\"oauth\"}");
-        _winCredStore.Seed("gemini:antigravity", "antigravity", validBlob);
+        _winCredStore.Seed("gemini:antigravity", "enrolled@example.com", validBlob);
 
         var payload = new
         {
@@ -449,5 +476,83 @@ public class LoopbackServerAccountApiTests : IAsyncDisposable
             await server.StopAsync();
             await server.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task DeleteAccount_WhenAccountIsActive_Returns409Conflict()
+    {
+        await EnsureServerStartedAsync();
+
+        var acc = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: "active_delete@example.com",
+            Priority: 1
+        ));
+        await _accountStore.SetActiveAccountIdAsync(acc.Id);
+
+        var response = await _client.DeleteAsync($"/api/accounts/{acc.Id}");
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        var json = await response.Content.ReadAsStringAsync();
+        Assert.Contains("Cannot delete currently active account", json);
+
+        // Verify account was NOT deleted
+        Assert.NotNull(await _accountStore.GetAccountAsync(acc.Id));
+    }
+
+    [Fact]
+    public async Task GetAccounts_DerivesHasVaultedSessionFromSessionVaultAuthoritatively()
+    {
+        await EnsureServerStartedAsync();
+
+        // Add account claiming HasVaultedSession = true in metadata, but nothing in vault
+        var acc = await _accountStore.AddAccountAsync(new CreateAccountInput(
+            Email: "unvaulted@example.com",
+            HasVaultedSession: true
+        ));
+
+        var response = await _client.GetAsync("/api/accounts");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var accountsArr = doc.RootElement.GetProperty("accounts");
+
+        JsonElement? found = null;
+        foreach (var item in accountsArr.EnumerateArray())
+        {
+            if (item.GetProperty("id").GetString() == acc.Id)
+            {
+                found = item;
+                break;
+            }
+        }
+
+        Assert.NotNull(found);
+        // Authoritative vault check overrides unverified metadata
+        Assert.False(found.Value.GetProperty("hasVaultedSession").GetBoolean());
+    }
+
+    [Fact]
+    public async Task LoopbackServer_RejectsCrossSiteFetchSite_AcrossApi()
+    {
+        await EnsureServerStartedAsync();
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, "/api/accounts");
+        req.Headers.Add("Sec-Fetch-Site", "cross-site");
+
+        using var res = await _client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.Forbidden, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task LoopbackServer_RejectsForeignOrigin_AcrossApi()
+    {
+        await EnsureServerStartedAsync();
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, "/api/accounts");
+        req.Headers.Add("Origin", "https://malicious.evil.com");
+
+        using var res = await _client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.Forbidden, res.StatusCode);
     }
 }

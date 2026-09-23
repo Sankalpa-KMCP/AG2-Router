@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text;
 using AG2Router.AG2.Accounts;
+using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Vault;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
@@ -63,10 +64,23 @@ public class AccountEnrollmentServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task EnrollCurrentAccount_WhenWinCredIdentityDoesNotMatchCurrentAccount_ThrowsAccountEnrollmentException()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("real@example.com", "Developer");
+        _winCredStore.Seed("gemini:antigravity", "foreign@example.com", Encoding.UTF8.GetBytes("{\"token\":\"fake\"}"));
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+
+        var ex = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
+            service.EnrollCurrentAccountAsync());
+
+        Assert.Contains("does not match authenticated Antigravity account", ex.Message);
+    }
+
+    [Fact]
     public async Task EnrollCurrentAccount_WhenBlobMalformed_ThrowsAccountEnrollmentException()
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("dev@example.com", "Developer");
-        _winCredStore.Seed("gemini:antigravity", "antigravity", Encoding.UTF8.GetBytes("not-valid-json"));
+        _winCredStore.Seed("gemini:antigravity", "dev@example.com", Encoding.UTF8.GetBytes("not-valid-json"));
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
 
         var ex = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
@@ -80,7 +94,7 @@ public class AccountEnrollmentServiceTests : IDisposable
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("dev@example.com", "Developer");
         byte[] validBlob = Encoding.UTF8.GetBytes("{\"token\":\"synthetic-token-12345\",\"auth_method\":\"oauth\"}");
-        _winCredStore.Seed("gemini:antigravity", "antigravity", validBlob);
+        _winCredStore.Seed("gemini:antigravity", "dev@example.com", validBlob);
 
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
 
@@ -116,7 +130,7 @@ public class AccountEnrollmentServiceTests : IDisposable
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("duplicate@example.com", "Original Name");
         byte[] blob1 = Encoding.UTF8.GetBytes("{\"token\":\"token-1\",\"auth_method\":\"oauth\"}");
-        _winCredStore.Seed("gemini:antigravity", "antigravity", blob1);
+        _winCredStore.Seed("gemini:antigravity", "duplicate@example.com", blob1);
 
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
 
@@ -127,7 +141,7 @@ public class AccountEnrollmentServiceTests : IDisposable
 
         // Second enrollment with updated options and new credential blob
         byte[] blob2 = Encoding.UTF8.GetBytes("{\"token\":\"token-2-refreshed\",\"auth_method\":\"oauth\"}");
-        _winCredStore.Seed("gemini:antigravity", "antigravity", blob2);
+        _winCredStore.Seed("gemini:antigravity", "duplicate@example.com", blob2);
 
         var secondResult = await service.EnrollCurrentAccountAsync(new EnrollmentOptions(
             Name: "Updated Name",
@@ -155,7 +169,7 @@ public class AccountEnrollmentServiceTests : IDisposable
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("alias-test@example.com", "Dev");
         byte[] blob = Encoding.UTF8.GetBytes("{\"token\":\"test\"}");
-        _winCredStore.Seed("gemini:antigravity", "antigravity", blob);
+        _winCredStore.Seed("gemini:antigravity", "alias-test@example.com", blob);
 
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
         var result = await service.EnrollCurrentAccountAsync(new EnrollmentOptions(Alias: "Primary Work"));
@@ -172,7 +186,7 @@ public class AccountEnrollmentServiceTests : IDisposable
     public async Task EnrollCurrentAccount_WhenVaultSaveFails_DoesNotExposeVaultedMetadata()
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("vault-failure@example.com", "Synthetic");
-        _winCredStore.Seed("gemini:antigravity", "synthetic", Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        _winCredStore.Seed("gemini:antigravity", "vault-failure@example.com", Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var failingVault = new SessionVault(_tempDir, new ThrowingDpapiProvider());
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, failingVault, _accountStore);
 
@@ -186,7 +200,7 @@ public class AccountEnrollmentServiceTests : IDisposable
     public async Task EnrollCurrentAccount_WhenFinalMetadataCommitFails_CompensatesAndRetrySucceeds()
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("metadata-failure@example.com", "Synthetic");
-        _winCredStore.Seed("gemini:antigravity", "synthetic", Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        _winCredStore.Seed("gemini:antigravity", "metadata-failure@example.com", Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var failingStore = new FailUpdateAccountStore(_accountStore);
         var failingService = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, failingStore);
 
@@ -206,7 +220,7 @@ public class AccountEnrollmentServiceTests : IDisposable
     public async Task EnrollCurrentAccount_ConcurrentDuplicateRequestsCreateOneAccount()
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("concurrent-enroll@example.com", "Synthetic");
-        _winCredStore.Seed("gemini:antigravity", "synthetic", Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        _winCredStore.Seed("gemini:antigravity", "concurrent-enroll@example.com", Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
 
         var results = await Task.WhenAll(
@@ -232,15 +246,21 @@ public class AccountEnrollmentServiceTests : IDisposable
         {
             CurrentAccount = new AccountIdentityDto("second-lane@example.com", "Second")
         };
-        _winCredStore.Seed(
+        var firstCredStore = new InMemoryWinCredStore();
+        firstCredStore.Seed(
             "gemini:antigravity",
-            "synthetic",
+            "first-lane@example.com",
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var secondCredStore = new InMemoryWinCredStore();
+        secondCredStore.Seed(
+            "gemini:antigravity",
+            "second-lane@example.com",
             Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
 
         var results = await Task.WhenAll(
-            new AccountEnrollmentService(firstAdapter, _winCredStore, vault, _accountStore)
+            new AccountEnrollmentService(firstAdapter, firstCredStore, vault, _accountStore)
                 .EnrollCurrentAccountAsync(),
-            new AccountEnrollmentService(secondAdapter, _winCredStore, vault, _accountStore)
+            new AccountEnrollmentService(secondAdapter, secondCredStore, vault, _accountStore)
                 .EnrollCurrentAccountAsync());
 
         Assert.Equal(2, results.Length);
@@ -258,7 +278,7 @@ public class AccountEnrollmentServiceTests : IDisposable
             HasVaultedSession: true));
         byte[] prior = Encoding.UTF8.GetBytes("{\"token\":\"prior-synthetic\"}");
         await _sessionVault.SaveSessionAsync(account.Id, prior);
-        _winCredStore.Seed("gemini:antigravity", "synthetic", Encoding.UTF8.GetBytes("{\"token\":\"replacement-synthetic\"}"));
+        _winCredStore.Seed("gemini:antigravity", "existing-failure@example.com", Encoding.UTF8.GetBytes("{\"token\":\"replacement-synthetic\"}"));
         var service = new AccountEnrollmentService(
             _mockAdapter,
             _winCredStore,
@@ -278,7 +298,7 @@ public class AccountEnrollmentServiceTests : IDisposable
         var newer = await _accountStore.AddAccountAsync(new CreateAccountInput(Email: "newer@example.com"));
         await _accountStore.SetActiveAccountIdAsync(previous.Id);
         _mockAdapter.CurrentAccount = new AccountIdentityDto("failing-enrollment@example.com", "Synthetic");
-        _winCredStore.Seed("gemini:antigravity", "synthetic", Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        _winCredStore.Seed("gemini:antigravity", "failing-enrollment@example.com", Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var blockingStore = new BlockingFailUpdateAccountStore(_accountStore);
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, blockingStore);
 
@@ -300,7 +320,7 @@ public class AccountEnrollmentServiceTests : IDisposable
         _mockAdapter.CurrentAccount = new AccountIdentityDto("committed-enrollment@example.com", "Synthetic");
         _winCredStore.Seed(
             "gemini:antigravity",
-            "synthetic",
+            "committed-enrollment@example.com",
             Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var service = new AccountEnrollmentService(
             _mockAdapter,
@@ -328,7 +348,7 @@ public class AccountEnrollmentServiceTests : IDisposable
         byte[] enrollment = Encoding.UTF8.GetBytes("{\"token\":\"enrollment-synthetic\"}");
         byte[] newer = Encoding.UTF8.GetBytes("{\"token\":\"newer-synthetic\"}");
         await _sessionVault.SaveSessionAsync(account.Id, original);
-        _winCredStore.Seed("gemini:antigravity", "synthetic", enrollment);
+        _winCredStore.Seed("gemini:antigravity", "vault-race@example.com", enrollment);
         var blockingStore = new BlockingFailUpdateAccountStore(_accountStore);
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, blockingStore);
 
@@ -347,7 +367,7 @@ public class AccountEnrollmentServiceTests : IDisposable
         _mockAdapter.CurrentAccount = new AccountIdentityDto("placeholder-race@example.com", "Synthetic");
         _winCredStore.Seed(
             "gemini:antigravity",
-            "synthetic",
+            "placeholder-race@example.com",
             Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var blockingStore = new BlockingFailUpdateAccountStore(_accountStore);
         var service = new AccountEnrollmentService(
@@ -529,5 +549,67 @@ public class AccountEnrollmentServiceTests : IDisposable
         public Task<AccountMetadata?> TryFinalizeSwitchAsync(
             string? expectedActiveId, string targetId, UpdateAccountInput updates,
             CancellationToken cancellationToken = default) => Task.FromResult<AccountMetadata?>(null);
+    }
+}
+
+public sealed class AccountRemovalServiceTests : IDisposable
+{
+    private readonly string _directory = Path.Combine(Path.GetTempPath(), $"ag2_remove_{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task RemovalRechecksActiveIdentityAfterAcquiringSwitchOwnership()
+    {
+        var store = new InMemoryAccountStore();
+        var account = await store.AddAccountAsync(new CreateAccountInput("target@example.com"));
+        var vault = new SessionVault(_directory, new FakeDpapiProvider());
+        await vault.SaveSessionAsync(account.Id, [1, 2, 3]);
+        var gate = PathLockRegistry.Get(vault.GetVaultPath() + ".switch");
+        await gate.WaitAsync();
+        try
+        {
+            var pending = new AccountRemovalService(store, vault).RemoveAsync(account.Id);
+            Assert.False(pending.IsCompleted);
+            await store.SetActiveAccountIdAsync(account.Id);
+            gate.Release();
+            await Assert.ThrowsAsync<AccountRemovalConflictException>(() => pending);
+        }
+        finally
+        {
+            if (gate.CurrentCount == 0) gate.Release();
+        }
+        Assert.NotNull(await store.GetAccountAsync(account.Id));
+        Assert.True(await vault.HasSessionAsync(account.Id));
+    }
+
+    [Fact]
+    public async Task MetadataWriteFailureRestoresRemovedVaultRecord()
+    {
+        Directory.CreateDirectory(_directory);
+        var writer = new FailSecondWrite();
+        var store = new LocalMetadataAccountStore(Path.Combine(_directory, "accounts.json"), writer);
+        var account = await store.AddAccountAsync(new CreateAccountInput("target@example.com"));
+        var vault = new SessionVault(Path.Combine(_directory, "vault"), new FakeDpapiProvider());
+        await vault.SaveSessionAsync(account.Id, [1, 2, 3]);
+
+        await Assert.ThrowsAsync<IOException>(() => new AccountRemovalService(store, vault).RemoveAsync(account.Id));
+        Assert.NotNull(await store.GetAccountAsync(account.Id));
+        Assert.Equal([1, 2, 3], await vault.GetSessionAsync(account.Id));
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_directory)) Directory.Delete(_directory, recursive: true);
+    }
+
+    private sealed class FailSecondWrite : IDurableFileWriter
+    {
+        private readonly DurableFileWriter _inner = new();
+        private int _writes;
+        public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _writes) == 2)
+                throw new IOException("synthetic metadata removal failure");
+            return _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+        }
     }
 }

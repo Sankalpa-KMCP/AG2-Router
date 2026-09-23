@@ -60,9 +60,36 @@ public sealed class LoopbackRouterApiTests : IAsyncDisposable
 
         string json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
+        Assert.True(doc.RootElement.GetProperty("success").GetBoolean());
         Assert.False(doc.RootElement.GetProperty("config").GetProperty("autoSwitchEnabled").GetBoolean());
         Assert.Equal(20, doc.RootElement.GetProperty("config").GetProperty("lowQuotaThresholdPercent").GetInt32());
         Assert.Equal(35, doc.RootElement.GetProperty("config").GetProperty("minimumCandidateQuotaPercent").GetInt32());
+    }
+
+    [Fact]
+    public async Task PostConfig_WhenPollingIntervalChanges_InvokesCallback()
+    {
+        TimeSpan observedInterval = TimeSpan.Zero;
+        var server = new LoopbackServer();
+        try
+        {
+            await server.StartAsync(
+                requestedPort: 0,
+                autoRouter: _autoRouter,
+                onPollingIntervalChanged: interval => observedInterval = interval
+            );
+            using var client = new HttpClient { BaseAddress = new Uri(server.BoundUrl) };
+
+            var update = new RouterConfigDto(PollingIntervalMs: 8000);
+            using var response = await client.PostAsJsonAsync("/api/config", update);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(TimeSpan.FromMilliseconds(8000), observedInterval);
+        }
+        finally
+        {
+            await server.StopAsync();
+            await server.DisposeAsync();
+        }
     }
 
     [Fact]
@@ -167,6 +194,10 @@ public sealed class LoopbackRouterApiTests : IAsyncDisposable
         {
             ResetManualRecoveryCallCount++;
         }
+
+        public ManualSwitchToken NotifyManualSwitchStarted(string targetAccountId) => new(1);
+        public void NotifyManualSwitchCompleted(ManualSwitchToken token, NativeSwitchResult result) { }
+        public void NotifyManualSwitchCompleted(NativeSwitchResult result) { }
 
         public void Start() { }
         public Task StopAsync() => Task.CompletedTask;

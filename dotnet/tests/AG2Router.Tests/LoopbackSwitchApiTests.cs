@@ -27,6 +27,15 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
         _client.BaseAddress = new Uri(_server.BoundUrl);
     }
 
+    private async Task<string> GetIntentTokenAsync()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/switching/intent");
+        request.Headers.Add("X-AG2-Intent-Request", "1");
+        using var response = await _client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return response.Headers.GetValues("X-AG2-Switch-Token").Single();
+    }
+
     [Theory]
     [InlineData(SwitchResultCodes.Success, HttpStatusCode.OK)]
     [InlineData(SwitchResultCodes.TargetNotFound, HttpStatusCode.NotFound)]
@@ -44,8 +53,7 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
         await StartAsync();
         _coordinator.NextCode = code;
 
-        using var status = await _client.GetAsync("/api/switching/status");
-        string token = status.Headers.GetValues("X-AG2-Switch-Token").Single();
+        string token = await GetIntentTokenAsync();
         using var request = new HttpRequestMessage(HttpMethod.Post, "/api/accounts/acc_target/switch")
         {
             Content = JsonContent.Create(new ExplicitSwitchRequest(true))
@@ -69,8 +77,7 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
             "/api/accounts/acc_target/switch", new ExplicitSwitchRequest(true));
         Assert.Equal(HttpStatusCode.Forbidden, missingToken.StatusCode);
 
-        using var status = await _client.GetAsync("/api/switching/status");
-        string token = status.Headers.GetValues("X-AG2-Switch-Token").Single();
+        string token = await GetIntentTokenAsync();
         using var request = new HttpRequestMessage(HttpMethod.Post, "/api/accounts/acc_target/switch")
         {
             Content = JsonContent.Create(new ExplicitSwitchRequest(false))
@@ -90,8 +97,7 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
         using var reboundResponse = await _client.SendAsync(rebound);
         Assert.Equal(HttpStatusCode.Forbidden, reboundResponse.StatusCode);
 
-        using var status = await _client.GetAsync("/api/switching/status");
-        string token = status.Headers.GetValues("X-AG2-Switch-Token").Single();
+        string token = await GetIntentTokenAsync();
         using var foreign = new HttpRequestMessage(HttpMethod.Post, "/api/accounts/acc_target/switch")
         {
             Content = JsonContent.Create(new ExplicitSwitchRequest(true))
@@ -112,6 +118,22 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
         string json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
         Assert.Equal("IDLE", doc.RootElement.GetProperty("status").GetProperty("currentState").GetString());
+        Assert.False(response.Headers.Contains("X-AG2-Switch-Token"));
+        Assert.DoesNotContain("switchToken", json, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("Origin", "http://attacker.example")]
+    [InlineData("Sec-Fetch-Site", "cross-site")]
+    public async Task ForeignBrowserCannotObtainSwitchIntent(string header, string value)
+    {
+        await StartAsync();
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/switching/intent");
+        request.Headers.Add("X-AG2-Intent-Request", "1");
+        request.Headers.Add(header, value);
+        using var response = await _client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.False(response.Headers.Contains("X-AG2-Switch-Token"));
     }
 
     private sealed class FakeSwitchCoordinator : INativeAccountSwitchCoordinator
@@ -137,5 +159,8 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
                 DateTimeOffset.UtcNow.ToString("O"),
                 ManualRecoveryRequired: NextCode == SwitchResultCodes.SwitchFailedRollbackFailed));
         }
+
+        public Task CoordinateShutdownAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
     }
 }

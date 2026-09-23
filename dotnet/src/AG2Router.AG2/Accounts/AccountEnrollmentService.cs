@@ -59,7 +59,7 @@ public class AccountEnrollmentService
             }
 
             // 2. Read live session blob from Windows Credential Manager
-            var cred = await _wincredReader.ReadCredentialAsync(VaultConstants.DefaultAg2WinCredTarget, cancellationToken).ConfigureAwait(false);
+            WinCredEntry? cred = await _wincredReader.ReadCredentialAsync(VaultConstants.DefaultAg2WinCredTarget, cancellationToken).ConfigureAwait(false);
             if (cred == null || cred.Blob == null || cred.Blob.Length == 0)
             {
                 throw new AccountEnrollmentException(
@@ -67,153 +67,214 @@ public class AccountEnrollmentService
                 );
             }
 
-            // 3. Inspect session blob structure safely
             try
             {
-                using var doc = JsonDocument.Parse(cred.Blob);
-                var root = doc.RootElement;
-                bool hasToken = root.TryGetProperty("token", out _);
-                bool hasAuthMethod = root.TryGetProperty("auth_method", out _);
-
-                if (!hasToken && !hasAuthMethod)
+                if (!string.Equals(cred.UserName?.Trim(), currentAccount.Email.Trim(), StringComparison.OrdinalIgnoreCase))
                 {
                     throw new AccountEnrollmentException(
-                        "Windows Credential blob does not contain valid Antigravity authentication data."
+                        $"Windows Credential username '{cred.UserName}' does not match authenticated Antigravity account '{currentAccount.Email}'."
                     );
                 }
-            }
-            catch (AccountEnrollmentException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                throw new AccountEnrollmentException($"Failed to parse Windows Credential JSON payload: {ex.Message}", ex);
-            }
 
-            // Serialize same-identity enrollment across service instances and requests.
-            string email = currentAccount.Email.Trim();
-            var enrollmentLock = EnrollmentLocks.GetOrAdd(email, static _ => new SemaphoreSlim(1, 1));
-            await enrollmentLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                string enrollmentResource = GetEnrollmentResourcePath();
-                var resourceLock = PathLockRegistry.Get(enrollmentResource);
-                await resourceLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                // 3. Inspect session blob structure safely
                 try
                 {
-                    await using var enrollmentLease = await CrossProcessFileLease
-                        .AcquireAsync(enrollmentResource, cancellationToken)
-                        .ConfigureAwait(false);
+                    using var doc = JsonDocument.Parse(cred.Blob);
+                    var root = doc.RootElement;
+                    bool hasToken = root.TryGetProperty("token", out _);
+                    bool hasAuthMethod = root.TryGetProperty("auth_method", out _);
 
-                // Recheck inside the identity lock so duplicate concurrent enrollment is idempotent.
-                var existing = await _accountStore.GetAccountByEmailAsync(email, cancellationToken).ConfigureAwait(false);
-                string? previousActiveId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
-                bool isNew = existing == null;
-                AccountMetadata pending = existing ?? await _accountStore.AddAccountAsync(new CreateAccountInput(
-                    Email: email,
-                    Name: options?.Name ?? currentAccount.Name,
-                    Priority: options?.Priority,
-                    IsReserve: options?.IsReserve,
-                    HasVaultedSession: false,
-                    Notes: options?.Notes,
-                    Alias: options?.Alias
-                ), cancellationToken).ConfigureAwait(false);
+                    if (!hasToken && !hasAuthMethod)
+                    {
+                        throw new AccountEnrollmentException(
+                            "Windows Credential blob does not contain valid Antigravity authentication data."
+                        );
+                    }
+                }
+                catch (AccountEnrollmentException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    throw new AccountEnrollmentException($"Failed to parse Windows Credential JSON payload: {ex.Message}", ex);
+                }
 
-                VaultMutationReceipt? vaultReceipt = null;
-                bool vaultCommitted = false;
-                AccountMetadata account;
+                // Serialize same-identity enrollment across service instances and requests.
+                string email = currentAccount.Email.Trim();
+                var enrollmentLock = EnrollmentLocks.GetOrAdd(email, static _ => new SemaphoreSlim(1, 1));
+                await enrollmentLock.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    // The vault commits first. Metadata cannot truthfully advertise a session before this succeeds.
-                    vaultReceipt = await _sessionVault.SaveSessionWithReceiptAsync(
-                        pending.Id,
-                        cred.Blob,
-                        cred.Target,
-                        cancellationToken).ConfigureAwait(false);
-                    vaultCommitted = true;
+                    string enrollmentResource = GetEnrollmentResourcePath();
+                    var resourceLock = PathLockRegistry.Get(enrollmentResource);
+                    await resourceLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await using var enrollmentLease = await CrossProcessFileLease
+                            .AcquireAsync(enrollmentResource, cancellationToken)
+                            .ConfigureAwait(false);
 
-                    string now = DateTimeOffset.UtcNow.ToString("O");
-                    var committed = await _accountStore.UpdateAccountAsync(pending.Id, new UpdateAccountInput(
-                        Name: options?.Name,
+                    // Recheck inside the identity lock so duplicate concurrent enrollment is idempotent.
+                    var existing = await _accountStore.GetAccountByEmailAsync(email, cancellationToken).ConfigureAwait(false);
+                    string? previousActiveId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+                    bool isNew = existing == null;
+                    AccountMetadata pending = existing ?? await _accountStore.AddAccountAsync(new CreateAccountInput(
+                        Email: email,
+                        Name: options?.Name ?? currentAccount.Name,
                         Priority: options?.Priority,
                         IsReserve: options?.IsReserve,
-                        ValidationStatus: AccountValidationStatus.Valid,
-                        HasVaultedSession: true,
-                        LastActiveAt: now,
+                        HasVaultedSession: false,
                         Notes: options?.Notes,
                         Alias: options?.Alias
                     ), cancellationToken).ConfigureAwait(false);
 
-                    if (committed == null)
+                    VaultMutationReceipt? vaultReceipt = null;
+                    bool vaultCommitted = false;
+                    AccountMetadata account;
+                    try
                     {
-                        throw new AccountEnrollmentException($"Failed to update account record for '{email}'.");
-                    }
-                    account = committed;
-                }
-                catch
-                {
-                    // Compensation is best effort, but its ordering preserves the core invariant:
-                    // metadata never became true before the vault commit. A failed cleanup may leave
-                    // only a truthful false/orphan state that a retry can reconcile.
-                    if (vaultCommitted)
-                    {
-                        try
-                        {
-                            await _sessionVault.RestoreIfCurrentAsync(
-                                vaultReceipt!,
-                                CancellationToken.None).ConfigureAwait(false);
-                        }
-                        catch { }
-                    }
+                        // 4. Save session to vault under lock
+                        vaultReceipt = await _sessionVault.SaveSessionWithReceiptAsync(
+                            pending.Id,
+                            cred.Blob,
+                            VaultConstants.DefaultAg2WinCredTarget,
+                            cancellationToken).ConfigureAwait(false);
+                        vaultCommitted = true;
 
-                    if (isNew)
+                        // 5. Update account metadata to record vaulted status
+                        string now = DateTimeOffset.UtcNow.ToString("O");
+                        var committed = await _accountStore.UpdateAccountAsync(
+                            pending.Id,
+                            new UpdateAccountInput(
+                                Name: options?.Name ?? pending.Name,
+                                Priority: options?.Priority ?? pending.Priority,
+                                IsReserve: options?.IsReserve ?? pending.IsReserve,
+                                ValidationStatus: AccountValidationStatus.Valid,
+                                HasVaultedSession: true,
+                                LastActiveAt: now,
+                                Notes: options?.Notes ?? pending.Notes,
+                                Alias: options?.Alias ?? pending.Alias
+                            ),
+                            CancellationToken.None).ConfigureAwait(false);
+                        if (committed == null)
+                        {
+                            throw new AccountEnrollmentException($"Failed to update account record for '{email}'.");
+                        }
+                        account = committed;
+                    }
+                    catch
                     {
+                        bool originallyVaulted = existing?.HasVaultedSession == true;
+                        AccountMetadata? currentMetadata = null;
                         try
                         {
-                            await _accountStore.RemoveAccountIfUnchangedAsync(pending, CancellationToken.None)
+                            currentMetadata = await _accountStore.GetAccountAsync(pending.Id, CancellationToken.None)
                                 .ConfigureAwait(false);
                         }
                         catch { }
+
+                        bool metadataHasVaultedSession = currentMetadata != null && currentMetadata.HasVaultedSession;
+
+                        if (!metadataHasVaultedSession || originallyVaulted)
+                        {
+                            if (vaultCommitted)
+                            {
+                                try
+                                {
+                                    await _sessionVault.RestoreIfCurrentAsync(
+                                        vaultReceipt!,
+                                        CancellationToken.None).ConfigureAwait(false);
+                                }
+                                catch { }
+                            }
+
+                            if (isNew && !metadataHasVaultedSession)
+                            {
+                                try
+                                {
+                                    await _accountStore.RemoveAccountIfUnchangedAsync(pending, CancellationToken.None)
+                                        .ConfigureAwait(false);
+                                }
+                                catch { }
+                            }
+                        }
+
+                        throw;
                     }
 
-                    throw;
-                }
+                    // CRITICAL INVARIANT (V021-005): Obtain fresh authoritative identity and credential evidence
+                    // immediately before asserting ACTIVE identity in metadata.
+                    bool liveIdentityStillCurrent = false;
+                    try
+                    {
+                        var freshAccount = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
+                        var freshCred = await _wincredReader.ReadCredentialAsync(VaultConstants.DefaultAg2WinCredTarget, cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            if (freshAccount != null &&
+                                string.Equals(freshAccount.Email?.Trim(), email, StringComparison.OrdinalIgnoreCase) &&
+                                freshCred != null &&
+                                string.Equals(freshCred.UserName?.Trim(), email, StringComparison.OrdinalIgnoreCase))
+                            {
+                                liveIdentityStillCurrent = true;
+                            }
+                        }
+                        finally
+                        {
+                            if (freshCred?.Blob is { Length: > 0 })
+                            {
+                                System.Security.Cryptography.CryptographicOperations.ZeroMemory(freshCred.Blob);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        liveIdentityStillCurrent = false;
+                    }
 
-                // The vault and its truth-bearing metadata are now committed. Active selection is
-                // ancillary and uses a one-way CAS: a concurrent user choice is preserved, and no
-                // rollback can overwrite a later selection through a value-ABA cycle.
-                bool activeUpdated;
-                try
-                {
-                    activeUpdated = await _accountStore.CompareExchangeActiveAccountIdAsync(
-                        previousActiveId,
-                        pending.Id,
-                        CancellationToken.None).ConfigureAwait(false);
-                }
-                catch
-                {
-                    activeUpdated = false;
-                }
+                    bool activeUpdated = false;
+                    if (liveIdentityStillCurrent)
+                    {
+                        try
+                        {
+                            activeUpdated = await _accountStore.CompareExchangeActiveAccountIdAsync(
+                                previousActiveId,
+                                pending.Id,
+                                CancellationToken.None).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            activeUpdated = false;
+                        }
+                    }
 
-                string message = isNew
-                    ? $"Successfully enrolled new account '{email}' into encrypted vault."
-                    : $"Successfully updated session vault for existing account '{email}'.";
-                if (!activeUpdated)
-                {
-                    message += " The current active-account selection was preserved.";
-                }
+                    string message = isNew
+                        ? $"Successfully enrolled new account '{email}' into encrypted vault."
+                        : $"Successfully updated session vault for existing account '{email}'.";
+                    if (!activeUpdated)
+                    {
+                        message += " The current active-account selection was preserved.";
+                    }
 
-                return new EnrollmentResult(true, account, isNew, message);
+                    return new EnrollmentResult(true, account, isNew, message);
+                    }
+                    finally
+                    {
+                        resourceLock.Release();
+                    }
                 }
                 finally
                 {
-                    resourceLock.Release();
+                    enrollmentLock.Release();
                 }
             }
             finally
             {
-                enrollmentLock.Release();
+                if (cred?.Blob is { Length: > 0 })
+                {
+                    System.Security.Cryptography.CryptographicOperations.ZeroMemory(cred.Blob);
+                }
             }
         }
         catch (AccountEnrollmentException)
@@ -228,4 +289,68 @@ public class AccountEnrollmentService
     }
 
     private string GetEnrollmentResourcePath() => $"{_sessionVault.GetVaultPath()}.enrollment";
+}
+
+public sealed record AccountRemovalResult(bool VaultRecordDeleted);
+
+public sealed class AccountRemovalConflictException(string message) : Exception(message);
+
+/// <summary>Serializes deletion with enrollment and switching and compensates cross-store failure.</summary>
+public sealed class AccountRemovalService(IAccountStore accountStore, SessionVault sessionVault)
+{
+    public async Task<AccountRemovalResult> RemoveAsync(string accountId, CancellationToken cancellationToken = default)
+    {
+        string switchResource = sessionVault.GetVaultPath() + ".switch";
+        var switchLock = PathLockRegistry.Get(switchResource);
+        await switchLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var lease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken)
+                .ConfigureAwait(false);
+
+            var expected = await accountStore.GetAccountAsync(accountId, cancellationToken).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException("Account not found.");
+            var activeId = await accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+            if (string.Equals(activeId, accountId, StringComparison.Ordinal))
+                throw new AccountRemovalConflictException("Cannot delete currently active account. Switch to another account first.");
+
+            var receipt = await sessionVault.RemoveSessionWithReceiptAsync(accountId, cancellationToken)
+                .ConfigureAwait(false);
+            try
+            {
+                using var completion = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                if (!await accountStore.RemoveAccountIfUnchangedAsync(expected, completion.Token).ConfigureAwait(false))
+                    throw new AccountRemovalConflictException("Account metadata changed during removal.");
+                return new AccountRemovalResult(receipt != null);
+            }
+            catch
+            {
+                if (receipt != null)
+                {
+                    // INVARIANT (V021-010): Only restore the removed session if metadata still contains the account.
+                    // If the metadata writer successfully replaced accounts.json with the account removed,
+                    // restoring the vault would create an orphan session without an account.
+                    AccountMetadata? currentMetadata = null;
+                    try
+                    {
+                        currentMetadata = await accountStore.GetAccountAsync(accountId, CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch { }
+
+                    if (currentMetadata != null)
+                    {
+                        using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                        if (!await sessionVault.RestoreRemovedIfAbsentAsync(receipt, recovery.Token).ConfigureAwait(false))
+                            throw new InvalidOperationException("Account removal compensation could not restore the vaulted session; manual recovery is required.");
+                    }
+                }
+                throw;
+            }
+        }
+        finally
+        {
+            switchLock.Release();
+        }
+    }
 }

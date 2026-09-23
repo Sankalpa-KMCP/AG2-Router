@@ -317,6 +317,29 @@ public class SessionVaultTests : IDisposable
         Assert.Equal("newer"u8.ToArray(), await vault.GetSessionAsync("acc_receipt"));
     }
 
+    [Fact]
+    public async Task RemovalWriterFailureAfterReplacementRestoresPreimage()
+    {
+        var writer = new ReplaceThenFailOnceWriter();
+        var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider(), writer);
+        await vault.SaveSessionAsync("acc_uncertain", "synthetic-session"u8.ToArray());
+
+        await Assert.ThrowsAsync<VaultException>(() => vault.RemoveSessionWithReceiptAsync("acc_uncertain"));
+        Assert.Equal("synthetic-session"u8.ToArray(), await vault.GetSessionAsync("acc_uncertain"));
+    }
+
+    private sealed class ReplaceThenFailOnceWriter : IDurableFileWriter
+    {
+        private readonly DurableFileWriter _inner = new();
+        private int _writes;
+        public async Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken)
+        {
+            await _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+            if (Interlocked.Increment(ref _writes) == 2)
+                throw new IOException("Injected post-replacement failure.");
+        }
+    }
+
     private sealed class ThrowingFileWriter : IDurableFileWriter
     {
         public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken) =>

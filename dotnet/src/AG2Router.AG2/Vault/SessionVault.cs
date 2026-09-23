@@ -12,6 +12,8 @@ internal sealed record VaultMutationReceipt(
     VaultAccountRecord CommittedRecord,
     VaultAccountRecord? PreviousRecord);
 
+internal sealed record VaultRemovalReceipt(string AccountId, VaultAccountRecord RemovedRecord);
+
 /// <summary>
 /// Encrypted Multi-Account Session Vault.
 /// Implements persistent, encrypted storage for Antigravity 2 account sessions.
@@ -339,6 +341,65 @@ public class SessionVault : ISessionVault
                 return false;
             }
 
+            await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
+    }
+
+    internal async Task<VaultRemovalReceipt?> RemoveSessionWithReceiptAsync(
+        string accountId, CancellationToken cancellationToken = default)
+    {
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var lease = await CrossProcessFileLease.AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
+            var envelope = ReadEnvelope();
+            if (!envelope.Records.Remove(accountId, out var removed)) return null;
+            try
+            {
+                await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A failed writer may have replaced the file before surfacing an error.
+                // Restore the preimage under the same vault ownership before reporting failure.
+                using var recovery = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                var current = ReadEnvelope();
+                if (!current.Records.ContainsKey(accountId))
+                {
+                    current.Records.Add(accountId, removed);
+                    try { await WriteEnvelopeAsync(current, recovery.Token).ConfigureAwait(false); }
+                    catch (Exception ex)
+                    {
+                        throw new VaultException($"Vault removal outcome is uncertain; manual recovery is required: {ex.Message}");
+                    }
+                }
+                throw;
+            }
+            return new VaultRemovalReceipt(accountId, removed);
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
+    }
+
+    internal async Task<bool> RestoreRemovedIfAbsentAsync(
+        VaultRemovalReceipt receipt, CancellationToken cancellationToken = default)
+    {
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var lease = await CrossProcessFileLease.AcquireAsync(_vaultFilePath, cancellationToken)
+                .ConfigureAwait(false);
+            var envelope = ReadEnvelope();
+            if (envelope.Records.ContainsKey(receipt.AccountId)) return false;
+            envelope.Records.Add(receipt.AccountId, receipt.RemovedRecord);
             await WriteEnvelopeAsync(envelope, cancellationToken).ConfigureAwait(false);
             return true;
         }
