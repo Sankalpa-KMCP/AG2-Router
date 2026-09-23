@@ -504,6 +504,7 @@ describe('AG2 Normalizer', () => {
       assert.equal(normalizeActivitySnapshot({ trajectorySummaries: {
         'traj-1': { status: 'CASCADE_RUN_STATUS_UNRECOGNIZED' }
       } }).state, 'UNKNOWN');
+      assert.equal(normalizeActivitySnapshot({ trajectorySummaries: [] } as never).state, 'UNKNOWN');
     });
   });
 });

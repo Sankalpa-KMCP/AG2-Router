@@ -10,6 +10,7 @@ import { SessionVault } from '../src/vault/session-vault.js';
 import { IWinCredReader, IWinCredWriter, WinCredEntry } from '../src/ag2/wincred.js';
 import { IProcessController, AG2ProcessLaunchSpec } from '../src/ag2/process-control.js';
 import { IAG2Adapter, AG2DiscoveryResult, AG2AccountIdentity, ActivitySnapshot, QuotaSnapshot, SwitchRequest, SwitchResult } from '../src/ag2/types.js';
+import { normalizeActivitySnapshot } from '../src/ag2/normalizer.js';
 
 class MockAccountStore implements IAccountStore {
   public accounts: Map<string, AccountMetadata> = new Map();
@@ -306,6 +307,26 @@ test('SwitchTransactionCoordinator - Preflight checks fail before any mutation',
   assert.strictEqual(res4.state, 'FAILED');
   assert.match(res4.error || '', /Antigravity 2 is busy/);
   assert.strictEqual(winCredWriter.writtenEntries.length, 0);
+});
+
+test('malformed trajectory array cannot authorize a reference switch', async () => {
+  const { deps, accountStore, sessionVault, ag2Adapter, winCredWriter, processController } = createTestHarness();
+  accountStore.accounts.set('target', {
+    id: 'target', email: 'target@example.com', priority: 1, isReserve: false,
+    validationStatus: 'VALID', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    lastActiveAt: null
+  });
+  accountStore.activeAccountId = 'source';
+  sessionVault.sessions.set('target', Buffer.from('synthetic-target'));
+  ag2Adapter.activity = normalizeActivitySnapshot({ trajectorySummaries: [] } as never);
+
+  const result = await new SwitchTransactionCoordinator(deps, { executionAuthorized: true })
+    .executeSwitch('target');
+
+  assert.equal(result.success, false);
+  assert.equal(ag2Adapter.activity.state, 'UNKNOWN');
+  assert.equal(processController.terminatedPids.length, 0);
+  assert.equal(winCredWriter.writtenEntries.length, 0);
 });
 
 test('SwitchTransactionCoordinator - Happy path executes all stages and completes successfully', async () => {

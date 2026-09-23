@@ -166,7 +166,8 @@ export function normalizeQuotaSnapshot(raw?: RawUserStatusResponse | null): Quot
  * - only an explicit empty collection or known inactive statuses => IDLE
  */
 export function normalizeActivitySnapshot(raw?: RawTrajectoriesResponse | null): ActivitySnapshot {
-  if (!raw || !raw.trajectorySummaries || typeof raw.trajectorySummaries !== 'object') {
+  if (!raw || !raw.trajectorySummaries || typeof raw.trajectorySummaries !== 'object' ||
+      Array.isArray(raw.trajectorySummaries)) {
     return {
       state: 'UNKNOWN',
       totalTrajectories: 0,

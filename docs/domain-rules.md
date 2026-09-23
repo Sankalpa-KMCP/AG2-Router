@@ -27,7 +27,7 @@ CURRENT IMPLEMENTATION:
 - AG2TelemetryNormalizer clamps observed numeric fractions and preserves prompt and Flow credit records separately.
 - AG2TelemetryNormalizer and the TypeScript reference normalizer retain missing and non-finite model fractions as unknown. CanonicalizeModelQuotas preserves each source row because model/tier, presentation labels, and even equal reset instants do not prove shared capacity. No proximity tolerance or prefix match is used.
 - NativeAutoRouter derives account-level switching pressure from the weakest observed model. Any observed exhausted model makes that account-level value zero; unknown models never become 100% by default. Unknown current-account quota does not authorize automatic mutation.
-- Activity telemetry is IDLE only when an explicitly observed trajectory collection is empty or every observed status is a known inactive status. Missing payloads, missing collections, and unrecognized statuses remain UNKNOWN; RUNNING evidence remains BUSY.
+- Activity telemetry is IDLE only when an explicitly observed keyed trajectory collection is empty or every observed status is a known inactive status. Missing payloads, malformed collections, and unrecognized statuses remain UNKNOWN; RUNNING evidence remains BUSY.
 - CandidateSelector requires known capacity for every pool matching a relevant model key; one healthy row cannot hide another matching unknown or exhausted row.
 - The dashboard renders missing quota as UNKNOWN, distinct from an observed zero/exhausted quota.
 
