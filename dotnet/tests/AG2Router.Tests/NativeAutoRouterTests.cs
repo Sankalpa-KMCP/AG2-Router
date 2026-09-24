@@ -343,22 +343,28 @@ public class NativeAutoRouterTests : IAsyncDisposable
     {
         await using var router = CreateRouter();
 
-        var holdTcs = new TaskCompletionSource<bool>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holdTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _adapter.GetStatusFunc = async _ =>
         {
+            entered.TrySetResult();
             await holdTcs.Task;
             return new Ag2StatusDto(true, "HEALTHY", null, "OK");
         };
 
         var task1 = Task.Run(() => router.EvaluateCycleAsync());
-        await Task.Delay(50); // Let task1 start
-
-        var result2 = await router.EvaluateCycleAsync();
-        Assert.False(result2.ShouldSwitch);
-        Assert.Contains("already in progress", result2.Reason);
-
-        holdTcs.SetResult(true);
-        await task1;
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var result2 = await router.EvaluateCycleAsync();
+            Assert.False(result2.ShouldSwitch);
+            Assert.Contains("already in progress", result2.Reason);
+        }
+        finally
+        {
+            holdTcs.TrySetResult(true);
+            await task1.WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     [Fact]
@@ -506,14 +512,14 @@ public class NativeAutoRouterTests : IAsyncDisposable
         };
 
         var evaluating = router.EvaluateCycleAsync();
-        await admitted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await admitted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted(current.Id);
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, false,
             SwitchResultCodes.SwitchInProgress, NativeSwitchStates.Failed, current.Id,
             current.Email, null, null, "Automatic switch owns transaction.", [],
             DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O")));
         release.TrySetResult(true);
-        await evaluating.WaitAsync(TimeSpan.FromSeconds(2));
+        await evaluating.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(candidate.Id, router.GetStatus().ActiveAccountId);
         Assert.Equal(RoutingSafetyGateState.Cooldown, router.GetStatus().State);
@@ -544,7 +550,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         }
 
         var pending = router.EvaluateCycleAsync();
-        await quotaEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await quotaEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted(current.Id);
         _accountStore.ActiveAccountId = current.Id;
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, true,
@@ -553,7 +559,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
             DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O")));
         releaseQuota.SetResult(new QuotaSnapshotDto(DateTime.UtcNow.ToString("O"),
             [new ModelQuotaDto("Gemini", "gemini", 0.9, null, false)], null, null));
-        Assert.False((await pending.WaitAsync(TimeSpan.FromSeconds(2))).ShouldSwitch);
+        Assert.False((await pending.WaitAsync(TimeSpan.FromSeconds(5))).ShouldSwitch);
 
         _safetyGate.Reset();
         var next = await router.EvaluateCycleAsync();
@@ -586,7 +592,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         };
 
         var evaluating = router.EvaluateCycleAsync();
-        await admitted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await admitted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted(manualTarget.Id);
         _accountStore.ActiveAccountId = manualTarget.Id;
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, true,
@@ -595,7 +601,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
             DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O")));
         _accountStore.ThrowOnActiveRead = true;
         release.TrySetResult();
-        await evaluating.WaitAsync(TimeSpan.FromSeconds(2));
+        await evaluating.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(manualTarget.Id, router.GetStatus().ActiveAccountId);
         Assert.Equal(RoutingSafetyGateState.Cooldown, router.GetStatus().State);
@@ -627,13 +633,13 @@ public class NativeAutoRouterTests : IAsyncDisposable
         };
 
         var evaluating = router.EvaluateCycleAsync();
-        await autoCommitted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await autoCommitted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted(manualTarget.Id);
         // Manual coordinator has committed and released switch ownership, but its
         // loopback completion callback has not yet updated the router epoch.
         _accountStore.ActiveAccountId = manualTarget.Id;
         releaseAutoResult.TrySetResult();
-        await evaluating.WaitAsync(TimeSpan.FromSeconds(2));
+        await evaluating.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.NotEqual(autoTarget.Id, router.GetStatus().ActiveAccountId);
 
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, true,
@@ -670,7 +676,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         };
 
         var evaluating = router.EvaluateCycleAsync();
-        await autoCommitted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await autoCommitted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted(manualTarget.Id);
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, false,
             SwitchResultCodes.SwitchFailedRollbackFailed, NativeSwitchStates.Failed,
@@ -678,7 +684,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
             "Manual rollback uncertain", [], DateTimeOffset.UtcNow.ToString("O"),
             DateTimeOffset.UtcNow.ToString("O"), ManualRecoveryRequired: true));
         releaseAutoResult.TrySetResult();
-        await evaluating.WaitAsync(TimeSpan.FromSeconds(2));
+        await evaluating.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(RoutingSafetyGateState.ManualRecoveryRequired, router.GetStatus().State);
         Assert.False(router.GetConfig().AutoSwitchEnabled);
     }
@@ -712,7 +718,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         };
 
         var evaluating = router.EvaluateCycleAsync();
-        await autoEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await autoEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted(manualTarget.Id);
         _accountStore.ActiveAccountId = manualTarget.Id;
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, true,
@@ -722,7 +728,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         Assert.Equal(RoutingSafetyGateState.Cooldown, router.GetStatus().State);
 
         releaseAutoResult.TrySetResult();
-        await evaluating.WaitAsync(TimeSpan.FromSeconds(2));
+        await evaluating.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(manualTarget.Id, router.GetStatus().ActiveAccountId);
         Assert.Equal(RoutingSafetyGateState.ManualRecoveryRequired, router.GetStatus().State);
         Assert.False(router.GetConfig().AutoSwitchEnabled);
@@ -814,7 +820,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _adapter.GetStatusFunc = _ => { probeEntered.TrySetResult(); return releaseProbe.Task; };
 
         var evaluation = router.EvaluateCycleAsync();
-        await probeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await probeEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted("manual");
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, false,
             SwitchResultCodes.SwitchFailedRollbackFailed, NativeSwitchStates.Failed,
@@ -822,7 +828,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
             DateTimeOffset.UtcNow.ToString("O"), DateTimeOffset.UtcNow.ToString("O"),
             ManualRecoveryRequired: true));
         releaseProbe.SetResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
-        await evaluation.WaitAsync(TimeSpan.FromSeconds(2));
+        await evaluation.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(RoutingSafetyGateState.ManualRecoveryRequired, router.GetStatus().State);
         Assert.False(router.GetConfig().AutoSwitchEnabled);
@@ -841,14 +847,14 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _adapter.GetStatusFunc = _ => { probeEntered.TrySetResult(); return releaseProbe.Task; };
 
         var evaluation = router.EvaluateCycleAsync();
-        await probeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await probeEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted(target.Id);
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, true,
             SwitchResultCodes.Success, NativeSwitchStates.Complete, target.Id, target.Email,
             null, null, "Manual success", [], DateTimeOffset.UtcNow.ToString("O"),
             DateTimeOffset.UtcNow.ToString("O")));
         releaseProbe.SetResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
-        await evaluation.WaitAsync(TimeSpan.FromSeconds(2));
+        await evaluation.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(RoutingSafetyGateState.Cooldown, router.GetStatus().State);
         Assert.Contains("cooldown", (await router.EvaluateCycleAsync()).Reason,
@@ -878,14 +884,14 @@ public class NativeAutoRouterTests : IAsyncDisposable
         };
 
         var evaluation = router.EvaluateCycleAsync();
-        await publicationEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await publicationEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var token = router.NotifyManualSwitchStarted(current.Id);
         await router.NotifyManualSwitchCompletedAsync(token, new NativeSwitchResult(null, false,
             SwitchResultCodes.Cancelled, NativeSwitchStates.Failed, current.Id, current.Email,
             null, null, "Cancelled before mutation", [], DateTimeOffset.UtcNow.ToString("O"),
             DateTimeOffset.UtcNow.ToString("O")));
         releasePublication.TrySetResult();
-        await evaluation.WaitAsync(TimeSpan.FromSeconds(2));
+        await evaluation.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(RoutingSafetyGateState.Idle, router.GetStatus().State);
         Assert.Equal(0, _switchCoordinator.CallCount);

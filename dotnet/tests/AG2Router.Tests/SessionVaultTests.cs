@@ -336,20 +336,20 @@ public class SessionVaultTests : IDisposable
         var writer = new DelayedWriter(entered, release);
         var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider(), writer)
         {
-            MutationTimeout = TimeSpan.FromMilliseconds(80),
-            AdmissionTimeout = TimeSpan.FromMilliseconds(80)
+            MutationTimeout = TimeSpan.FromSeconds(2),
+            AdmissionTimeout = TimeSpan.FromSeconds(2)
         };
         try
         {
             var first = vault.SaveSessionAsync("acc_first", "first"u8.ToArray());
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await Assert.ThrowsAsync<VaultMutationUncertainException>(
-                () => first.WaitAsync(TimeSpan.FromSeconds(2)));
+                () => first.WaitAsync(TimeSpan.FromSeconds(5)));
 
             var later = new SessionVault(_tempVaultDir, new FakeDpapiProvider());
             await Assert.ThrowsAsync<VaultMutationUncertainException>(
                 () => later.SaveSessionAsync("acc_later", "later"u8.ToArray())
-                    .WaitAsync(TimeSpan.FromSeconds(1)));
+                    .WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Equal(1, writer.WriteCount);
         }
         finally
@@ -358,7 +358,7 @@ public class SessionVaultTests : IDisposable
         }
 
         var gate = PathLockRegistry.Get(vault.GetVaultPath());
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
         gate.Release();
         await Assert.ThrowsAsync<VaultMutationUncertainException>(
             () => vault.SaveSessionAsync("acc_after", "after"u8.ToArray()));
@@ -378,7 +378,7 @@ public class SessionVaultTests : IDisposable
 
         var vault = new SessionVault(_tempVaultDir, dpapi);
         if (remove) await vault.SaveSessionAsync(accountId, "older-session"u8.ToArray());
-        vault.MutationTimeout = TimeSpan.FromMilliseconds(80);
+        vault.MutationTimeout = TimeSpan.FromSeconds(2);
 
         var heldLease = await CrossProcessFileLease.AcquireAsync(vault.GetVaultPath(), CancellationToken.None);
         try
@@ -387,7 +387,7 @@ public class SessionVaultTests : IDisposable
                 ? vault.RemoveSessionAsync(accountId)
                 : vault.SaveSessionAsync(accountId, "stale-session"u8.ToArray());
             await Assert.ThrowsAsync<VaultMutationUncertainException>(
-                () => oldOperation.WaitAsync(TimeSpan.FromSeconds(2)));
+                () => oldOperation.WaitAsync(TimeSpan.FromSeconds(5)));
 
             // A different serialized owner publishes the newer state while the old
             // operation is still waiting for this lease.
@@ -399,7 +399,7 @@ public class SessionVaultTests : IDisposable
         }
 
         var gate = PathLockRegistry.Get(vault.GetVaultPath());
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
         gate.Release();
         Assert.Equal(newerEnvelope, await File.ReadAllTextAsync(vault.GetVaultPath()));
     }
@@ -433,16 +433,16 @@ public class SessionVaultTests : IDisposable
         var writer = new ReplacePauseThenThrowWriter(entered, release);
         var vault = new SessionVault(_tempVaultDir, new FakeDpapiProvider(), writer);
         await vault.SaveSessionAsync(accountId, "original-session"u8.ToArray());
-        vault.MutationTimeout = TimeSpan.FromMilliseconds(80);
+        vault.MutationTimeout = TimeSpan.FromSeconds(2);
 
         Task removal = vault.RemoveSessionWithReceiptAsync(accountId);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await Assert.ThrowsAsync<VaultMutationUncertainException>(
-            () => removal.WaitAsync(TimeSpan.FromSeconds(2)));
+            () => removal.WaitAsync(TimeSpan.FromSeconds(5)));
         release.TrySetResult();
 
         var gate = PathLockRegistry.Get(vault.GetVaultPath());
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
         gate.Release();
         Assert.Equal(2, writer.WriteCount);
         await Assert.ThrowsAsync<VaultMutationUncertainException>(

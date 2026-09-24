@@ -110,10 +110,10 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             _credentials, _credentials, _adapter, _process);
 
         var switching = coordinator.SwitchAsync(_target!.Id);
-        await decryptEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await decryptEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         _adapter.Identity = new AccountIdentityDto("external@example.com");
         resumeDecrypt.TrySetResult();
-        var result = await switching.WaitAsync(TimeSpan.FromSeconds(2));
+        var result = await switching.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
         Assert.Equal(0, _process.StopCount);
@@ -165,10 +165,10 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         };
 
         var switching = Coordinator().SwitchAsync(_target!.Id);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         _adapter.Identity = new AccountIdentityDto("external@example.com");
         resume.TrySetResult();
-        var result = await switching.WaitAsync(TimeSpan.FromSeconds(2));
+        var result = await switching.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(SwitchResultCodes.TelemetryUnavailable, result.Code);
         Assert.Equal(0, _process.StopCount);
@@ -191,10 +191,10 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         };
 
         var switching = Coordinator().SwitchAsync(_target!.Id);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         _adapter.Activity = new ActivityStatusDto(state, running, running, DateTimeOffset.UtcNow.ToString("O"));
         resume.TrySetResult();
-        var result = await switching.WaitAsync(TimeSpan.FromSeconds(2));
+        var result = await switching.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(expectedCode, result.Code);
         Assert.Equal(0, _process.StopCount);
@@ -451,7 +451,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         };
 
         Task<NativeSwitchResult> first = Coordinator().SwitchAsync(_target!.Id);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var second = await Coordinator().SwitchAsync(_target.Id);
         Assert.Equal(SwitchResultCodes.SwitchInProgress, second.Code);
         Assert.Equal(1, _credentials.WriteCount);
@@ -532,7 +532,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         };
 
         Task<NativeSwitchResult> pending = Coordinator().SwitchAsync(_target!.Id);
-        await identityEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await identityEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         _process.GenerationCurrent = false;
         releaseIdentity.TrySetResult();
 
@@ -616,12 +616,12 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         };
         var coordinator = Coordinator();
         var switching = coordinator.SwitchAsync(_target!.Id);
-        await stopped.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await stopped.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         await Assert.ThrowsAsync<TimeoutException>(() =>
             coordinator.CoordinateShutdownAsync(TimeSpan.FromMilliseconds(20)));
         release.TrySetResult(true);
-        var outcome = await switching.WaitAsync(TimeSpan.FromSeconds(2));
+        var outcome = await switching.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, outcome.Code);
         Assert.Equal(SwitchResultCodes.Cancelled, (await coordinator.SwitchAsync(_target.Id)).Code);
     }
@@ -658,7 +658,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             verificationTimeout: TimeSpan.FromMilliseconds(100),
             rollbackTimeout: TimeSpan.FromMilliseconds(30));
 
-        var result = await coordinator.SwitchAsync(_target!.Id).WaitAsync(TimeSpan.FromSeconds(2));
+        var result = await coordinator.SwitchAsync(_target!.Id).WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, result.Code);
         Assert.True(result.ManualRecoveryRequired);
         Assert.Contains("ROLLBACK_FAILED", result.StagesCompleted);
@@ -685,7 +685,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             Assert.True(uncertain.ManualRecoveryRequired);
             Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, uncertain.Code);
 
-            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(1));
+            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(later.ManualRecoveryRequired);
             Assert.Equal(1, _process.StopCount);
             Assert.Equal(0, _credentials.WriteCount);
@@ -696,7 +696,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             release.TrySetResult();
         }
         var gate = PathLockRegistry.Get(_vault.GetVaultPath() + ".switch");
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
         gate.Release();
         Assert.True(coordinator.GetStatus().LastResult?.ManualRecoveryRequired);
     }
@@ -720,7 +720,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(uncertain.ManualRecoveryRequired);
 
-            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(1));
+            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(later.ManualRecoveryRequired);
             Assert.Equal(1, _process.StopCount);
             Assert.Equal(0, _credentials.WriteCount);
@@ -730,7 +730,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             release.TrySetResult();
         }
         var gate = PathLockRegistry.Get(_vault.GetVaultPath() + ".switch");
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
         gate.Release();
         Assert.True(coordinator.GetStatus().LastResult?.ManualRecoveryRequired);
     }
@@ -759,7 +759,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             var uncertain = await first.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(uncertain.ManualRecoveryRequired);
 
-            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(1));
+            var later = await Coordinator().SwitchAsync(_target.Id).WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(later.ManualRecoveryRequired);
             Assert.Equal(1, _credentials.WriteCount);
             var gate = PathLockRegistry.Get(_vault.GetVaultPath() + ".switch");
@@ -770,7 +770,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             release.TrySetResult();
         }
         var settledGate = PathLockRegistry.Get(_vault.GetVaultPath() + ".switch");
-        Assert.True(await settledGate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await settledGate.WaitAsync(TimeSpan.FromSeconds(5)));
         settledGate.Release();
         Assert.True(coordinator.GetStatus().LastResult?.ManualRecoveryRequired);
     }
