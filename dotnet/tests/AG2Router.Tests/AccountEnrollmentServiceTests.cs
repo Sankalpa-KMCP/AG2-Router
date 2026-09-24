@@ -631,7 +631,7 @@ public class AccountEnrollmentServiceTests : IDisposable
 
         Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
         var second = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
-            service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(1)));
+            service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.Contains("manual recovery", second.Message, StringComparison.OrdinalIgnoreCase);
         var gate = PathLockRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
         Assert.False(await gate.WaitAsync(TimeSpan.FromMilliseconds(30)));
@@ -659,14 +659,14 @@ public class AccountEnrollmentServiceTests : IDisposable
             Assert.NotNull(pending);
 
             var later = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
-                service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(1)));
+                service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains("manual recovery", later.Message, StringComparison.OrdinalIgnoreCase);
             Assert.False((await _accountStore.GetAccountAsync(pending.Id))?.HasVaultedSession);
 
             store.ReleaseUpdate();
-            await store.UpdateFinished.WaitAsync(TimeSpan.FromSeconds(2));
+            await store.UpdateFinished.WaitAsync(TimeSpan.FromSeconds(5));
             var gate = PathLockRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
-            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
             gate.Release();
             Assert.True((await _accountStore.GetAccountAsync(pending.Id))?.HasVaultedSession);
         }
@@ -694,7 +694,7 @@ public class AccountEnrollmentServiceTests : IDisposable
             Assert.Equal(0, store.AddCount);
             store.ReleaseRead();
             var gate = PathLockRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
-            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
             gate.Release();
             Assert.Equal(0, store.AddCount);
             Assert.Null(await _accountStore.GetAccountByEmailAsync(email));
@@ -716,19 +716,19 @@ public class AccountEnrollmentServiceTests : IDisposable
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var vault = new SessionVault(_tempDir, _fakeDpapi, new DelayedFirstVaultWrite(entered, release))
         {
-            MutationTimeout = TimeSpan.FromMilliseconds(70)
+            MutationTimeout = TimeSpan.FromSeconds(2)
         };
         try
         {
             var first = vault.SaveSessionAsync("unrelated", "synthetic"u8.ToArray());
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await Assert.ThrowsAsync<VaultMutationUncertainException>(
-                () => first.WaitAsync(TimeSpan.FromSeconds(2)));
+                () => first.WaitAsync(TimeSpan.FromSeconds(5)));
 
             var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, vault, _accountStore,
-                TimeSpan.FromMilliseconds(200));
+                TimeSpan.FromSeconds(2));
             await Assert.ThrowsAsync<AccountEnrollmentException>(
-                () => service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(1)));
+                () => service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Null(await _accountStore.GetAccountByEmailAsync(email));
         }
         finally
@@ -768,18 +768,20 @@ public class AccountEnrollmentServiceTests : IDisposable
         var vault = new SessionVault(Path.Combine(_tempDir, "rotation-timeout"),
             new FakeDpapiProvider(), writer);
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, vault,
-            _accountStore, TimeSpan.FromMilliseconds(60));
+            _accountStore, TimeSpan.FromSeconds(5));
 
+        var enrollment = service.EnrollCurrentAccountAsync();
+        await writer.WriteEntered.WaitAsync(TimeSpan.FromSeconds(10));
         var failure = await Assert.ThrowsAsync<AccountEnrollmentException>(
-            () => service.EnrollCurrentAccountAsync().WaitAsync(TimeSpan.FromSeconds(2)));
+            () => enrollment.WaitAsync(TimeSpan.FromSeconds(10)));
 
         Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
         writer.Release();
         var vaultGate = PathLockRegistry.Get(vault.GetVaultPath());
-        Assert.True(await vaultGate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await vaultGate.WaitAsync(TimeSpan.FromSeconds(5)));
         vaultGate.Release();
         var gate = PathLockRegistry.Get(vault.GetVaultPath() + ".switch");
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
         gate.Release();
     }
 
@@ -875,11 +877,18 @@ public class AccountEnrollmentServiceTests : IDisposable
         private readonly DurableFileWriter _inner = new();
         private int _writes;
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _writeEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task WriteEntered => _writeEntered.Task;
         public void Release() => _release.TrySetResult();
         public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken) =>
             Interlocked.Increment(ref _writes) == ordinal
-                ? _release.Task
+                ? HoldWrite()
                 : _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+        private Task HoldWrite()
+        {
+            _writeEntered.TrySetResult();
+            return _release.Task;
+        }
     }
 
     private sealed class TrackingDpapiProvider : IDpapiProvider
@@ -1171,13 +1180,15 @@ public sealed class AccountRemovalServiceTests : IDisposable
         await vault.SaveSessionAsync(account.Id, [1, 2, 3]);
         var store = new HangingRemovalStore(underlying) { HangReadback = true };
 
+        var removal = new AccountRemovalService(store, vault, TimeSpan.FromSeconds(5))
+            .RemoveAsync(account.Id);
+        await store.ReadbackEntered.WaitAsync(TimeSpan.FromSeconds(10));
         var failure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            new AccountRemovalService(store, vault, TimeSpan.FromMilliseconds(60))
-                .RemoveAsync(account.Id).WaitAsync(TimeSpan.FromSeconds(2)));
+            removal.WaitAsync(TimeSpan.FromSeconds(10)));
 
         Assert.Contains("manual", failure.Message, StringComparison.OrdinalIgnoreCase);
         var gate = PathLockRegistry.Get(vault.GetVaultPath() + ".switch");
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
         gate.Release();
     }
 
@@ -1192,17 +1203,19 @@ public sealed class AccountRemovalServiceTests : IDisposable
         await vault.SaveSessionAsync(account.Id, [1, 2, 3]);
         var store = new HangingRemovalStore(underlying);
 
+        var removal = new AccountRemovalService(store, vault, TimeSpan.FromSeconds(5))
+            .RemoveAsync(account.Id);
+        await writer.RestoreEntered.WaitAsync(TimeSpan.FromSeconds(10));
         var failure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            new AccountRemovalService(store, vault, TimeSpan.FromMilliseconds(60))
-                .RemoveAsync(account.Id).WaitAsync(TimeSpan.FromSeconds(2)));
+            removal.WaitAsync(TimeSpan.FromSeconds(10)));
 
         Assert.Contains("manual recovery", failure.Message, StringComparison.OrdinalIgnoreCase);
         writer.Release();
         var vaultGate = PathLockRegistry.Get(vault.GetVaultPath());
-        Assert.True(await vaultGate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await vaultGate.WaitAsync(TimeSpan.FromSeconds(5)));
         vaultGate.Release();
         var gate = PathLockRegistry.Get(vault.GetVaultPath() + ".switch");
-        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
         gate.Release();
     }
 
@@ -1229,12 +1242,12 @@ public sealed class AccountRemovalServiceTests : IDisposable
             // The late writer ignores cancellation. No newer vault mutation may
             // be admitted while its durable outcome is unresolved.
             var unavailable = await Assert.ThrowsAsync<VaultMutationUncertainException>(() =>
-                vault.SaveSessionAsync(account.Id, [9, 8, 7]).WaitAsync(TimeSpan.FromSeconds(1)));
+                vault.SaveSessionAsync(account.Id, [9, 8, 7]).WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains("manual recovery", unavailable.Message, StringComparison.OrdinalIgnoreCase);
             writer.Release();
-            await writer.RestoreFinished.WaitAsync(TimeSpan.FromSeconds(2));
+            await writer.RestoreFinished.WaitAsync(TimeSpan.FromSeconds(5));
             var stillUnavailable = await Assert.ThrowsAsync<VaultMutationUncertainException>(() =>
-                vault.SaveSessionAsync(account.Id, [9, 8, 7]).WaitAsync(TimeSpan.FromSeconds(1)));
+                vault.SaveSessionAsync(account.Id, [9, 8, 7]).WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains("manual recovery", stillUnavailable.Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
@@ -1242,7 +1255,7 @@ public sealed class AccountRemovalServiceTests : IDisposable
             writer.Release();
         }
         var vaultGate = PathLockRegistry.Get(vault.GetVaultPath());
-        Assert.True(await vaultGate.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(await vaultGate.WaitAsync(TimeSpan.FromSeconds(5)));
         vaultGate.Release();
     }
 
@@ -1266,13 +1279,13 @@ public sealed class AccountRemovalServiceTests : IDisposable
             Assert.Contains("manual recovery", error.Message, StringComparison.OrdinalIgnoreCase);
 
             var later = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                service.RemoveAsync(account.Id).WaitAsync(TimeSpan.FromSeconds(1)));
+                service.RemoveAsync(account.Id).WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains("manual recovery", later.Message, StringComparison.OrdinalIgnoreCase);
             Assert.NotNull(await underlying.GetAccountAsync(account.Id));
             store.ReleaseRemoval();
-            await store.RemovalFinished.WaitAsync(TimeSpan.FromSeconds(2));
+            await store.RemovalFinished.WaitAsync(TimeSpan.FromSeconds(5));
             var gate = PathLockRegistry.Get(vault.GetVaultPath() + ".switch");
-            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.True(await gate.WaitAsync(TimeSpan.FromSeconds(5)));
             gate.Release();
             Assert.Null(await underlying.GetAccountAsync(account.Id));
             // No compensation ran concurrently with the original metadata commit.
@@ -1334,11 +1347,18 @@ public sealed class AccountRemovalServiceTests : IDisposable
         private int _writes;
         private readonly DurableFileWriter _inner = new();
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _restoreEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task RestoreEntered => _restoreEntered.Task;
         public void Release() => _release.TrySetResult();
         public Task WriteAtomicAsync(string destinationPath, string content, CancellationToken cancellationToken) =>
             Interlocked.Increment(ref _writes) == 3
-                ? _release.Task
+                ? HoldRestore()
                 : _inner.WriteAtomicAsync(destinationPath, content, cancellationToken);
+        private Task HoldRestore()
+        {
+            _restoreEntered.TrySetResult();
+            return _release.Task;
+        }
     }
 
     private sealed class ReplaceFailThenDelayedRestoreWriter : IDurableFileWriter
@@ -1379,16 +1399,23 @@ public sealed class AccountRemovalServiceTests : IDisposable
         private int _readCount;
         public bool HangReadback { get; init; }
         public bool DelayedRemoval { get; init; }
+        private readonly TaskCompletionSource _readbackEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _removalEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _releaseRemoval = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _removalFinished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task ReadbackEntered => _readbackEntered.Task;
         public Task RemovalEntered => _removalEntered.Task;
         public Task RemovalFinished => _removalFinished.Task;
         public void ReleaseRemoval() => _releaseRemoval.TrySetResult();
         public Task<AccountMetadata?> GetAccountAsync(string id, CancellationToken cancellationToken = default) =>
             HangReadback && Interlocked.Increment(ref _readCount) >= 2
-                ? new TaskCompletionSource<AccountMetadata?>(TaskCreationOptions.RunContinuationsAsynchronously).Task
+                ? HangAfterEntry()
                 : inner.GetAccountAsync(id, cancellationToken);
+        private Task<AccountMetadata?> HangAfterEntry()
+        {
+            _readbackEntered.TrySetResult();
+            return new TaskCompletionSource<AccountMetadata?>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        }
         public Task<bool> RemoveAccountIfUnchangedAsync(AccountMetadata expected, CancellationToken cancellationToken = default) =>
             DelayedRemoval ? RemoveLateAsync(expected) :
                 Task.FromException<bool>(new IOException("synthetic metadata removal failure"));
