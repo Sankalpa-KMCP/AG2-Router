@@ -32,6 +32,27 @@ public class AccountEnrollmentServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task UsernameMutationWithSameBlobDoesNotCommitCurrentSession()
+    {
+        const string email = "username-race@example.com";
+        byte[] blob = Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}");
+        _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget,
+            VaultConstants.DefaultAg2WinCredUserName, blob);
+        int reads = 0;
+        _mockAdapter.GetCurrentAccountFunc = _ => {
+            if (Interlocked.Increment(ref reads) == 2)
+                _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget, "Antigravity", blob);
+            return Task.FromResult<AccountIdentityDto?>(new AccountIdentityDto(email, "Synthetic"));
+        };
+
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+        await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync());
+        Assert.Null(await _accountStore.GetAccountByEmailAsync(email));
+        Assert.Null(await _accountStore.GetActiveAccountIdAsync());
+        Assert.Empty(await _sessionVault.ListStoredAccountIdsAsync());
+    }
+
+    [Fact]
     public async Task CredentialRotationRestoresExistingMetadataWithoutInventingVaultAvailability()
     {
         const string email = "existing-rotation@example.com";
@@ -138,16 +159,74 @@ public class AccountEnrollmentServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task EnrollCurrentAccount_WhenWinCredIdentityDoesNotMatchCurrentAccount_ThrowsAccountEnrollmentException()
+    public async Task EnrollCurrentAccount_CanonicalUsernameUsesAuthenticatedEmail()
     {
         _mockAdapter.CurrentAccount = new AccountIdentityDto("real@example.com", "Developer");
-        _winCredStore.Seed("gemini:antigravity", "foreign@example.com", Encoding.UTF8.GetBytes("{\"token\":\"fake\"}"));
+        _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget,
+            VaultConstants.DefaultAg2WinCredUserName, Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
         var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
 
-        var ex = await Assert.ThrowsAsync<AccountEnrollmentException>(() =>
-            service.EnrollCurrentAccountAsync());
+        var result = await service.EnrollCurrentAccountAsync();
+        Assert.True(result.Success);
+        Assert.Equal("real@example.com", result.Account.Email);
+        Assert.Equal(result.Account.Id, await _accountStore.GetActiveAccountIdAsync());
+    }
 
-        Assert.Contains("does not match authenticated Antigravity account", ex.Message);
+    [Fact]
+    public async Task EnrollCurrentAccount_LegacyEmailUsernameUsesAuthenticatedEmail()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("real@example.com", "Developer");
+        _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget, "legacy@example.com",
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+
+        var result = await service.EnrollCurrentAccountAsync();
+        Assert.True(result.Success);
+        Assert.Equal("real@example.com", result.Account.Email);
+        Assert.Equal(result.Account.Id, await _accountStore.GetActiveAccountIdAsync());
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("bad\0name")]
+    public async Task EnrollCurrentAccount_RejectsStructurallyInvalidUsername(string username)
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("real@example.com", "Developer");
+        _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget, username,
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+
+        await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync());
+        Assert.Empty(await _accountStore.ListAccountsAsync());
+    }
+
+    [Fact]
+    public async Task EnrollCurrentAccount_RejectsOversizedUsername()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("real@example.com", "Developer");
+        _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget,
+            new string('x', 514),
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+
+        await Assert.ThrowsAsync<AccountEnrollmentException>(() => service.EnrollCurrentAccountAsync());
+        Assert.Empty(await _accountStore.ListAccountsAsync());
+    }
+
+    [Fact]
+    public async Task EnrollCurrentAccount_AcceptsUsernameAtWindowsLengthLimit()
+    {
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("real@example.com", "Developer");
+        _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget, new string('x', 513),
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+        var service = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+
+        var result = await service.EnrollCurrentAccountAsync();
+
+        Assert.True(result.Success);
+        Assert.Equal("real@example.com", result.Account.Email);
+        Assert.True(await _sessionVault.HasSessionAsync(result.Account.Id));
     }
 
     [Fact]

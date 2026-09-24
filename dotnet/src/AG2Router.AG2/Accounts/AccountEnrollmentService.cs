@@ -97,10 +97,12 @@ public class AccountEnrollmentService
 
             try
             {
-                if (!string.Equals(cred.UserName?.Trim(), currentAccount.Email.Trim(), StringComparison.OrdinalIgnoreCase))
+                if (string.IsNullOrWhiteSpace(cred.UserName) ||
+                    cred.UserName.Length > VaultConstants.MaxAg2WinCredUserNameLength ||
+                    cred.UserName.IndexOf('\0') >= 0)
                 {
                     throw new AccountEnrollmentException(
-                        $"Windows Credential username '{cred.UserName}' does not match authenticated Antigravity account '{currentAccount.Email}'."
+                        "Windows Credential username is structurally invalid."
                     );
                 }
 
@@ -294,7 +296,7 @@ public class AccountEnrollmentService
                             if (freshAccount != null &&
                                 string.Equals(freshAccount.Email?.Trim(), email, StringComparison.OrdinalIgnoreCase) &&
                                 freshCred != null &&
-                                string.Equals(freshCred.UserName?.Trim(), email, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(freshCred.UserName, cred.UserName, StringComparison.Ordinal) &&
                                 freshCred.Blob is { Length: > 0 } freshBlob &&
                                 freshBlob.Length == cred.Blob.Length &&
                                 CryptographicOperations.FixedTimeEquals(freshBlob, cred.Blob))

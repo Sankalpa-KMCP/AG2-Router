@@ -272,6 +272,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
     public async Task SuccessfulSyntheticSwitchVerifiesIdentityThenCommitsMetadata()
     {
         await SeedAccountsAsync();
+        _credentials.Set(Credential(VaultConstants.DefaultAg2WinCredUserName, "source-secret"));
         var result = await Coordinator().SwitchAsync(_target!.Id);
 
         Assert.True(result.Success);
@@ -279,11 +280,66 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         Assert.Equal(_target.Id, await _accounts.GetActiveAccountIdAsync());
         Assert.True((await _accounts.GetAccountAsync(_target.Id))!.HasVaultedSession);
         Assert.Equal("target@example.com", _adapter.Identity!.Email);
+        Assert.Equal("antigravity", _credentials.Snapshot().UserName);
         Assert.Equal(1, _process.StopCount);
         Assert.Equal(1, _process.LaunchCount);
         Assert.Contains("TARGET_IDENTITY_VERIFIED", result.StagesCompleted);
         Assert.True(result.StagesCompleted.IndexOf("TARGET_IDENTITY_VERIFIED") <
                     result.StagesCompleted.IndexOf("METADATA_COMMITTED"));
+    }
+
+    [Fact]
+    public async Task LegacyUsernameSwitchesAndForwardWriteNormalizesUsername()
+    {
+        await SeedAccountsAsync();
+        _credentials.Set(Credential("legacy@example.com", "source-secret"));
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.True(result.Success);
+        Assert.Equal(VaultConstants.DefaultAg2WinCredUserName, _credentials.Snapshot().UserName);
+        Assert.Equal(_target.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    [Fact]
+    public async Task UsernameAtWindowsLengthLimitPassesSwitchPreflight()
+    {
+        await SeedAccountsAsync();
+        _credentials.Set(Credential(new string('x', 513), "source-secret"));
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.True(result.Success);
+        Assert.Equal("antigravity", _credentials.Snapshot().UserName);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("bad\0name")]
+    public async Task StructurallyInvalidSourceUsernameFailsBeforeMutation(string username)
+    {
+        await SeedAccountsAsync();
+        _credentials.Set(Credential(username, "source-secret"));
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.False(result.Success);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+    }
+
+    [Fact]
+    public async Task OversizedSourceUsernameFailsBeforeMutation()
+    {
+        await SeedAccountsAsync();
+        _credentials.Set(Credential(new string('x', 514),
+            "source-secret"));
+
+        var result = await Coordinator().SwitchAsync(_target!.Id);
+
+        Assert.False(result.Success);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
     }
 
     [Theory]
@@ -296,13 +352,20 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
     public async Task PostMutationFailuresRollbackCredentialProcessAndIdentity(string failure)
     {
         await SeedAccountsAsync();
+        var originalCredential = _credentials.Snapshot();
+        Assert.Equal("source@example.com", originalCredential.UserName);
         ConfigureFailure(failure);
 
         var result = await Coordinator(TimeSpan.FromMilliseconds(40)).SwitchAsync(_target!.Id);
 
         Assert.False(result.Success);
         Assert.Equal(SwitchResultCodes.SwitchFailedRolledBack, result.Code);
-        Assert.Equal("source-secret", Encoding.UTF8.GetString(_credentials.Snapshot().Blob));
+        var restoredCredential = _credentials.Snapshot();
+        Assert.Equal(originalCredential.Target, restoredCredential.Target);
+        Assert.Equal(originalCredential.Type, restoredCredential.Type);
+        Assert.Equal(originalCredential.UserName, restoredCredential.UserName);
+        Assert.Equal(originalCredential.Persistence, restoredCredential.Persistence);
+        Assert.Equal(originalCredential.Blob, restoredCredential.Blob);
         Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
         Assert.Equal("source@example.com", _adapter.Identity!.Email);
         Assert.True(_process.RestoreCount >= 1);

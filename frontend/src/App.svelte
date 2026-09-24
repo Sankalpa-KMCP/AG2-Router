@@ -3,6 +3,7 @@
   import Header from './lib/components/Header.svelte';
   import SummaryCards from './lib/components/SummaryCards.svelte';
   import QuotaSection from './lib/components/QuotaSection.svelte';
+  import ProviderOverview from './lib/components/ProviderOverview.svelte';
   import AccountsTable from './lib/components/AccountsTable.svelte';
   import RoutingConfigSection from './lib/components/RoutingConfigSection.svelte';
   import ActivityLogSection from './lib/components/ActivityLogSection.svelte';
@@ -299,6 +300,15 @@
         </div>
       {/if}
 
+      <div class="page-intro">
+        <div>
+          <span class="page-eyebrow">Command center</span>
+          <h2>{activeTab === 'overview' ? 'Overview' : activeTab === 'accounts' ? 'Accounts' : activeTab === 'telemetry' ? 'Telemetry & quotas' : activeTab === 'routing' ? 'Settings' : 'Activity & safety'}</h2>
+          <p>{activeTab === 'overview' ? 'Account health and model capacity at a glance.' : activeTab === 'accounts' ? 'Manage saved identities and account access.' : activeTab === 'telemetry' ? 'Inspect individual model observations and reset windows.' : activeTab === 'routing' ? 'Configure routing and switch thresholds.' : 'Review recent dashboard activity and router state.'}</p>
+        </div>
+        <span class="sync-indicator"><span aria-hidden="true"></span>{isRefreshing ? 'Syncing' : `Last sync ${lastPollTime}`}</span>
+      </div>
+
       <!-- Summary metrics cards -->
       <SummaryCards
         totalAccounts={totalAccountsCount}
@@ -317,6 +327,7 @@
         <button
           type="button"
           class="nav-tab {activeTab === 'overview' ? 'active' : ''}"
+          aria-current={activeTab === 'overview' ? 'page' : undefined}
           onclick={() => (activeTab = 'overview')}
         >
           Overview
@@ -324,6 +335,7 @@
         <button
           type="button"
           class="nav-tab {activeTab === 'accounts' ? 'active' : ''}"
+          aria-current={activeTab === 'accounts' ? 'page' : undefined}
           onclick={() => (activeTab = 'accounts')}
         >
           Accounts ({totalAccountsCount})
@@ -331,6 +343,7 @@
         <button
           type="button"
           class="nav-tab {activeTab === 'telemetry' ? 'active' : ''}"
+          aria-current={activeTab === 'telemetry' ? 'page' : undefined}
           onclick={() => (activeTab = 'telemetry')}
         >
           Telemetry &amp; Quotas
@@ -338,6 +351,7 @@
         <button
           type="button"
           class="nav-tab {activeTab === 'routing' ? 'active' : ''}"
+          aria-current={activeTab === 'routing' ? 'page' : undefined}
           onclick={() => (activeTab = 'routing')}
         >
           Settings
@@ -345,6 +359,7 @@
         <button
           type="button"
           class="nav-tab {activeTab === 'activity' ? 'active' : ''}"
+          aria-current={activeTab === 'activity' ? 'page' : undefined}
           onclick={() => (activeTab = 'activity')}
         >
           Activity &amp; Safety
@@ -353,7 +368,7 @@
 
       <!-- View Panels -->
       {#if activeTab === 'overview'}
-        <QuotaSection
+        <ProviderOverview
           quota={quotaSnapshot}
           isAg2Connected={Boolean(status?.ag2?.connected)}
           {lowThresholdPercent}
@@ -437,34 +452,45 @@
     display: flex;
     flex-direction: column;
     min-height: 100vh;
-    background-color: var(--color-canvas);
+    background: var(--color-canvas);
   }
 
   .main-content {
     flex: 1;
-    padding: var(--space-5) var(--space-6);
-    max-width: 1360px;
+    padding: 27px 34px 40px;
+    max-width: 1440px;
     width: 100%;
     margin: 0 auto;
   }
+
+  .page-intro { display: flex; align-items: end; justify-content: space-between; gap: var(--space-4); margin-bottom: 21px; }
+  .page-eyebrow { color: var(--color-primary-text); font-size: 11px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
+  .page-intro h2 { margin-top: 3px; font-size: 26px; font-weight: 720; line-height: 1.15; letter-spacing: -.045em; }
+  .page-intro p { margin-top: 5px; color: var(--color-text-muted); font-size: 12px; }
+  .sync-indicator { display: inline-flex; align-items: center; gap: 7px; color: var(--color-text-muted); font-size: 11px; white-space: nowrap; }
+  .sync-indicator span { width: 6px; height: 6px; border-radius: 50%; background: var(--color-success); }
 
   .view-nav {
     display: flex;
     align-items: center;
     gap: var(--space-1);
-    margin-bottom: var(--space-4);
-    border-bottom: 1px solid var(--color-card-border);
-    padding-bottom: var(--space-1);
+    margin: 0 0 var(--space-5);
+    padding: 4px;
+    width: fit-content;
+    max-width: 100%;
+    overflow-x: auto;
+    background: var(--color-surface-hover);
+    border-radius: var(--radius-md);
   }
 
   .nav-tab {
     background: transparent;
     border: none;
     font-family: var(--font-sans);
-    font-size: 13px;
-    font-weight: 500;
+    font-size: 12px;
+    font-weight: 550;
     color: var(--color-text-secondary);
-    padding: var(--space-2) var(--space-3);
+    padding: 8px 13px;
     border-radius: var(--radius-sm);
     cursor: pointer;
     transition: all var(--transition-fast);
@@ -476,18 +502,19 @@
   }
 
   .nav-tab.active {
-    background-color: var(--color-primary-subtle);
-    color: var(--color-primary-text);
-    font-weight: 600;
+    background-color: var(--color-surface);
+    color: var(--color-text-primary);
+    font-weight: 700;
+    box-shadow: var(--shadow-xs);
   }
 
   .app-footer {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-3) var(--space-6);
-    background-color: var(--color-surface);
-    border-top: 1px solid var(--color-card-border);
+    padding: var(--space-3) 34px;
+    background-color: transparent;
+    border-top: 1px solid var(--color-divider);
     font-size: 11.5px;
     color: var(--color-text-muted);
   }
@@ -528,10 +555,11 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-2-5) var(--space-4);
-    border-radius: var(--radius-sm);
+    padding: 13px 16px;
+    border-radius: var(--radius-md);
     margin-bottom: var(--space-4);
     font-size: 12.5px;
+    font-weight: 550;
     gap: var(--space-3);
   }
 
@@ -539,6 +567,7 @@
     background-color: var(--color-danger-subtle);
     border: 1px solid var(--color-danger-border);
     color: var(--color-danger-text);
+    box-shadow: 0 3px 12px rgba(153, 27, 27, .06);
   }
 
   .notification-banner.success {
@@ -551,5 +580,15 @@
     font-size: 13px;
     padding: 2px 6px;
     color: inherit;
+  }
+
+  @media (max-width: 720px) {
+    .main-content { padding: 20px 16px 30px; }
+    .page-intro { align-items: start; }
+    .sync-indicator { display: none; }
+    .view-nav { width: 100%; }
+    .nav-tab { flex: 0 0 auto; }
+    .app-footer { padding: 12px 16px; }
+    .footer-poll { display: none; }
   }
 </style>

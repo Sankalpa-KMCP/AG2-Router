@@ -10,6 +10,8 @@ public static class VaultConstants
     public const string Magic = "AG2_ROUTER_SESSION_VAULT";
     public const int SchemaVersion = 1;
     public const string DefaultAg2WinCredTarget = "gemini:antigravity";
+    public const string DefaultAg2WinCredUserName = "antigravity";
+    public const int MaxAg2WinCredUserNameLength = 513;
 }
 
 /// <summary>
