@@ -96,7 +96,7 @@
   <!-- Card 4: Quota Health / Attention Required -->
   <div class="card metric-card">
     <div class="metric-top">
-      <span class="metric-label">Pools Status</span>
+      <span class="metric-label">Model health</span>
       <span class="badge {poolsSummary.badgeClass}">
         {poolsSummary.badgeText}
       </span>
@@ -106,7 +106,7 @@
         {poolsSummary.metricText}
       </span>
       <span class="metric-subtext">
-        {activeModelsCount > 0 ? `${activeModelsCount} active quota pools monitored` : 'Waiting for telemetry data'}
+        {activeModelsCount > 0 ? `${activeModelsCount} model rows monitored` : 'Waiting for telemetry data'}
       </span>
     </div>
   </div>
@@ -121,7 +121,7 @@
     </div>
     <div class="metric-body">
       <span class="metric-value-medium {autoSwitchEnabled ? 'text-primary' : 'text-muted'}">
-        {autoSwitchEnabled ? 'AUTOMATED' : 'MANUAL ONLY'}
+        {autoSwitchEnabled ? 'Automatic' : 'Manual only'}
       </span>
       <span class="metric-subtext">
         Trigger quota &le; {lowThresholdPercent}%
@@ -133,17 +133,17 @@
 <style>
   .summary-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-    gap: var(--space-3);
-    margin-bottom: var(--space-5);
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 23px;
   }
 
   .metric-card {
-    padding: var(--space-3-5) var(--space-4);
+    padding: 15px 16px;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
-    min-height: 96px;
+    min-height: 108px;
   }
 
   .metric-top {
@@ -154,11 +154,10 @@
   }
 
   .metric-label {
-    font-size: 11.5px;
-    font-weight: 600;
+    font-size: 11px;
+    font-weight: 650;
     color: var(--color-text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: .01em;
   }
 
   .metric-body {
@@ -182,7 +181,7 @@
   }
 
   .metric-value-large {
-    font-size: 24px;
+    font-size: 27px;
     font-weight: 700;
     color: var(--color-text-primary);
     line-height: 1.1;
@@ -241,4 +240,8 @@
   .text-muted {
     color: var(--color-text-muted);
   }
+
+  @media (max-width: 1150px) { .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 680px) { .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric-card { min-height: 100px; } }
+  @media (max-width: 400px) { .summary-grid { grid-template-columns: 1fr; } }
 </style>

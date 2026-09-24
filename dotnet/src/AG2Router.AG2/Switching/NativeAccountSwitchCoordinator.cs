@@ -295,7 +295,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     $"Antigravity process provenance is unsafe: {AG2Security.SanitizeError(ex)}");
             }
 
-            originalCredential = await CaptureCurrentCredentialAsync(previousEmail, cancellationToken)
+            originalCredential = await CaptureCurrentCredentialAsync(cancellationToken)
                 .ConfigureAwait(false);
             stages.Add("ROLLBACK_SNAPSHOT_CAPTURED");
 
@@ -401,7 +401,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
             // The source may have refreshed WinCred after the provisional preflight read.
             // Once it is proven stopped, refresh the rollback snapshot before any overwrite.
-            var quiescedCredential = await CaptureCurrentCredentialAsync(previousEmail, mutationToken)
+            var quiescedCredential = await CaptureCurrentCredentialAsync(mutationToken)
                 .ConfigureAwait(false);
             ZeroCredential(originalCredential);
             originalCredential = quiescedCredential;
@@ -410,7 +410,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             targetCredential = new WinCredEntry(
                 WinCredTarget,
                 originalCredential.Type,
-                target.Email,
+                VaultConstants.DefaultAg2WinCredUserName,
                 originalCredential.Persistence,
                 targetSession);
             ValidateCredential(targetCredential, requireConfiguredTarget: true);
@@ -603,9 +603,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
     }
 
-    private async Task<WinCredEntry> CaptureCurrentCredentialAsync(
-        string? expectedEmail,
-        CancellationToken cancellationToken)
+    private async Task<WinCredEntry> CaptureCurrentCredentialAsync(CancellationToken cancellationToken)
     {
         var readCredential = await _winCredReader.ReadCredentialAsync(WinCredTarget, cancellationToken)
             .ConfigureAwait(false)
@@ -615,12 +613,6 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         try
         {
             ValidateCredential(readCredential, requireConfiguredTarget: true);
-            if (!string.Equals(readCredential.UserName, expectedEmail, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new SwitchRejectedException(
-                    SwitchResultCodes.TelemetryUnavailable,
-                    "Current credential identity does not match verified telemetry.");
-            }
             return CloneCredential(readCredential);
         }
         finally
@@ -718,8 +710,11 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     {
         if (requireConfiguredTarget && !string.Equals(entry.Target, WinCredTarget, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("Credential target does not match the configured Antigravity target.");
-        if (entry.Target.IndexOf('\0') >= 0 || entry.UserName.IndexOf('\0') >= 0)
+        if (entry.Target.IndexOf('\0') >= 0 || entry.UserName?.IndexOf('\0') >= 0)
             throw new InvalidDataException("Credential text contains an embedded null.");
+        if (string.IsNullOrWhiteSpace(entry.UserName) ||
+            entry.UserName.Length > VaultConstants.MaxAg2WinCredUserNameLength)
+            throw new InvalidDataException("Credential username is structurally invalid.");
         if (entry.Type != 1 || entry.Persistence is < 1 or > 3)
             throw new InvalidDataException("Credential type or persistence is unsupported.");
         if (entry.Blob == null || entry.Blob.Length is < 1 or > MaxCredentialBlobBytes)

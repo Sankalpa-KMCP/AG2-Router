@@ -30,6 +30,7 @@ CURRENT IMPLEMENTATION:
 - Activity telemetry is IDLE only when an explicitly observed keyed trajectory collection is empty or every observed status is a known inactive status. Missing payloads, malformed collections, and unrecognized statuses remain UNKNOWN; RUNNING evidence remains BUSY.
 - CandidateSelector requires known capacity for every pool matching a relevant model key; one healthy row cannot hide another matching unknown or exhausted row.
 - The dashboard renders missing quota as UNKNOWN, distinct from an observed zero/exhausted quota.
+- The Overview shows Gemini and Claude provider summaries derived from, but never written back to, individual model rows. Each summary uses the lowest observed fraction; unknown rows prevent a healthy percentage unless exhaustion is observed. Differing or incomplete reset evidence does not become one shared reset time. The detailed model rows remain visible in Telemetry & Quotas, and routing keeps its model-specific inputs.
 
 Primary evidence: AG2TelemetryNormalizer, NativeAutoRouter, AG2TelemetryNormalizerTests, and NativeAutoRouterTests.
 
@@ -38,6 +39,7 @@ Primary evidence: AG2TelemetryNormalizer, NativeAutoRouter, AG2TelemetryNormaliz
 INTENDED INVARIANT:
 
 - Account identity comes from verified Antigravity telemetry, not user-entered email alone.
+- The WinCred entry at `gemini:antigravity` uses `UserName` as keyring metadata, not as account identity. The canonical upstream value is `antigravity`; structurally valid legacy email-valued or other noncanonical usernames remain admissible. Enrollment binds the session to verified telemetry and rejects a changed credential blob or username during capture.
 - Metadata, the vaulted session, the active-account marker, the live WinCred value, and the verified process identity are related records but are not interchangeable proof.
 - Enrollment must bind captured credential material to the observed account and must not leave a partial new account after failure.
 - A switch is complete only after the restarted, verified process reports the target identity and the metadata commit succeeds.

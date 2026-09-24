@@ -184,7 +184,8 @@ public class LoopbackServerAccountApiTests : IAsyncDisposable
 
         _mockAdapter.CurrentAccount = new AccountIdentityDto("enrolled@example.com", "Enrolled User");
         byte[] validBlob = Encoding.UTF8.GetBytes("{\"token\":\"fake-token-12345\",\"auth_method\":\"oauth\"}");
-        _winCredStore.Seed("gemini:antigravity", "enrolled@example.com", validBlob);
+        _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget,
+            VaultConstants.DefaultAg2WinCredUserName, validBlob);
 
         var payload = new
         {

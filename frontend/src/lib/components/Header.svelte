@@ -34,7 +34,11 @@
 <header class="app-header">
   <div class="header-left">
     <div class="brand">
-      <h1 class="brand-title">AG2 Router</h1>
+      <span class="brand-mark" aria-hidden="true">A<span>2</span></span>
+      <div>
+        <h1 class="brand-title">AG2 Router</h1>
+        <span class="brand-subtitle">Account intelligence</span>
+      </div>
     </div>
     <div class="connection-status" role="status" aria-live="polite">
       <span class="status-dot {isConnected ? 'connected' : 'disconnected'}" aria-hidden="true"></span>
@@ -44,7 +48,7 @@
 
   <div class="header-right">
     <div class="active-account-chip" title="Currently Active Account">
-      <span class="chip-label">Active:</span>
+      <span class="chip-label">Active account</span>
       <span class="chip-value">{activeAccountName}</span>
     </div>
     <button
@@ -66,30 +70,36 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-3) var(--space-6);
+    padding: 13px 34px;
     background-color: var(--color-surface);
-    border-bottom: 1px solid var(--color-card-border);
+    border-bottom: 1px solid var(--color-divider);
     gap: var(--space-4);
   }
 
   .header-left {
     display: flex;
     align-items: center;
-    gap: var(--space-5);
+    gap: 24px;
+    min-width: 0;
   }
 
   .brand {
     display: flex;
-    align-items: baseline;
-    gap: var(--space-2);
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
   }
 
+  .brand-mark { display: inline-flex; align-items: baseline; justify-content: center; width: 35px; height: 35px; padding-top: 6px; border-radius: 10px; background: var(--color-primary); color: white; font-size: 18px; font-weight: 800; letter-spacing: -.07em; line-height: 1; box-shadow: 0 3px 9px rgba(38, 84, 150, .16); }
+  .brand-mark span { font-size: 11px; }
+
   .brand-title {
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 700;
     color: var(--color-text-primary);
-    letter-spacing: -0.01em;
+    letter-spacing: -.035em;
   }
+  .brand-subtitle { display: block; margin-top: 1px; font-size: 10px; color: var(--color-text-muted); }
 
   .connection-status {
     display: flex;
@@ -97,6 +107,7 @@
     gap: var(--space-2);
     font-size: 12px;
     color: var(--color-text-secondary);
+    min-width: 0;
   }
 
   .status-dot {
@@ -117,6 +128,9 @@
 
   .status-text {
     font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .header-right {
@@ -130,16 +144,16 @@
     align-items: center;
     gap: var(--space-1-5);
     background-color: var(--color-surface-subtle);
-    border: 1px solid var(--color-card-border);
-    padding: 3px 10px;
-    border-radius: var(--radius-full);
+    padding: 5px 11px;
+    border-radius: var(--radius-sm);
     font-size: 12px;
-    max-width: 280px;
+    max-width: 310px;
   }
 
   .chip-label {
     color: var(--color-text-muted);
     font-weight: 500;
+    white-space: nowrap;
   }
 
   .chip-value {
@@ -152,7 +166,7 @@
 
   .refresh-btn {
     font-size: 12px;
-    padding: 4px 10px;
+    padding: 7px 12px;
   }
 
   .refresh-icon {
@@ -168,5 +182,18 @@
   @keyframes spin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
+  }
+
+  @media (max-width: 940px) {
+    .app-header { flex-wrap: wrap; gap: 10px; }
+    .header-left, .header-right { width: 100%; justify-content: space-between; }
+    .status-text { max-width: 220px; }
+  }
+  @media (max-width: 640px) {
+    .app-header { padding: 12px 16px; }
+    .brand-subtitle, .chip-label { display: none; }
+    .status-text { max-width: 40vw; }
+    .active-account-chip { max-width: min(70vw, 310px); }
+    .refresh-btn span:last-child { display: none; }
   }
 </style>
