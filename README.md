@@ -46,7 +46,7 @@ dotnet/src/
 * Antigravity 2 installed.
 
 ### Per-User Installation (Non-Admin)
-1. Download the release archive `AG2Router-v0.2.2-win-x64.zip` from releases.
+1. Download the release archive `AG2Router-v0.3.0-win-x64.zip` from releases.
 2. Extract the archive to a folder of your choice.
 3. Open PowerShell and run the installer:
    ```powershell
@@ -102,13 +102,13 @@ npm run typecheck
 npm test
 
 # Build and package the self-contained release candidate
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Configuration Release -Version 0.2.2
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Configuration Release -Version 0.3.0
 ```
 
 The packaging script outputs:
-- `dist/AG2Router-v0.2.2-win-x64.zip`: Standalone self-contained release archive.
+- `dist/AG2Router-v0.3.0-win-x64.zip`: Standalone self-contained release archive.
 - `dist/SHA256SUMS.txt`: SHA-256 checksum manifest for artifact integrity.
-- `dist/AG2Router-Setup-v0.2.2-win-x64.exe`: Inno Setup installer (if `iscc` compiler is present in PATH).
+- `dist/AG2Router-Setup-v0.3.0-win-x64.exe`: Inno Setup installer (if `iscc` compiler is present in PATH).
 
 ---
 
