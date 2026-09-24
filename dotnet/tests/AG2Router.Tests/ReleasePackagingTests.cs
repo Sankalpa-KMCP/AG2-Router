@@ -312,7 +312,7 @@ public class ReleasePackagingTests
         var versionMatch = Regex.Match(propsContent, @"<Version>(?<ver>[^<]+)</Version>");
         Assert.True(versionMatch.Success, "Directory.Build.props must specify <Version>");
         string canonicalVersion = versionMatch.Groups["ver"].Value.Trim();
-        Assert.Equal("0.3.0", canonicalVersion);
+        Assert.Equal("0.3.1", canonicalVersion);
 
         // Assembly, File, and Informational versions must match canonical version
         Assert.Contains($"<AssemblyVersion>{canonicalVersion}</AssemblyVersion>", propsContent);
