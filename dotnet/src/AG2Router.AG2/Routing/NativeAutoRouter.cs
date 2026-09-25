@@ -33,8 +33,6 @@ public class NativeAutoRouter : INativeAutoRouter
     private long _lastSuccessfulManualEpoch;
     private long _nextManualTokenId;
     private bool _manualSwitchPending;
-    private CancellationTokenSource? _timerCts;
-    private Task? _timerTask;
     private bool _disposed;
 
     public NativeAutoRouter(
@@ -279,109 +277,20 @@ public class NativeAutoRouter : INativeAutoRouter
         }
     }
 
-    public void SetObservedQuota(string accountId, double remainingFraction)
+    internal void SetObservedQuota(string accountId, double remainingFraction, IReadOnlyList<ModelQuotaDto>? modelQuotas = null)
     {
         ArgumentNullException.ThrowIfNull(accountId);
         lock (_stateLock)
         {
             _observedQuotas[accountId] = remainingFraction;
-            if (!_observedModelQuotas.ContainsKey(accountId))
+            if (modelQuotas != null)
             {
-                _observedModelQuotas[accountId] = new List<ModelQuotaDto>
-                {
-                    new("Gemini Pro", "gemini-pro", remainingFraction, null, false),
-                    new("Claude 3.7 Sonnet", "claude-3-7-sonnet", remainingFraction, null, false),
-                    new("Gemini", "gemini", remainingFraction, null, false)
-                };
+                _observedModelQuotas[accountId] = modelQuotas;
             }
-        }
-    }
-
-    public void SetObservedModelQuotas(string accountId, IReadOnlyList<ModelQuotaDto> models)
-    {
-        ArgumentNullException.ThrowIfNull(accountId);
-        ArgumentNullException.ThrowIfNull(models);
-        lock (_stateLock)
-        {
-            _observedModelQuotas[accountId] = models;
-        }
-    }
-
-    public void Start()
-    {
-        lock (_stateLock)
-        {
-            if (_timerCts != null || _disposed) return;
-            _timerCts = new CancellationTokenSource();
-            var token = _timerCts.Token;
-
-            _timerTask = Task.Run(async () =>
+            else
             {
-                try
-                {
-                    await EvaluateCycleAsync(token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch
-                {
-                    // Swallowed to preserve background worker resilience
-                }
-
-                int intervalMs = Math.Max(1000, _config.PollingIntervalMs);
-                using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(intervalMs));
-
-                while (!token.IsCancellationRequested)
-                {
-                    try
-                    {
-                        if (!await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
-                        {
-                            break;
-                        }
-                        await EvaluateCycleAsync(token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    catch
-                    {
-                        // Swallowed to prevent loop termination
-                    }
-                }
-            }, token);
-        }
-    }
-
-    public async Task StopAsync()
-    {
-        CancellationTokenSource? cts;
-        Task? task;
-
-        lock (_stateLock)
-        {
-            cts = _timerCts;
-            task = _timerTask;
-            _timerCts = null;
-            _timerTask = null;
-        }
-
-        if (cts != null)
-        {
-            cts.Cancel();
-            if (task != null)
-            {
-                try
-                {
-                    await task.ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) { }
-                catch { }
+                _observedModelQuotas.Remove(accountId);
             }
-            cts.Dispose();
         }
     }
 
@@ -935,12 +844,12 @@ public class NativeAutoRouter : INativeAutoRouter
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (_disposed) return;
+        if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
-        await StopAsync().ConfigureAwait(false);
         _evaluatingGate.Dispose();
         GC.SuppressFinalize(this);
+        return ValueTask.CompletedTask;
     }
 }

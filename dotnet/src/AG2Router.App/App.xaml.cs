@@ -149,7 +149,8 @@ public partial class App : System.Windows.Application
             _telemetryCoordinator = new TelemetryPollingCoordinator(
                 _ag2Adapter,
                 interval: TimeSpan.FromMilliseconds(_autoRouter.GetConfig().PollingIntervalMs),
-                autoRouter: _autoRouter);
+                autoRouter: _autoRouter,
+                log: Log);
             _telemetryCoordinator.Start();
 
             Log("Starting loopback server...");

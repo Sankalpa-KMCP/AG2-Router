@@ -53,6 +53,9 @@ public class NativeAutoRouterTests : IAsyncDisposable
         );
     }
 
+    private static IReadOnlyList<ModelQuotaDto> CreateTestModelQuotas(double fraction, string key = "gemini-pro", string label = "Gemini Pro")
+        => [new(label, key, fraction, null, false)];
+
     [Fact]
     public async Task EvaluateCycleAsync_WhenAntigravityOffline_ReturnsNoSwitchAndResetsPending()
     {
@@ -106,7 +109,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.ActiveAccountId = "acc_current";
         _sessionVault.StoredIds.Add("acc_current");
         _sessionVault.StoredIds.Add("acc_candidate");
-        router.SetObservedQuota("acc_candidate", 0.85);
+        router.SetObservedQuota("acc_candidate", 0.85, CreateTestModelQuotas(0.85));
 
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
@@ -138,7 +141,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.ActiveAccountId = "acc_current";
         _sessionVault.StoredIds.Add("acc_current");
         _sessionVault.StoredIds.Add("acc_candidate");
-        router.SetObservedQuota("acc_candidate", 0.85);
+        router.SetObservedQuota("acc_candidate", 0.85, CreateTestModelQuotas(0.85));
 
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
@@ -185,8 +188,8 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _sessionVault.StoredIds.Add("acc_current");
         _sessionVault.StoredIds.Add("acc_fail");
         _sessionVault.StoredIds.Add("acc_fallback");
-        router.SetObservedQuota("acc_fail", 0.85);
-        router.SetObservedQuota("acc_fallback", 0.80);
+        router.SetObservedQuota("acc_fail", 0.85, CreateTestModelQuotas(0.85));
+        router.SetObservedQuota("acc_fallback", 0.80, CreateTestModelQuotas(0.80));
 
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
@@ -217,7 +220,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.ActiveAccountId = "acc_current";
         _sessionVault.StoredIds.Add("acc_current");
         _sessionVault.StoredIds.Add("acc_target");
-        router.SetObservedQuota("acc_target", 0.85);
+        router.SetObservedQuota("acc_target", 0.85, CreateTestModelQuotas(0.85));
 
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
@@ -256,7 +259,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.ActiveAccountId = "acc_current";
         _sessionVault.StoredIds.Add("acc_current");
         _sessionVault.StoredIds.Add("acc_candidate");
-        router.SetObservedQuota("acc_candidate", 0.85);
+        router.SetObservedQuota("acc_candidate", 0.85, CreateTestModelQuotas(0.85));
 
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
@@ -315,7 +318,10 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.ActiveAccountId = "acc_current";
         _sessionVault.StoredIds.Add("acc_current");
         _sessionVault.StoredIds.Add("acc_candidate");
-        router.SetObservedQuota("acc_candidate", 0.85);
+        router.SetObservedQuota("acc_candidate", 0.85, [
+            new("Gemini Pro", "gemini-pro", 0.85, null, false),
+            new("Claude 3.7 Sonnet", "claude-3-7-sonnet", 0.85, null, false)
+        ]);
 
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         // Current account has Gemini Pro at 90% healthy, but Claude 3.7 Sonnet is 0% exhausted!
@@ -368,15 +374,15 @@ public class NativeAutoRouterTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task StartAndStop_PeriodicExecutionStartsAndStopsCleanly()
+    public async Task EvaluateCycleAsync_DirectCallerDrivenExecution_UpdatesStatusCleanly()
     {
         await using var router = CreateRouter(new RouterConfigDto(AutoSwitchEnabled: false, PollingIntervalMs: 50));
 
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
 
-        router.Start();
-        await Task.Delay(150);
-        await router.StopAsync();
+        var result = await router.EvaluateCycleAsync();
+        Assert.False(result.ShouldSwitch);
+        Assert.Equal(RoutingSafetyGateState.Idle, router.GetStatus().State);
     }
 
     [Fact]
@@ -496,7 +502,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.Accounts[candidate.Id] = candidate;
         _accountStore.ActiveAccountId = current.Id;
         _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
-        router.SetObservedQuota(candidate.Id, 0.9);
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
             DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
@@ -578,7 +584,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
             _accountStore.Accounts[account.Id] = account;
         _accountStore.ActiveAccountId = former.Id;
         _sessionVault.StoredIds.UnionWith([former.Id, autoTarget.Id, manualTarget.Id]);
-        router.SetObservedQuota(autoTarget.Id, 0.9);
+        router.SetObservedQuota(autoTarget.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
             DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
@@ -618,7 +624,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
             _accountStore.Accounts[account.Id] = account;
         _accountStore.ActiveAccountId = former.Id;
         _sessionVault.StoredIds.UnionWith([former.Id, autoTarget.Id, manualTarget.Id]);
-        router.SetObservedQuota(autoTarget.Id, 0.9);
+        router.SetObservedQuota(autoTarget.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
             DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
@@ -661,7 +667,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
             _accountStore.Accounts[account.Id] = account;
         _accountStore.ActiveAccountId = former.Id;
         _sessionVault.StoredIds.UnionWith([former.Id, autoTarget.Id, manualTarget.Id]);
-        router.SetObservedQuota(autoTarget.Id, 0.9);
+        router.SetObservedQuota(autoTarget.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
             DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
@@ -700,7 +706,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
             _accountStore.Accounts[account.Id] = account;
         _accountStore.ActiveAccountId = former.Id;
         _sessionVault.StoredIds.UnionWith([former.Id, autoTarget.Id, manualTarget.Id]);
-        router.SetObservedQuota(autoTarget.Id, 0.9);
+        router.SetObservedQuota(autoTarget.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
             DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
@@ -871,7 +877,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.Accounts[candidate.Id] = candidate;
         _accountStore.ActiveAccountId = current.Id;
         _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
-        router.SetObservedQuota(candidate.Id, 0.9);
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
             DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
@@ -907,8 +913,8 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.Accounts[candidate.Id] = candidate;
         _accountStore.ActiveAccountId = stored.Id;
         _sessionVault.StoredIds.UnionWith([stored.Id, candidate.Id]);
-        router.SetObservedQuota(stored.Id, 0.8);
-        router.SetObservedQuota(candidate.Id, 0.9);
+        router.SetObservedQuota(stored.Id, 0.8, CreateTestModelQuotas(0.8, "gemini", "Gemini"));
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetCurrentAccountFunc = _ => Task.FromResult<AccountIdentityDto?>(
             new AccountIdentityDto("external@example.com"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
@@ -933,8 +939,8 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.Accounts[candidate.Id] = candidate;
         _accountStore.ActiveAccountId = stored.Id;
         _sessionVault.StoredIds.UnionWith([stored.Id, candidate.Id]);
-        router.SetObservedQuota(stored.Id, 0.8);
-        router.SetObservedQuota(candidate.Id, 0.9);
+        router.SetObservedQuota(stored.Id, 0.8, CreateTestModelQuotas(0.8, "gemini", "Gemini"));
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetAccountQuotaObservationFunc = _ => Task.FromResult(new AccountQuotaObservation(
             new AccountIdentityDto("transient@example.com"),
@@ -961,7 +967,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.Accounts[candidate.Id] = candidate;
         _accountStore.ActiveAccountId = current.Id;
         _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
-        router.SetObservedQuota(candidate.Id, 0.9);
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
             DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
@@ -983,7 +989,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
         _accountStore.Accounts[candidate.Id] = candidate;
         _accountStore.ActiveAccountId = current.Id;
         _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
-        router.SetObservedQuota(candidate.Id, 0.9);
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9, "gemini", "Gemini"));
         _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
         _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
             DateTime.UtcNow.ToString("O"), [new ModelQuotaDto("Gemini", "gemini", 0.05, null, false)], null, null));
@@ -995,6 +1001,105 @@ public class NativeAutoRouterTests : IAsyncDisposable
         Assert.Equal(1, _switchCoordinator.CallCount);
         Assert.Equal(RoutingSafetyGateState.ManualRecoveryRequired, router.GetStatus().State);
         Assert.False(router.GetConfig().AutoSwitchEnabled);
+    }
+
+    [Fact]
+    public async Task SetObservedQuota_WithoutModelQuotas_LeavesPerModelTelemetryUnknown_AndRejectsCandidateWhenModelsRequired()
+    {
+        await using var router = CreateRouter();
+
+        var current = CreateAccount("acc_current", "curr@example.com");
+        var candidate = CreateAccount("acc_candidate", "cand@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = "acc_current";
+        _sessionVault.StoredIds.Add("acc_current");
+        _sessionVault.StoredIds.Add("acc_candidate");
+
+        // Set aggregate quota ONLY without model quotas: no synthetic fallback rows are generated
+        router.SetObservedQuota("acc_candidate", 0.85);
+
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        // Active account has observed model telemetry: candidate selection requires matching model telemetry
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"),
+            new List<ModelQuotaDto> { new("Gemini Pro", "gemini-pro", 0.05, null, false) },
+            null, null
+        ));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto("IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+
+        var result = await router.EvaluateCycleAsync();
+
+        // Candidate must be rejected because per-model telemetry is unknown, not falsely satisfied by synthetic rows
+        Assert.False(result.ShouldSwitch);
+        var candidateEval1 = Assert.Single(result.Candidates);
+        Assert.False(candidateEval1.IsEligible);
+        Assert.Contains("quota is unknown (no observed per-model telemetry)", candidateEval1.IneligibilityReason, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task SetObservedQuota_WithExplicitModelQuotas_AllowsCandidateSelection()
+    {
+        await using var router = CreateRouter();
+
+        var current = CreateAccount("acc_current", "curr@example.com");
+        var candidate = CreateAccount("acc_candidate", "cand@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = "acc_current";
+        _sessionVault.StoredIds.Add("acc_current");
+        _sessionVault.StoredIds.Add("acc_candidate");
+
+        // Explicit model quotas passed
+        router.SetObservedQuota("acc_candidate", 0.85, [new("Gemini Pro", "gemini-pro", 0.85, null, false)]);
+
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"),
+            new List<ModelQuotaDto> { new("Gemini Pro", "gemini-pro", 0.05, null, false) },
+            null, null
+        ));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto("IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+
+        var result = await router.EvaluateCycleAsync();
+
+        Assert.True(result.ShouldSwitch);
+        Assert.NotNull(result.BestCandidate);
+        Assert.Equal("acc_candidate", result.BestCandidate.Account.Id);
+    }
+
+    [Fact]
+    public async Task SetObservedQuota_WithExhaustedModelQuota_RejectsCandidate()
+    {
+        await using var router = CreateRouter();
+
+        var current = CreateAccount("acc_current", "curr@example.com");
+        var candidate = CreateAccount("acc_candidate", "cand@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = "acc_current";
+        _sessionVault.StoredIds.Add("acc_current");
+        _sessionVault.StoredIds.Add("acc_candidate");
+
+        // Candidate has 85% aggregate quota, but the relevant model is exhausted (0% / isExhausted)
+        router.SetObservedQuota("acc_candidate", 0.85, [new("Gemini Pro", "gemini-pro", 0.0, null, true)]);
+
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"),
+            new List<ModelQuotaDto> { new("Gemini Pro", "gemini-pro", 0.05, null, false) },
+            null, null
+        ));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto("IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+
+        var result = await router.EvaluateCycleAsync();
+
+        Assert.False(result.ShouldSwitch);
+        var candidateEval2 = Assert.Single(result.Candidates);
+        Assert.False(candidateEval2.IsEligible);
+        Assert.Contains("is exhausted on candidate", candidateEval2.IneligibilityReason, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, _switchCoordinator.CallCount);
     }
 
     private sealed class FakeDurableFileWriter : IDurableFileWriter

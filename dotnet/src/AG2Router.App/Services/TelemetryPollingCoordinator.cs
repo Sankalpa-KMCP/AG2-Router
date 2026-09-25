@@ -31,15 +31,18 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
     public event Action<SystemStatusDto>? StatusUpdated;
 
     private readonly INativeAutoRouter? _autoRouter;
+    private readonly Action<string>? _log;
 
     public TelemetryPollingCoordinator(
         IAG2Adapter adapter,
         TimeSpan? interval = null,
-        INativeAutoRouter? autoRouter = null)
+        INativeAutoRouter? autoRouter = null,
+        Action<string>? log = null)
     {
         _adapter = adapter;
         _interval = interval ?? TimeSpan.FromSeconds(10);
         _autoRouter = autoRouter;
+        _log = log;
 
         _currentStatus = new SystemStatusDto(
             Status: "ok",
@@ -100,9 +103,9 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
             {
                 return;
             }
-            catch
+            catch (Exception ex)
             {
-                // Swallowed to prevent crashing background thread
+                _log?.Invoke($"Background telemetry polling loop encountered an unexpected error: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
             }
 
             PeriodicTimer timer;
@@ -128,9 +131,9 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                     {
                         break;
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Swallowed to prevent crashing background thread
+                        _log?.Invoke($"Background telemetry polling loop encountered an unexpected error: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
                     }
                 }
             }
@@ -150,8 +153,20 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
 
     public async Task PollAsync(CancellationToken cancellationToken = default)
     {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
         // Guard against overlapping polls: if a poll is already active, skip this tick cleanly
-        if (!await _semaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+        try
+        {
+            if (!await _semaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            {
+                return;
+            }
+        }
+        catch (OperationCanceledException)
         {
             return;
         }
@@ -168,9 +183,13 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 {
                     await _autoRouter.EvaluateCycleAsync(cancellationToken).ConfigureAwait(false);
                 }
-                catch
+                catch (OperationCanceledException)
                 {
-                    // Swallowed to prevent telemetry loop abort
+                    // Clean cancellation during shutdown; don't log as an error
+                }
+                catch (Exception ex)
+                {
+                    _log?.Invoke($"AutoRouter evaluation cycle failed: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
                 }
             }
 
@@ -243,7 +262,10 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 {
                     StatusUpdated?.Invoke(newStatus);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    _log?.Invoke($"StatusUpdated subscriber threw an exception: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
+                }
             }
         }
         catch (OperationCanceledException)
@@ -253,6 +275,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         catch (Exception ex)
         {
             var safeMessage = AG2Security.RedactSensitiveText(ex.Message);
+            _log?.Invoke($"Telemetry polling failed: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + safeMessage)}");
             var fallbackStatus = new SystemStatusDto(
                 Status: "error",
                 Ag2: new Ag2StatusDto(
@@ -280,7 +303,10 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 {
                     StatusUpdated?.Invoke(fallbackStatus);
                 }
-                catch { }
+                catch (Exception subscriberEx)
+                {
+                    _log?.Invoke($"StatusUpdated subscriber threw an exception on fallback status: {AG2Security.RedactSensitiveText(subscriberEx.GetType().Name + ": " + subscriberEx.Message)}");
+                }
             }
         }
         finally
