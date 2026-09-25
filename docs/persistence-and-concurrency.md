@@ -96,7 +96,7 @@ The order is security- and integrity-sensitive. See NativeAccountSwitchCoordinat
 
 ## Polling and stale state
 
-TelemetryPollingCoordinator starts from the persisted router polling interval, prevents overlapping PollAsync calls, assigns monotonic sequence numbers, and refuses to replace newer status with an older result. A successful config write dynamically replaces its timer. Each poll invokes NativeAutoRouter.EvaluateCycleAsync before building the published snapshot. A failed durable config write does not report success or change runtime config.
+TelemetryPollingCoordinator starts from the persisted router polling interval, prevents overlapping PollAsync calls, assigns monotonic sequence numbers, and refuses to replace newer status with an older result. When Antigravity is connected, it derives account identity and quota telemetry from a single unified observation (`IAG2Adapter.GetAccountQuotaObservationAsync`) to ensure published dashboard snapshots never mix telemetry across accounts. A successful config write dynamically replaces its timer. Each poll invokes NativeAutoRouter.EvaluateCycleAsync before building the published snapshot. A failed durable config write does not report success or change runtime config.
 
 ### Dashboard configuration form
 
