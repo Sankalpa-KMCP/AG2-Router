@@ -1,6 +1,6 @@
 # AG2 Router
 
-A lightweight, native Windows desktop application and service for Antigravity 2 that monitors per-model quota across multiple connected accounts and performs safe, automated account routing.
+A lightweight, native Windows desktop application and service for Antigravity 2 that monitors active per-model quota, tracks observed capacity across connected accounts, and performs safe, automated account routing.
 
 ---
 
@@ -8,8 +8,8 @@ A lightweight, native Windows desktop application and service for Antigravity 2 
 
 AG2 Router eliminates session and quota exhaustion during heavy Antigravity agent workflows:
 
-* **Real-Time Quota Telemetry:** Continuously polls active Antigravity language server telemetry for model quota and prompt/flow credits.
-* **Autonomous Low-Quota Routing:** Automatically identifies low-quota conditions and switches to the highest-priority eligible candidate account.
+* **Real-Time Quota Telemetry:** Continuously polls active Antigravity language server telemetry for active per-model quota alongside informational prompt and flow credit metrics. Connected candidate accounts retain last-observed quota evidence rather than being continuously polled simultaneously.
+* **Autonomous Low-Quota Routing:** Automatically identifies low-quota conditions on the active account and selects among eligible candidate accounts using reserve status, observed usable quota, configured priority, and deterministic tie-breaking.
 * **Workload-Aware Safety Gating:** Strictly prevents account switching whenever Antigravity is active (`BUSY` or running trajectories $> 0$). Switches occur exclusively during verified `IDLE` states.
 * **Per-User Encrypted Session Vault:** Stores account tokens with native Windows DPAPI (`DataProtectionScope.CurrentUser`), preventing plaintext credential exposure.
 * **Tray-First Windows Desktop Architecture:** Runs quietly in the Windows notification area (system tray) with zero background window overhead and instant quick status tooltips.
