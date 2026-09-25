@@ -276,6 +276,8 @@ public class ReleasePackagingTests
     [Theory]
     [InlineData("0.4.0", "v0.4.0", true)]
     [InlineData("0.4.0", "v0.4.1", false)]
+    [InlineData("0.4.0", "V0.4.0", false)]
+    [InlineData("0.4.0", "v0.4.0-beta", false)]
     public void ReleaseTagVersionGuard_AcceptsOnlyTheCanonicalTag(
         string canonicalVersion,
         string tagName,
@@ -296,7 +298,7 @@ public class ReleasePackagingTests
         Assert.Contains("if: github.event_name == 'push' && github.ref_type == 'tag'", workflow);
         Assert.Contains("$expectedTag = \"v${{ steps.version.outputs.version }}\"", workflow);
         Assert.Contains("$actualTag = \"${{ github.ref_name }}\"", workflow);
-        Assert.Contains("if ($actualTag -ne $expectedTag)", workflow);
+        Assert.Contains("if ($actualTag -cne $expectedTag)", workflow);
         Assert.Contains("Release tag/version mismatch", workflow);
 
         int guardPosition = workflow.IndexOf("Verify Release Tag Matches Canonical Version", StringComparison.Ordinal);
@@ -365,9 +367,10 @@ public class ReleasePackagingTests
         string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
         Assert.Contains($"#define AppVersion \"{canonicalVersion}\"", issContent);
 
-        // 4. scripts/package-release.ps1 fallback literal
+        // 4. scripts/package-release.ps1 derives canonical version and fails closed without fallback
         string packageScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "package-release.ps1"));
-        Assert.Contains($"$Version = \"{canonicalVersion}\"", packageScript);
+        Assert.Contains("Could not derive canonical version from $PropsPath. Pass -Version explicitly.", packageScript);
+        Assert.DoesNotContain($"$Version = \"{canonicalVersion}\"", packageScript);
 
         // 5. scripts/install.ps1 fallback literal and dynamic derivation
         string installScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "install.ps1"));
@@ -383,6 +386,85 @@ public class ReleasePackagingTests
         Assert.True(File.Exists(releaseNotesPath), $"Release notes for v{canonicalVersion} must exist at {releaseNotesPath}");
         string releaseNotes = File.ReadAllText(releaseNotesPath);
         Assert.Contains($"**Version:** {canonicalVersion}", releaseNotes);
+    }
+
+    [Fact]
+    public void PackageRelease_ArchiveStep_DoesNotContainDeadVariables()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string packageScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "package-release.ps1"));
+
+        Assert.DoesNotContain("$FilesToZip", packageScript);
+        Assert.Contains("Compress-Archive -Path (Join-Path $PublishDir \"*\")", packageScript);
+    }
+
+    [Fact]
+    public void Workflows_ExplicitMinimalPermissions_AreConfiguredAcrossAllWorkflows()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string[] workflowFiles = ["ci.yml", "dotnet-ci.yml", "release.yml"];
+
+        foreach (string file in workflowFiles)
+        {
+            string path = Path.Combine(repoRoot, ".github", "workflows", file);
+            string content = File.ReadAllText(path);
+
+            Assert.Contains("permissions:", content);
+            Assert.Contains("contents: read", content);
+        }
+    }
+
+    [Fact]
+    public void Workflows_JobTimeoutsAndConcurrency_AreConfiguredAcrossAllWorkflows()
+    {
+        string repoRoot = FindRepositoryRoot();
+
+        // 1. ci.yml: concurrency with cancel-in-progress, timeout-minutes: 15
+        string ci = File.ReadAllText(Path.Combine(repoRoot, ".github", "workflows", "ci.yml"));
+        Assert.Contains("concurrency:", ci);
+        Assert.Contains("cancel-in-progress: true", ci);
+        Assert.Contains("timeout-minutes: 15", ci);
+
+        // 2. dotnet-ci.yml: concurrency with cancel-in-progress, timeout-minutes: 15, no stale branches
+        string dotnetCi = File.ReadAllText(Path.Combine(repoRoot, ".github", "workflows", "dotnet-ci.yml"));
+        Assert.Contains("concurrency:", dotnetCi);
+        Assert.Contains("cancel-in-progress: true", dotnetCi);
+        Assert.Contains("timeout-minutes: 15", dotnetCi);
+        Assert.DoesNotContain("feat/dotnet-native-shell", dotnetCi);
+
+        // 3. release.yml: non-cancelling concurrency, timeout-minutes: 30
+        string release = File.ReadAllText(Path.Combine(repoRoot, ".github", "workflows", "release.yml"));
+        Assert.Contains("concurrency:", release);
+        Assert.Contains("cancel-in-progress: false", release);
+        Assert.Contains("timeout-minutes: 30", release);
+    }
+
+    [Fact]
+    public void Workflows_ActionVersions_ArePinnedToImmutableCommitShas()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string[] workflowFiles = ["ci.yml", "dotnet-ci.yml", "release.yml"];
+        var usesRegex = new Regex(@"uses:\s+(?<action>[a-zA-Z0-9_\-\.\/]+)@(?<ref>[^\s#]+)", RegexOptions.Compiled);
+
+        foreach (string file in workflowFiles)
+        {
+            string path = Path.Combine(repoRoot, ".github", "workflows", file);
+            string content = File.ReadAllText(path);
+
+            var matches = usesRegex.Matches(content);
+            Assert.NotEmpty(matches);
+
+            foreach (Match match in matches)
+            {
+                string action = match.Groups["action"].Value;
+                string actionRef = match.Groups["ref"].Value;
+
+                // Action refs must be 40-character hex commit SHAs
+                Assert.Matches("^[0-9a-f]{40}$", actionRef);
+                Assert.False(actionRef.StartsWith("v", StringComparison.OrdinalIgnoreCase),
+                    $"Action {action} in {file} uses mutable tag '{actionRef}' instead of immutable SHA.");
+            }
+        }
     }
 
     #region Inno Setup Upgrade & Safety Semantics (vNext)

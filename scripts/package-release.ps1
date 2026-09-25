@@ -18,7 +18,7 @@ if (-not $Version) {
         $Version = $propsXml.Project.PropertyGroup.Version
     }
     if (-not $Version) {
-        $Version = "0.4.0"
+        throw "Could not derive canonical version from $PropsPath. Pass -Version explicitly."
     }
 }
 $PublishDir = Join-Path $RepoRoot "publish\win-x64"
@@ -117,8 +117,6 @@ Write-Host "  [PASS] All essential binaries and wwwroot UI assets verified." -Fo
 
 # 5. Package ZIP archive
 Write-Host "[5/6] Creating release archive: $ZipFileName..."
-# Use Compress-Archive with deterministic sorting
-$FilesToZip = Get-ChildItem -Path $PublishDir -Recurse | Sort-Object FullName
 Compress-Archive -Path (Join-Path $PublishDir "*") -DestinationPath $ZipFilePath -CompressionLevel Optimal
 
 $ZipHash = (Get-FileHash -Path $ZipFilePath -Algorithm SHA256).Hash
