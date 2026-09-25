@@ -21,7 +21,7 @@
       }));
     }
     return (quota?.models ?? []).map((model, index) => ({
-      key: `${model.modelOrTier}-${index}`,
+      key: `${model.modelOrTier ?? model.label ?? 'model'}-${index}`,
       label: model.label,
       modes: [] as string[],
       percent: formatQuotaFraction(model.remainingFraction),

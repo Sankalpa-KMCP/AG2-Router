@@ -125,6 +125,18 @@ describe('Frontend Dashboard Business Logic & Truthful Telemetry', () => {
       assert.equal(result!.label, 'Gemini 1.5 Flash');
     });
 
+    it('handles raw models where modelOrTier is null without error or false labeling', () => {
+      const rawModels = [
+        { modelOrTier: null, label: 'Custom Model A', remainingFraction: 0.8 },
+        { modelOrTier: null, label: 'Custom Model B', remainingFraction: 0.4 }
+      ];
+
+      const result = deriveLowestModelQuota(rawModels);
+      assert.notEqual(result, null);
+      assert.equal(result!.percent, 40);
+      assert.equal(result!.label, 'Custom Model B');
+    });
+
     it('should return null for empty or null model lists', () => {
       assert.equal(deriveLowestModelQuota([]), null);
       assert.equal(deriveLowestModelQuota(null), null);

@@ -21,7 +21,7 @@ export interface AccountsListResponse {
 }
 
 export interface RawModelQuotaDto {
-  modelOrTier: string;
+  modelOrTier: string | null;
   label: string;
   remainingFraction: number | null;
   resetTime?: string | null;
@@ -35,8 +35,6 @@ export interface CanonicalModelDto {
   remainingFraction: number | null;
   resetTime?: string | null;
   isExhausted: boolean;
-  timeUntilReset?: string | null;
-  isRollingWindow?: boolean;
 }
 
 export interface CreditPoolDto {
@@ -75,6 +73,7 @@ export interface Ag2StatusDto {
 }
 
 export interface RouterConfigDto {
+  autoSwitchEnabled: boolean;
   lowQuotaThresholdPercent: number;
   minimumCandidateQuotaPercent: number;
   pollingIntervalMs: number;

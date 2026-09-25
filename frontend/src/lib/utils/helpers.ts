@@ -59,7 +59,7 @@ export interface ModelQuotaLike {
   isExhausted?: boolean;
   label?: string;
   displayLabel?: string;
-  modelOrTier?: string;
+  modelOrTier?: string | null;
 }
 
 /**
