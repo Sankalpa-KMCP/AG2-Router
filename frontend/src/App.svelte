@@ -372,6 +372,8 @@
           quota={quotaSnapshot}
           isAg2Connected={Boolean(status?.ag2?.connected)}
           {lowThresholdPercent}
+          currentAccount={status?.telemetry?.currentAccount}
+          onNavigateToTelemetry={() => (activeTab = 'telemetry')}
         />
         <AccountsTable
           {accounts}
