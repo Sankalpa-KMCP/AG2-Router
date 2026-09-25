@@ -32,6 +32,55 @@ public class CoreModelTests
     }
 
     [Fact]
+    public void CanonicalModelQuotaDto_Serialization_DoesNotContainPhantomFields()
+    {
+        var model = new CanonicalModelQuotaDto("tier:pro", "Pro", "pro", 0.4, null, false, ["Standard"]);
+        using var doc = JsonDocument.Parse(JsonSerializer.Serialize(model, JsonSerializerOptions.Web));
+        var root = doc.RootElement;
+
+        Assert.Equal("tier:pro", root.GetProperty("canonicalKey").GetString());
+        Assert.Equal("Pro", root.GetProperty("displayLabel").GetString());
+        Assert.Equal("pro", root.GetProperty("modelOrTier").GetString());
+        Assert.Equal(0.4, root.GetProperty("remainingFraction").GetDouble());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("resetTime").ValueKind);
+        Assert.False(root.GetProperty("isExhausted").GetBoolean());
+        Assert.Single(root.GetProperty("modes").EnumerateArray());
+
+        // AUD-103: Assert phantom fields are NOT emitted by backend
+        Assert.False(root.TryGetProperty("timeUntilReset", out _));
+        Assert.False(root.TryGetProperty("isRollingWindow", out _));
+    }
+
+    [Fact]
+    public void RouterConfigDto_Serialization_EmitsAutoSwitchEnabled()
+    {
+        var config = new RouterConfigDto(AutoSwitchEnabled: true, LowQuotaThresholdPercent: 20, MinimumCandidateQuotaPercent: 35, PollingIntervalMs: 5000);
+        using var doc = JsonDocument.Parse(JsonSerializer.Serialize(config, JsonSerializerOptions.Web));
+        var root = doc.RootElement;
+
+        Assert.True(root.GetProperty("autoSwitchEnabled").GetBoolean());
+        Assert.Equal(20, root.GetProperty("lowQuotaThresholdPercent").GetInt32());
+        Assert.Equal(35, root.GetProperty("minimumCandidateQuotaPercent").GetInt32());
+        Assert.Equal(5000, root.GetProperty("pollingIntervalMs").GetInt32());
+    }
+
+    [Fact]
+    public void ModelQuotaDto_AllowsNullModelOrTier_AndSerializesTruthfully()
+    {
+        var modelWithNullTier = new ModelQuotaDto("Custom Model", null, 0.75, null, false);
+        Assert.Null(modelWithNullTier.ModelOrTier);
+
+        using var doc = JsonDocument.Parse(JsonSerializer.Serialize(modelWithNullTier, JsonSerializerOptions.Web));
+        var root = doc.RootElement;
+
+        Assert.Equal("Custom Model", root.GetProperty("label").GetString());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("modelOrTier").ValueKind);
+        Assert.Equal(0.75, root.GetProperty("remainingFraction").GetDouble());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("resetTime").ValueKind);
+        Assert.False(root.GetProperty("isExhausted").GetBoolean());
+    }
+
+    [Fact]
     public void AccountMetadata_SerializesAndDeserializesCleanly()
     {
         var account = new AccountMetadata(
