@@ -68,7 +68,7 @@ Frontend types are checked internally but not generated from backend serializati
 
 ## Frontend interaction fidelity
 
-CURRENT IMPLEMENTATION has Svelte/TypeScript static checks and a Vite build. test/frontend-dashboard.test.ts exercises reference/helper functions imported from src/dashboard/helpers.ts. test/frontend-provider-quota.test.ts exercises the authored frontend provider-summary helper with synthetic canonical and raw model telemetry. test/frontend-provider-render.test.ts server-renders the authored quota components with synthetic telemetry.
+CURRENT IMPLEMENTATION has Svelte/TypeScript static checks and a Vite build. The dashboard helper implementation is owned by the authored frontend at frontend/src/lib/utils/helpers.ts, and authored frontend code must not import from src/dashboard; test/frontend-boundary.test.ts enforces that boundary. test/frontend-dashboard.test.ts exercises those helpers through the src/dashboard/helpers.ts compatibility re-export. test/frontend-provider-quota.test.ts exercises the authored frontend provider-summary helper with synthetic canonical and raw model telemetry. test/frontend-provider-render.test.ts server-renders the authored quota components with synthetic telemetry.
 
 There is no committed browser or end-to-end suite. Server rendering proves quota markup for supplied props, but does not prove form editing, modal behavior, component reactivity, periodic refresh interaction, WebView2 rendering, or a full dashboard-to-loopback workflow.
 
