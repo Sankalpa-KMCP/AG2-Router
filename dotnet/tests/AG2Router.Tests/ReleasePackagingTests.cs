@@ -274,8 +274,8 @@ public class ReleasePackagingTests
     }
 
     [Theory]
-    [InlineData("0.3.1", "v0.3.1", true)]
-    [InlineData("0.3.1", "v0.3.2", false)]
+    [InlineData("0.4.0", "v0.4.0", true)]
+    [InlineData("0.4.0", "v0.4.1", false)]
     public void ReleaseTagVersionGuard_AcceptsOnlyTheCanonicalTag(
         string canonicalVersion,
         string tagName,
@@ -347,7 +347,7 @@ public class ReleasePackagingTests
         var versionMatch = Regex.Match(propsContent, @"<Version>(?<ver>[^<]+)</Version>");
         Assert.True(versionMatch.Success, "Directory.Build.props must specify <Version>");
         string canonicalVersion = versionMatch.Groups["ver"].Value.Trim();
-        Assert.Equal("0.3.1", canonicalVersion);
+        Assert.Equal("0.4.0", canonicalVersion);
 
         // Assembly, File, and Informational versions must match canonical version
         Assert.Contains($"<AssemblyVersion>{canonicalVersion}</AssemblyVersion>", propsContent);
