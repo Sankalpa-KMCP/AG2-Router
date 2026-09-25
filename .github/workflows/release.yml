@@ -27,6 +27,16 @@ jobs:
           Write-Host "Canonical Version: $canonicalVersion"
           "version=$canonicalVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
+      - name: Verify Release Tag Matches Canonical Version
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $expectedTag = "v${{ steps.version.outputs.version }}"
+          $actualTag = "${{ github.ref_name }}"
+          if ($actualTag -ne $expectedTag) {
+            throw "Release tag/version mismatch. Expected '$expectedTag' but received '$actualTag'."
+          }
+
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:

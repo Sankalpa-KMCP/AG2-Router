@@ -273,6 +273,41 @@ public class ReleasePackagingTests
         Assert.Contains("Compiler engine version: Inno Setup $PinnedVersion", provisioner);
     }
 
+    [Theory]
+    [InlineData("0.3.1", "v0.3.1", true)]
+    [InlineData("0.3.1", "v0.3.2", false)]
+    public void ReleaseTagVersionGuard_AcceptsOnlyTheCanonicalTag(
+        string canonicalVersion,
+        string tagName,
+        bool expectedAccepted)
+    {
+        Assert.Equal(expectedAccepted, IsCanonicalReleaseTag(canonicalVersion, tagName));
+    }
+
+    [Fact]
+    public void ReleaseWorkflow_TagVersionGuardUsesCanonicalVersionAndRunsBeforePackaging()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string workflow = File.ReadAllText(Path.Combine(repoRoot, ".github", "workflows", "release.yml"));
+
+        Assert.Contains("[xml]$props = Get-Content \"dotnet/Directory.Build.props\"", workflow);
+        Assert.Contains("$canonicalVersion = $props.Project.PropertyGroup.Version", workflow);
+        Assert.Contains("\"version=$canonicalVersion\" | Out-File -FilePath $env:GITHUB_OUTPUT", workflow);
+        Assert.Contains("if: github.event_name == 'push' && github.ref_type == 'tag'", workflow);
+        Assert.Contains("$expectedTag = \"v${{ steps.version.outputs.version }}\"", workflow);
+        Assert.Contains("$actualTag = \"${{ github.ref_name }}\"", workflow);
+        Assert.Contains("if ($actualTag -ne $expectedTag)", workflow);
+        Assert.Contains("Release tag/version mismatch", workflow);
+
+        int guardPosition = workflow.IndexOf("Verify Release Tag Matches Canonical Version", StringComparison.Ordinal);
+        int packagingPosition = workflow.IndexOf("Run Release Packaging Procedure", StringComparison.Ordinal);
+        Assert.True(guardPosition >= 0 && guardPosition < packagingPosition,
+            "The tag/version guard must run before release packaging.");
+
+        Assert.Contains("AG2Router-v${{ steps.version.outputs.version }}-win-x64", workflow);
+        Assert.DoesNotContain("-Version ${{ github.ref_name }}", workflow);
+    }
+
     [Fact]
     public void WindowsCi_CompilesInstallerWithPinnedCompilerBeforeTagging()
     {
@@ -637,6 +672,9 @@ public class ReleasePackagingTests
 
         return dir?.FullName ?? Directory.GetCurrentDirectory();
     }
+
+    private static bool IsCanonicalReleaseTag(string canonicalVersion, string tagName) =>
+        string.Equals(tagName, $"v{canonicalVersion}", StringComparison.Ordinal);
 
     #endregion
 }
