@@ -56,12 +56,12 @@ type ModelRow = Pick<RawModelQuotaDto, 'remainingFraction' | 'resetTime' | 'isEx
 export const MODEL_FAMILIES: ModelFamilyDefinition[] = [
   {
     key: 'gemini-flash',
-    displayName: 'Gemini 3.6 Flash',
+    displayName: 'Gemini 3.8 Flash',
     provider: 'Gemini',
     matcher: (id: string) =>
       /(^|[^a-z])gemini(?=$|[^a-z])/i.test(id) &&
       /(^|[^a-z])flash(?=$|[^a-z])/i.test(id) &&
-      /(^|[^0-9])3[._\s-]6([^0-9]|$)/.test(id) &&
+      /(^|[^0-9])3[._\s-]8([^0-9]|$)/.test(id) &&
       !/(^|[^a-z])pro(?=$|[^a-z])/i.test(id)
   },
   {

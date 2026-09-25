@@ -40,7 +40,7 @@ describe('Live Capacity model family grouping & overall capacity', () => {
       timestamp: '2026-01-01T00:00:00Z',
       models: [],
       canonicalModels: [
-        model('gemini-3.6-flash-high', 'Gemini 3.6 Flash High', 0.8),
+        model('gemini-3.8-flash-high', 'Gemini 3.8 Flash High', 0.8),
         model('gemini-3.1-pro-high', 'Gemini 3.1 Pro High', 0.65),
         model('claude-opus-4-6-thinking', 'Claude Opus 4.6', 0.4),
         model('claude-sonnet-4-6', 'Claude Sonnet 4.6', 0.55),
@@ -53,7 +53,7 @@ describe('Live Capacity model family grouping & overall capacity', () => {
     assert.equal(families.length, 4);
     assert.deepEqual(
       families.map((f: { displayName: string }) => f.displayName),
-      ['Gemini 3.6 Flash', 'Gemini 3.1 Pro', 'Opus 4.6', 'Sonnet 4.6']
+      ['Gemini 3.8 Flash', 'Gemini 3.1 Pro', 'Opus 4.6', 'Sonnet 4.6']
     );
     assert.deepEqual(
       families.map((f: { provider: string }) => f.provider),
@@ -64,17 +64,17 @@ describe('Live Capacity model family grouping & overall capacity', () => {
     assert.deepEqual(quota, before, 'Model telemetry snapshot must not be mutated');
   });
 
-  it('handles Gemini 3.6 Flash grouping and derives conservative minimum across variants', () => {
+  it('handles Gemini 3.8 Flash grouping and derives conservative minimum across variants', () => {
     const quota = {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('tier:gemini-3.6-flash:row:0', 'Gemini 3.6 Flash High', 0.85, '2026-01-01T03:00:00Z'),
-        model('tier:gemini-3.6-flash:row:1', 'Gemini 3.6 Flash Low', 0.35, '2026-01-01T03:00:00Z')
+        model('tier:gemini-3.8-flash:row:0', 'Gemini 3.8 Flash High', 0.85, '2026-01-01T03:00:00Z'),
+        model('tier:gemini-3.8-flash:row:1', 'Gemini 3.8 Flash Low', 0.35, '2026-01-01T03:00:00Z')
       ]
     };
     const [flash] = summarizeModelFamilies(quota, 15);
-    assert.equal(flash.displayName, 'Gemini 3.6 Flash');
+    assert.equal(flash.displayName, 'Gemini 3.8 Flash');
     assert.equal(flash.modelCount, 2);
     assert.equal(flash.percent, 35, 'Must use conservative minimum across variants');
     assert.equal(flash.health, 'healthy');
@@ -116,7 +116,7 @@ describe('Live Capacity model family grouping & overall capacity', () => {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('gemini-flash', 'Gemini 3.6 Flash', 0.8),
+        model('gemini-flash', 'Gemini 3.8 Flash', 0.8),
         model('gemini-pro', 'Gemini 3.1 Pro', 0.6),
         model('claude-opus', 'Opus 4.6', 0.2),
         model('claude-sonnet', 'Sonnet 4.6', 0.75)
@@ -137,7 +137,7 @@ describe('Live Capacity model family grouping & overall capacity', () => {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('gemini-flash', 'Gemini 3.6 Flash', 0.9),
+        model('gemini-flash', 'Gemini 3.8 Flash', 0.9),
         model('gemini-pro', 'Gemini 3.1 Pro', null),
         model('claude-sonnet', 'Sonnet 4.6', 0.85)
       ]
@@ -160,7 +160,7 @@ describe('Live Capacity model family grouping & overall capacity', () => {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('gemini-flash', 'Gemini 3.6 Flash', null),
+        model('gemini-flash', 'Gemini 3.8 Flash', null),
         model('claude-sonnet', 'Sonnet 4.6', 0.7),
         model('claude-opus', 'Opus 4.6', null, null, true)
       ]
@@ -182,8 +182,8 @@ describe('Live Capacity model family grouping & overall capacity', () => {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('gemini-flash-1', 'Gemini 3.6 Flash High', 0.8, '2026-01-01T02:00:00Z'),
-        model('gemini-flash-2', 'Gemini 3.6 Flash Low', 0.5, '2026-01-01T05:00:00Z')
+        model('gemini-flash-1', 'Gemini 3.8 Flash High', 0.8, '2026-01-01T02:00:00Z'),
+        model('gemini-flash-2', 'Gemini 3.8 Flash Low', 0.5, '2026-01-01T05:00:00Z')
       ]
     };
     const [flash] = summarizeModelFamilies(quota);
@@ -233,7 +233,7 @@ describe('Live Capacity model family grouping & overall capacity', () => {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('gemini-3.6-flash', 'Gemini 3.6 Flash', 0.8),
+        model('gemini-3.8-flash', 'Gemini 3.8 Flash', 0.8),
         model('claude-sonnet-4-6', 'Sonnet 4.6', 0.6)
       ]
     };
@@ -241,7 +241,7 @@ describe('Live Capacity model family grouping & overall capacity', () => {
     assert.equal(families.length, 2, 'Only observed families must be returned');
     assert.deepEqual(
       families.map((f: { displayName: string }) => f.displayName),
-      ['Gemini 3.6 Flash', 'Sonnet 4.6']
+      ['Gemini 3.8 Flash', 'Sonnet 4.6']
     );
   });
 
@@ -249,8 +249,12 @@ describe('Live Capacity model family grouping & overall capacity', () => {
     const unverifiedModels = [
       model('gemini-2.5-flash', 'Gemini 2.5 Flash', 0.9),
       model('gemini-2.5-pro', 'Gemini 2.5 Pro', 0.9),
+      model('gemini-3.6-flash', 'Gemini 3.6 Flash', 0.9),
       model('gemini-3.7-flash', 'Gemini 3.7 Flash', 0.9),
-      model('gemini-3.8-flash', 'Gemini 3.8 Flash', 0.9),
+      model('gemini-3.9-flash', 'Gemini 3.9 Flash', 0.9),
+      model('gemini-4.0-flash', 'Gemini 4.0 Flash', 0.9),
+      model('gemini-3.80-flash', 'Gemini 3.80 Flash', 0.9),
+      model('gemini-13.8-flash', 'Gemini 13.8 Flash', 0.9),
       model('gemini-4.0-pro', 'Gemini 4.0 Pro', 0.9),
       model('claude-opus-4-5', 'Claude Opus 4.5', 0.9),
       model('claude-opus-4-7', 'Claude Opus 4.7', 0.9),
@@ -294,8 +298,10 @@ describe('Live Capacity model family grouping & overall capacity', () => {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('gemini-3.6-flash-high', 'Gemini 3.6 Flash High', 0.8),
-        // An exhausted unverified version that must NOT drag down Gemini 3.6 Flash
+        model('gemini-3.8-flash-high', 'Gemini 3.8 Flash High', 0.8),
+        // Exhausted unverified/prior versions that must NOT drag down Gemini 3.8 Flash
+        model('gemini-3.6-flash', 'Gemini 3.6 Flash', 0.0, null, true),
+        model('gemini-3.7-flash', 'Gemini 3.7 Flash', 0.0, null, true),
         model('gemini-2.5-flash', 'Gemini 2.5 Flash', 0.0, null, true),
         // An exhausted unverified Claude model that must NOT drag down Sonnet 4.6
         model('claude-sonnet-4-5', 'Claude Sonnet 4.5', 0.0, null, true),
@@ -307,8 +313,9 @@ describe('Live Capacity model family grouping & overall capacity', () => {
     assert.equal(families.length, 2);
 
     const flash = families.find((f: { key: string }) => f.key === 'gemini-flash');
-    assert.ok(flash, 'Gemini 3.6 Flash family must be present');
-    assert.equal(flash.percent, 80, 'Must not be contaminated by Gemini 2.5 Flash');
+    assert.ok(flash, 'Gemini 3.8 Flash family must be present');
+    assert.equal(flash.displayName, 'Gemini 3.8 Flash');
+    assert.equal(flash.percent, 80, 'Must not be contaminated by Gemini 3.6, 3.7, or 2.5 Flash');
     assert.equal(flash.isExhausted, false);
     assert.equal(flash.health, 'healthy');
 
@@ -328,7 +335,7 @@ describe('Live Capacity model family grouping & overall capacity', () => {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('gemini-3.6-flash', 'Gemini 3.6 Flash', 0.8),
+        model('gemini-3.8-flash', 'Gemini 3.8 Flash', 0.8),
         model('gemini-3_1-pro', 'Gemini 3-1 Pro', 0.7),
         model('claude-opus-4-6-thinking', 'Claude Opus 4.6', 0.6),
         model('claude-sonnet-4_6', 'Claude Sonnet 4_6', 0.5)
@@ -338,8 +345,25 @@ describe('Live Capacity model family grouping & overall capacity', () => {
     assert.equal(families.length, 4);
     assert.deepEqual(
       families.map((f: { displayName: string }) => f.displayName),
-      ['Gemini 3.6 Flash', 'Gemini 3.1 Pro', 'Opus 4.6', 'Sonnet 4.6']
+      ['Gemini 3.8 Flash', 'Gemini 3.1 Pro', 'Opus 4.6', 'Sonnet 4.6']
     );
+  });
+
+  it('matches Gemini 3.8 Flash across separator variations (3.8, 3-8, 3_8)', () => {
+    const quota = {
+      timestamp: '',
+      models: [],
+      canonicalModels: [
+        model('gemini-3.8-flash', 'Gemini 3.8 Flash', 0.85),
+        model('gemini-3-8-flash', 'Gemini 3-8 Flash', 0.65),
+        model('gemini-3_8-flash', 'Gemini 3_8 Flash', 0.70)
+      ]
+    };
+    const families = summarizeModelFamilies(quota);
+    assert.equal(families.length, 1);
+    assert.equal(families[0].displayName, 'Gemini 3.8 Flash');
+    assert.equal(families[0].modelCount, 3);
+    assert.equal(families[0].percent, 65, 'Must derive conservative minimum across separator variants');
   });
 });
 
@@ -349,7 +373,7 @@ describe('backward compatibility provider summaries', () => {
       timestamp: '',
       models: [],
       canonicalModels: [
-        model('gemini-3.6-flash', 'Gemini 3.6 Flash', 0.75),
+        model('gemini-3.8-flash', 'Gemini 3.8 Flash', 0.75),
         model('claude-sonnet-4-6', 'Claude Sonnet 4.6', 0.5)
       ]
     };

@@ -14,7 +14,7 @@ const quota = {
   flowCredits: { availableCredits: 200 },
   models: [],
   canonicalModels: [
-    { canonicalKey: 'gemini-flash', displayLabel: 'Gemini 3.6 Flash', modes: ['High'], remainingFraction: 0.8, resetTime: '2026-01-02T00:00:00Z', isExhausted: false },
+    { canonicalKey: 'gemini-flash', displayLabel: 'Gemini 3.8 Flash', modes: ['High'], remainingFraction: 0.8, resetTime: '2026-01-02T00:00:00Z', isExhausted: false },
     { canonicalKey: 'gemini-pro', displayLabel: 'Gemini 3.1 Pro', modes: [], remainingFraction: 0.3, resetTime: '2026-01-03T00:00:00Z', isExhausted: false },
     { canonicalKey: 'claude-sonnet-4-6', displayLabel: 'Claude Sonnet 4.6', modes: [], remainingFraction: null, resetTime: null, isExhausted: false },
     { canonicalKey: 'gpt-oss', displayLabel: 'GPT-OSS', modes: [], remainingFraction: 0.9, resetTime: null, isExhausted: false }
@@ -25,7 +25,7 @@ const completeQuota = {
   timestamp: '2026-01-01T00:00:00Z',
   models: [],
   canonicalModels: [
-    { canonicalKey: 'gemini-flash', displayLabel: 'Gemini 3.6 Flash', modes: [], remainingFraction: 0.85, resetTime: '2026-01-02T00:00:00Z', isExhausted: false },
+    { canonicalKey: 'gemini-flash', displayLabel: 'Gemini 3.8 Flash', modes: [], remainingFraction: 0.85, resetTime: '2026-01-02T00:00:00Z', isExhausted: false },
     { canonicalKey: 'gemini-pro', displayLabel: 'Gemini 3.1 Pro', modes: [], remainingFraction: 0.6, resetTime: '2026-01-02T00:00:00Z', isExhausted: false },
     { canonicalKey: 'claude-opus', displayLabel: 'Opus 4.6', modes: [], remainingFraction: 0.25, resetTime: '2026-01-02T00:00:00Z', isExhausted: false },
     { canonicalKey: 'claude-sonnet', displayLabel: 'Sonnet 4.6', modes: [], remainingFraction: 0.7, resetTime: '2026-01-02T00:00:00Z', isExhausted: false },
@@ -64,9 +64,9 @@ describe('authored quota components', () => {
     assert.match(body, /dev@example\.com/);
     assert.match(body, /3 model families observed/);
 
-    // Observed family cards (Gemini 3.6 Flash, Gemini 3.1 Pro, Sonnet 4.6)
+    // Observed family cards (Gemini 3.8 Flash, Gemini 3.1 Pro, Sonnet 4.6)
     assert.equal((body.match(/<article\b/g) ?? []).length, 3);
-    assert.match(body, /Gemini 3\.6 Flash/);
+    assert.match(body, /Gemini 3\.8 Flash/);
     assert.match(body, /Gemini 3\.1 Pro/);
     assert.match(body, /Sonnet 4\.6/);
 
@@ -90,7 +90,7 @@ describe('authored quota components', () => {
 
     // All 4 verified model families rendered
     assert.equal((body.match(/<article\b/g) ?? []).length, 4);
-    assert.match(body, /Gemini 3\.6 Flash/);
+    assert.match(body, /Gemini 3\.8 Flash/);
     assert.match(body, /Gemini 3\.1 Pro/);
     assert.match(body, /Opus 4\.6/);
     assert.match(body, /Sonnet 4\.6/);
@@ -103,7 +103,7 @@ describe('authored quota components', () => {
 
   it('keeps individual model rows in the detailed view without credit presentation', () => {
     const { body } = renderComponent(QuotaSection, { props: { quota, isAg2Connected: true, lowThresholdPercent: 15 } });
-    for (const label of ['Gemini 3.6 Flash', 'Gemini 3.1 Pro', 'Claude Sonnet', 'GPT-OSS']) {
+    for (const label of ['Gemini 3.8 Flash', 'Gemini 3.1 Pro', 'Claude Sonnet', 'GPT-OSS']) {
       assert.match(body, new RegExp(label));
     }
     assert.doesNotMatch(body, /CREDIT POOLS|Prompt Credits|Flow Credits/);
