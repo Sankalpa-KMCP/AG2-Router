@@ -198,8 +198,6 @@ public sealed class LoopbackRouterApiTests : IAsyncDisposable
         public ManualSwitchToken NotifyManualSwitchStarted(string targetAccountId) => new(1);
         public Task NotifyManualSwitchCompletedAsync(ManualSwitchToken token, NativeSwitchResult result) => Task.CompletedTask;
 
-        public void Start() { }
-        public Task StopAsync() => Task.CompletedTask;
         public Task<SelectionResult> EvaluateCycleAsync(CancellationToken cancellationToken = default)
             => Task.FromResult(new SelectionResult(false, "Fake", null, null, null, Array.Empty<CandidateEvaluation>()));
 

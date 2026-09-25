@@ -1,3 +1,4 @@
+using System.IO;
 using AG2Router.App.Services;
 using AG2Router.App.Views;
 using AG2Router.Core.Contracts;
@@ -62,6 +63,26 @@ public class MockAG2Adapter : IAG2Adapter
             ? GetActivityStateFunc(cancellationToken)
             : Task.FromResult(new ActivityStatusDto("OFFLINE", 0, 0, DateTime.UtcNow.ToString("o")));
     }
+}
+
+public class MockAutoRouter : INativeAutoRouter
+{
+    public Func<CancellationToken, Task<SelectionResult>>? EvaluateCycleFunc { get; set; }
+    public RouterStatusDto Status { get; set; } = new(
+        RoutingSafetyGateState.Idle, false, null, null, null, null, "Mock reason",
+        new RouterConfigDto(AutoSwitchEnabled: false, LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30));
+
+    public RouterConfigDto GetConfig() => Status.Config;
+    public RouterConfigDto UpdateConfig(RouterConfigDto updates) => updates;
+    public RouterStatusDto GetStatus() => Status;
+    public void ResetManualRecovery() { }
+    public ManualSwitchToken NotifyManualSwitchStarted(string targetAccountId) => new(1);
+    public Task NotifyManualSwitchCompletedAsync(ManualSwitchToken token, NativeSwitchResult result) => Task.CompletedTask;
+    public Task<SelectionResult> EvaluateCycleAsync(CancellationToken cancellationToken = default)
+        => EvaluateCycleFunc != null
+            ? EvaluateCycleFunc(cancellationToken)
+            : Task.FromResult(new SelectionResult(false, "Mock", null, null, null, Array.Empty<CandidateEvaluation>()));
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
 public class TelemetryPollingCoordinatorTests
@@ -405,5 +426,97 @@ public class TelemetryPollingCoordinatorTests
         Assert.Null(status.Router.ActiveAccountId);
         Assert.Null(status.Router.ActiveAccountEmail);
         Assert.Contains("Account none active with 0 models.", status.Router.LastDecisionReason);
+    }
+
+    [Fact]
+    public async Task PollAsync_WhenAutoRouterEvaluateCycleThrows_LogsSanitizedErrorAndContinuesSnapshotAssembly()
+    {
+        var logs = new List<string>();
+        var autoRouter = new MockAutoRouter
+        {
+            EvaluateCycleFunc = _ => throw new InvalidOperationException("Evaluation token=secret123 failed")
+        };
+
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "Connected")),
+            GetAccountQuotaObservationFunc = _ => Task.FromResult(new AccountQuotaObservation(
+                new AccountIdentityDto("user@example.com"),
+                new QuotaSnapshotDto(DateTime.UtcNow.ToString("o"), new List<ModelQuotaDto>(), null, null)))
+        };
+
+        var coordinator = new TelemetryPollingCoordinator(adapter, autoRouter: autoRouter, log: logs.Add);
+
+        await coordinator.PollAsync();
+
+        Assert.Single(logs);
+        Assert.StartsWith("AutoRouter evaluation cycle failed: InvalidOperationException:", logs[0]);
+        Assert.Contains("[REDACTED]", logs[0]);
+        Assert.DoesNotContain("secret123", logs[0]);
+
+        var status = coordinator.CurrentStatus;
+        Assert.True(status.Ag2.Connected);
+        Assert.NotNull(status.Telemetry);
+        Assert.Equal("user@example.com", status.Telemetry.CurrentAccount?.Email);
+    }
+
+    [Fact]
+    public async Task PollAsync_WhenCanceled_DoesNotLogError()
+    {
+        var logs = new List<string>();
+        var adapter = new MockAG2Adapter();
+        var coordinator = new TelemetryPollingCoordinator(adapter, log: logs.Add);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await coordinator.PollAsync(cts.Token);
+
+        Assert.Empty(logs);
+    }
+
+    [Fact]
+    public async Task PollAsync_WhenAdapterThrows_LogsSanitizedErrorAndAppliesFallback()
+    {
+        var logs = new List<string>();
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ => throw new IOException("Network failure with password=mySecretPass")
+        };
+
+        var coordinator = new TelemetryPollingCoordinator(adapter, log: logs.Add);
+
+        await coordinator.PollAsync();
+
+        Assert.Single(logs);
+        Assert.StartsWith("Telemetry polling failed: IOException:", logs[0]);
+        Assert.Contains("[REDACTED]", logs[0]);
+        Assert.DoesNotContain("mySecretPass", logs[0]);
+
+        var status = coordinator.CurrentStatus;
+        Assert.Equal("error", status.Status);
+        Assert.False(status.Ag2.Connected);
+    }
+
+    [Fact]
+    public async Task PollAsync_WhenStatusUpdatedSubscriberThrows_LogsSanitizedError()
+    {
+        var logs = new List<string>();
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "Connected")),
+            GetAccountQuotaObservationFunc = _ => Task.FromResult(new AccountQuotaObservation(
+                new AccountIdentityDto("user@example.com"), null))
+        };
+
+        var coordinator = new TelemetryPollingCoordinator(adapter, log: logs.Add);
+        coordinator.StatusUpdated += _ => throw new InvalidOperationException("Subscriber bearer: secretBearerToken crash");
+
+        await coordinator.PollAsync();
+
+        Assert.Single(logs);
+        Assert.StartsWith("StatusUpdated subscriber threw an exception: InvalidOperationException:", logs[0]);
+        Assert.Contains("[REDACTED]", logs[0]);
+        Assert.DoesNotContain("secretBearerToken", logs[0]);
     }
 }
