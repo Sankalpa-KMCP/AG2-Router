@@ -12,6 +12,7 @@ namespace AG2Router.App.Services;
 /// 2. Stale response suppression via monotonic sequence numbering.
 /// 3. Lockless atomic reads for Kestrel loopback server and UI views.
 /// 4. Prompt cancellation during application shutdown.
+/// 5. Coherent account identity and quota observation derived from a single upstream response.
 /// </summary>
 public class TelemetryPollingCoordinator : IAsyncDisposable
 {
@@ -178,8 +179,9 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
             SystemStatusDto newStatus;
             if (ag2Status.Connected)
             {
-                var account = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
-                var quota = await _adapter.GetQuotaAsync(cancellationToken).ConfigureAwait(false);
+                var observation = await _adapter.GetAccountQuotaObservationAsync(cancellationToken).ConfigureAwait(false);
+                var account = observation?.Account;
+                var quota = observation?.Quota;
 
                 // Check for stale response before assembling snapshot
                 if (sequence < Volatile.Read(ref _lastAppliedSequence))
