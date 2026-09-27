@@ -166,6 +166,10 @@ describe('AppServer (Loopback HTTP & API)', () => {
     const invalidPayloads = [
       { pollingIntervalMs: 0 },
       { pollingIntervalMs: -100 },
+      { pollingIntervalMs: 0.5 },
+      { pollingIntervalMs: 1.5 },
+      { pollingIntervalMs: 2147483648 },
+      { pollingIntervalMs: 99999999999 },
       { lowQuotaThresholdPercent: 4 },
       { lowQuotaThresholdPercent: 55 },
       { minimumCandidateQuotaPercent: 9 },
@@ -187,6 +191,38 @@ describe('AppServer (Loopback HTTP & API)', () => {
       const checkRes = await request('/api/config');
       assert.deepEqual(JSON.parse(checkRes.body).config, baselineCfg);
     }
+  });
+
+  it('should accept 1 ms polling interval via POST /api/config proving 1 ms is valid and 2000 ms is not backend minimum', async () => {
+    const postRes = await request('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pollingIntervalMs: 1 })
+    } as http.RequestOptions & { body: string });
+
+    assert.equal(postRes.status, 200);
+    const updated = JSON.parse(postRes.body).config;
+    assert.equal(updated.pollingIntervalMs, 1);
+
+    const checkRes = await request('/api/config');
+    assert.equal(checkRes.status, 200);
+    assert.equal(JSON.parse(checkRes.body).config.pollingIntervalMs, 1);
+  });
+
+  it('should accept 2147483647 ms polling interval via POST /api/config proving Int32.MaxValue is valid', async () => {
+    const postRes = await request('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pollingIntervalMs: 2147483647 })
+    } as http.RequestOptions & { body: string });
+
+    assert.equal(postRes.status, 200);
+    const updated = JSON.parse(postRes.body).config;
+    assert.equal(updated.pollingIntervalMs, 2147483647);
+
+    const checkRes = await request('/api/config');
+    assert.equal(checkRes.status, 200);
+    assert.equal(JSON.parse(checkRes.body).config.pollingIntervalMs, 2147483647);
   });
 
   it('should reject non-object or malformed body via POST /api/config', async () => {
