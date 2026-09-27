@@ -14,14 +14,7 @@ stay in `docs/known-limitations.md`.
 
 ## Now — verified defects
 
-### TODO-002 · OPEN DEFECT · Misleading enrollment contention wording (AUD-110)
-
-- Priority: 2 — user-facing correctness of operator guidance; no state corruption.
-- Problem: in `AccountEnrollmentService.EnrollCoreAsync` (`dotnet/src/AG2Router.AG2/Accounts/AccountEnrollmentService.cs`), a timeout waiting on the per-identity enrollment lock throws `AccountEnrollmentException` claiming "manual recovery is required", although no quarantine is marked and the condition is ordinary contention that a retry resolves. The same wording pattern appears on the lifecycle resource-lock wait in the same method. Every genuinely uncertain outcome in this service throws a quarantine-marking variant; these two messages overstate the condition on a user-facing API error.
-- Why it matters: the dashboard relays the message verbatim, instructing users toward a recovery action that is not actually required.
-- Evidence: `dotnet/src/AG2Router.AG2/Accounts/AccountEnrollmentService.cs` (lock-wait failure paths in `EnrollCoreAsync`, contrasted with the `RecoveryUncertainEnrollmentException` paths that do quarantine).
-- Completion criteria: contention/timeout wording distinguishes a retryable ownership wait from manual recovery; a focused test asserts the message/state contract; lock ownership and quarantine behavior unchanged.
-- Dependencies: none.
+No verified defects currently open.
 
 ## Next — planned engineering
 
@@ -116,3 +109,4 @@ Owned by `docs/known-limitations.md` and the subject documents; recorded here on
 - AUD-001 release tag/version guard — fixed: the release workflow derives the canonical version from `dotnet/Directory.Build.props` and fails on mismatch.
 - AUD-101 through AUD-108 — closed; re-verified fixed at the HEAD shown above: frontend helper ownership with import-boundary test (AUD-101), unified account/quota observation (AUD-102), frontend API type alignment with drift test (AUD-103), dead-seam removal in `NativeAutoRouter` (AUD-104), case-sensitive release tag guard (AUD-105), workflow permissions/concurrency/timeouts (AUD-106), action SHA pinning (AUD-107), truthful README routing wording (AUD-108). Reopen only on regression evidence.
 - TODO-001 · CLOSED · RouterConfig has no server-side validation boundary (AUD-109) — closed via PR #25 (`fix: validate router configuration`): authoritative RouterConfig validation rejects invalid API and runtime configuration before persistence or application; invalid persisted configuration fails closed before polling or routing startup; routing threshold bounds are enforced across .NET and the TypeScript reference server; startup configuration errors retain actionable validation detail without exposing the full config filesystem path in user-facing dialogs; full diagnostic exception context preserved in application logs; covered by focused negative and regression tests.
+- TODO-002 · CLOSED · Misleading enrollment contention wording (AUD-110) — closed via PR #28 (`fix: clarify enrollment contention errors`, commit `d33b59e382015081adc5b1194b0cee14d0fa229c`, merged as `57a076137eee412b04b6f156f1d0407ab798caa6`): retryable per-identity enrollment and lifecycle ownership contention timeouts report retry guidance instead of claiming manual recovery; ordinary contention paths remain non-quarantining; genuinely uncertain and quarantined enrollment paths retain manual-recovery semantics; covered by deterministic regression tests for both contention branches; post-merge CI verified successful.
