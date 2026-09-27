@@ -16,7 +16,7 @@ Evidence and wire-contract detail: [api-contracts.md](api-contracts.md).
 
 ## Configuration and polling
 
-- No verified configuration/polling gap currently open. Router configuration persists atomically via IDurableFileWriter, PollingIntervalMs dynamically reconfigures the active telemetry timer, and the frontend config form is protected against polling clobbering by dirty-state tracking.
+- No verified configuration/polling gap currently open. Router configuration bounds (positive polling interval >= 1ms, low-quota threshold 5–50%, candidate threshold 10–90%) are authoritatively enforced by RouterConfigValidator across API ingestion, runtime mutations, and persisted config loading; configuration persists atomically via IDurableFileWriter; PollingIntervalMs dynamically reconfigures the active telemetry timer; and the frontend config form is protected against polling clobbering by dirty-state tracking.
 
 Evidence and lifecycle detail: [persistence-and-concurrency.md](persistence-and-concurrency.md).
 

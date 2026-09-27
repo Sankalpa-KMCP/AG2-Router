@@ -3,6 +3,7 @@ using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Security;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
+using AG2Router.Core.Validation;
 
 namespace AG2Router.AG2.Routing;
 
@@ -64,6 +65,11 @@ public class NativeAutoRouter : INativeAutoRouter
         _configFilePath = configFilePath;
         _fileWriter = fileWriter ?? (!string.IsNullOrEmpty(configFilePath) ? new DurableFileWriter() : null);
 
+        if (initialConfig != null)
+        {
+            RouterConfigValidator.Validate(initialConfig);
+        }
+
         RouterConfigDto? loadedConfig = null;
         if (!string.IsNullOrEmpty(_configFilePath) && File.Exists(_configFilePath))
         {
@@ -72,7 +78,26 @@ public class NativeAutoRouter : INativeAutoRouter
                 var json = File.ReadAllText(_configFilePath);
                 loadedConfig = JsonSerializer.Deserialize<RouterConfigDto>(json);
             }
-            catch { }
+            catch (JsonException ex)
+            {
+                throw new InvalidDataException($"Router configuration file '{_configFilePath}' is malformed.", ex);
+            }
+
+            if (loadedConfig != null)
+            {
+                try
+                {
+                    RouterConfigValidator.Validate(loadedConfig);
+                }
+                catch (ArgumentException ex)
+                {
+                    throw new InvalidDataException($"Router configuration file '{_configFilePath}' contains invalid configuration: {ex.Message}", ex);
+                }
+            }
+            else
+            {
+                throw new InvalidDataException($"Router configuration file '{_configFilePath}' contains invalid configuration.");
+            }
         }
 
         _config = initialConfig ?? loadedConfig ?? new RouterConfigDto();
@@ -92,6 +117,7 @@ public class NativeAutoRouter : INativeAutoRouter
     public RouterConfigDto UpdateConfig(RouterConfigDto updates)
     {
         ArgumentNullException.ThrowIfNull(updates);
+        RouterConfigValidator.Validate(updates);
         lock (_stateLock)
         {
             if (!string.IsNullOrEmpty(_configFilePath) && _fileWriter != null)

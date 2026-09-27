@@ -1,8 +1,10 @@
+using System.Text.RegularExpressions;
 using System.Windows;
 using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Adapter;
 using AG2Router.AG2.Discovery;
 using AG2Router.AG2.Routing;
+using AG2Router.AG2.Security;
 using AG2Router.AG2.Switching;
 using AG2Router.AG2.Vault;
 using AG2Router.App.Diagnostics;
@@ -208,7 +210,7 @@ public partial class App : System.Windows.Application
         {
             Log($"Startup failed with exception: {ex}");
             System.Windows.MessageBox.Show(
-                $"An error occurred while starting AG2 Router: {ex.Message}",
+                FormatStartupErrorMessage(ex),
                 "AG2 Router Startup Error",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error
@@ -342,5 +344,122 @@ public partial class App : System.Windows.Application
         Log($"App.OnExit called with exit code {e.ApplicationExitCode}");
         _trayIconManager?.Dispose();
         base.OnExit(e);
+    }
+
+    /// <summary>
+    /// Formats an actionable startup error message preserving the high-level context and appending inner validation details
+    /// when safe and not already included, while strictly sanitizing and redacting tokens/credentials and omitting stack traces.
+    /// </summary>
+    public static string FormatStartupErrorMessage(Exception ex)
+    {
+        if (ex == null)
+        {
+            return "An error occurred while starting AG2 Router: An unexpected error occurred.";
+        }
+
+        const string prefix = "An error occurred while starting AG2 Router: ";
+        string primary = SanitizeConfigPath(StripStackTraces(ex.Message ?? string.Empty).Trim());
+
+        string result;
+        if (string.IsNullOrWhiteSpace(primary))
+        {
+            result = "An error occurred while starting AG2 Router.";
+        }
+        else if (primary.StartsWith("An error occurred while starting AG2 Router", StringComparison.OrdinalIgnoreCase))
+        {
+            result = primary;
+        }
+        else
+        {
+            result = prefix + primary;
+        }
+
+        IEnumerable<Exception> innerExceptions = ex switch
+        {
+            AggregateException agg => agg.Flatten().InnerExceptions,
+            _ => GetInnerExceptions(ex)
+        };
+
+        foreach (var inner in innerExceptions)
+        {
+            string detail = SanitizeConfigPath(StripStackTraces(inner.Message ?? string.Empty).Trim());
+            if (!string.IsNullOrWhiteSpace(detail) &&
+                !result.Contains(detail, StringComparison.OrdinalIgnoreCase))
+            {
+                if (result.EndsWith('.'))
+                {
+                    result = $"{result.TrimEnd('.')}: {detail}";
+                }
+                else if (result.EndsWith(':'))
+                {
+                    result = $"{result} {detail}";
+                }
+                else
+                {
+                    result = $"{result}: {detail}";
+                }
+            }
+        }
+
+        string sanitized = SanitizeConfigPath(result);
+        sanitized = AG2Security.SanitizeCommandLine(sanitized);
+        sanitized = AG2Security.RedactSensitiveText(sanitized);
+        return sanitized;
+    }
+
+    private static readonly Regex ConfigPathRegex = new(
+        @"Router configuration file '(?<path>.*?)'(?<suffix>\s+(?:contains invalid configuration|is malformed))",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+    private static string SanitizeConfigPath(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return message;
+
+        return ConfigPathRegex.Replace(message, match =>
+        {
+            string rawPath = match.Groups["path"].Value;
+            string fileName = string.Empty;
+            try
+            {
+                fileName = System.IO.Path.GetFileName(rawPath);
+            }
+            catch
+            {
+                // Fall back if path contains invalid characters
+            }
+
+            if (string.IsNullOrWhiteSpace(fileName) || string.Equals(fileName, "config.json", StringComparison.OrdinalIgnoreCase))
+            {
+                fileName = "config.json";
+            }
+
+            string suffix = match.Groups["suffix"].Value;
+            return $"Router configuration file '{fileName}'{suffix}";
+        });
+    }
+
+    private static IEnumerable<Exception> GetInnerExceptions(Exception ex)
+    {
+        var current = ex.InnerException;
+        while (current != null)
+        {
+            yield return current;
+            current = current.InnerException;
+        }
+    }
+
+    private static string StripStackTraces(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
+        var lines = text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+        var filtered = lines.Where(line =>
+        {
+            var trimmed = line.TrimStart();
+            if (trimmed.StartsWith("at ", StringComparison.OrdinalIgnoreCase)) return false;
+            if (trimmed.StartsWith("in ", StringComparison.OrdinalIgnoreCase) && trimmed.Contains(":line ")) return false;
+            if (trimmed.StartsWith("--- End of stack trace", StringComparison.OrdinalIgnoreCase)) return false;
+            return true;
+        });
+        return string.Join(Environment.NewLine, filtered).Trim();
     }
 }

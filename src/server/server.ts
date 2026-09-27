@@ -491,7 +491,11 @@ export class AppServer {
     // POST /api/config
     if (pathname === '/api/config' && method === 'POST') {
       try {
-        const body = (await this.readBodyJson(req)) as Record<string, unknown>;
+        const raw = await this.readBodyJson(req);
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+          throw new Error('Invalid configuration payload');
+        }
+        const body = raw as Record<string, unknown>;
         const updates: Record<string, unknown> = {};
 
         if (typeof body.autoSwitchEnabled === 'boolean') {

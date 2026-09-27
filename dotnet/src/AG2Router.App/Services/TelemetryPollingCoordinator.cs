@@ -40,6 +40,10 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         Action<string>? log = null)
     {
         _adapter = adapter;
+        if (interval.HasValue && interval.Value <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(interval), "Polling interval must be positive.");
+        }
         _interval = interval ?? TimeSpan.FromSeconds(10);
         _autoRouter = autoRouter;
         _log = log;
@@ -111,6 +115,11 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
             PeriodicTimer timer;
             lock (_stateLock)
             {
+                if (_interval <= TimeSpan.Zero)
+                {
+                    _log?.Invoke("Polling interval must be positive; cannot start timer.");
+                    return;
+                }
                 _timer = new PeriodicTimer(_interval);
                 timer = _timer;
             }
