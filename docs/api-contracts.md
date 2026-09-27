@@ -13,6 +13,7 @@ Source and tests remain authoritative. The intended contract below is separated 
 - Error bodies generally use { "error": "safe message" }. Callers must also use the HTTP status; error text is not a stable machine code.
 - DTO additions may be tolerated by JavaScript, but renames, type changes, nullability changes, and enum/result-code changes are wire-contract changes.
 - Non-finite quota fractions are emitted as null (unknown) at the status boundary, never as invalid JSON or an endpoint error; observed zero remains zero.
+- Numeric integer wire representation: Clients should transmit `PollingIntervalMs` as a JSON numeric integer. The .NET JSON binding path strictly requires integer numeric JSON representation and rejects fractional numeric tokens, including lexical forms such as `1.0`. The JavaScript reference operates after JSON parsing, where `1` and `1.0` collapse to the identical value. Although the ASP.NET Core web-default binder tolerates quoted integer strings such as `"1"`, that coercion is non-normative and not accepted by the TypeScript reference.
 
 Trust checks and their limits are defined in [security-and-trust-model.md](security-and-trust-model.md).
 
@@ -65,7 +66,7 @@ Do not describe loopback binding or Origin checks as user authentication. See [s
 Common meanings in current handlers:
 
 - 400: invalid payload, invalid identifier, validation failure, or rejected enrollment input. For POST /api/config, RouterConfigValidator enforces:
-  - PollingIntervalMs >= 1 (must be positive).
+  - PollingIntervalMs: JSON numeric integer in the Int32 range (1..2147483647 ms; default 10000 ms). The dashboard form exposes a more conservative 2–60 second range (whole-second granularity) as a UI/UX guard, but that is a frontend input constraint, not the backend validity floor. Sub-2-second API and persisted values (1–1999 ms) remain contract-valid without automatic clamping or migration. Aggressive polling intervals produce near-continuous serialized polling and increased local RPC, CPU, and lock-file activity; external-service tolerance and rate-limiting behavior under aggressive polling intervals are unknown.
   - LowQuotaThresholdPercent between 5 and 50 inclusive.
   - MinimumCandidateQuotaPercent between 10 and 90 inclusive.
   Any value outside these ranges is rejected with 400 Bad Request prior to lock acquisition or persistence.

@@ -16,7 +16,8 @@ Evidence and wire-contract detail: [api-contracts.md](api-contracts.md).
 
 ## Configuration and polling
 
-- No verified configuration/polling gap currently open. Router configuration bounds (positive polling interval >= 1ms, low-quota threshold 5–50%, candidate threshold 10–90%) are authoritatively enforced by RouterConfigValidator across API ingestion, runtime mutations, and persisted config loading; configuration persists atomically via IDurableFileWriter; PollingIntervalMs dynamically reconfigures the active telemetry timer; and the frontend config form is protected against polling clobbering by dirty-state tracking.
+- No verified configuration/polling gap currently open. Router configuration bounds (integer polling interval 1..2147483647 ms with 10000 ms default, low-quota threshold 5–50%, candidate threshold 10–90%) are authoritatively enforced by RouterConfigValidator across API ingestion, runtime mutations, and persisted config loading; configuration persists atomically via IDurableFileWriter; PollingIntervalMs dynamically reconfigures the active telemetry timer; and the frontend config form is protected against polling clobbering by dirty-state tracking.
+- Intentional layered difference: the backend/persisted validity range is integer 1..2147483647 ms, whereas the dashboard UI exposes a 2–60 second range (whole-second granularity) as a conservative UI/UX guard. Sub-2-second API and persisted values (1–1999 ms) remain contract-valid without automatic clamping or migration. Aggressive polling produces near-continuous serialized polling, increasing local RPC, CPU, and lock-file activity; external-service tolerance and rate-limit behavior under aggressive polling are unknown.
 
 Evidence and lifecycle detail: [persistence-and-concurrency.md](persistence-and-concurrency.md).
 

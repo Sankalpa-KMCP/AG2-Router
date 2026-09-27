@@ -18,12 +18,20 @@ import {
   SelectionResult
 } from './types.js';
 
+export const MIN_POLLING_INTERVAL_MS = 1;
+export const MAX_POLLING_INTERVAL_MS = 2147483647;
+
 export function validateRouterConfig(config: RouterConfig): void {
   if (!config) {
     throw new Error('Router configuration must not be null or undefined.');
   }
-  if (typeof config.pollingIntervalMs !== 'number' || !Number.isFinite(config.pollingIntervalMs) || config.pollingIntervalMs <= 0) {
-    throw new RangeError('Polling interval must be positive.');
+  if (
+    typeof config.pollingIntervalMs !== 'number' ||
+    !Number.isInteger(config.pollingIntervalMs) ||
+    config.pollingIntervalMs < MIN_POLLING_INTERVAL_MS ||
+    config.pollingIntervalMs > MAX_POLLING_INTERVAL_MS
+  ) {
+    throw new RangeError('Polling interval must be an integer between 1 and 2147483647 ms.');
   }
   if (
     typeof config.lowQuotaThresholdPercent !== 'number' ||
