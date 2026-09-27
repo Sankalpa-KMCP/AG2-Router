@@ -837,6 +837,86 @@ public class AccountEnrollmentServiceTests : IDisposable
             () => _sessionVault.HasSessionAsync(pending.Id));
     }
 
+    [Fact]
+    public async Task EnrollmentLockContention_ReportsRetryableContention_WithoutManualRecoveryOrQuarantine()
+    {
+        const string email = "identity-contention@example.com";
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email, Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+
+        var delayingStore = new DelayingAccountStore(_accountStore);
+        var holderService = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, delayingStore);
+
+        var holderTask = holderService.EnrollCurrentAccountAsync();
+        await delayingStore.ReadEntered.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var contendingService = new AccountEnrollmentService(
+                _mockAdapter, _winCredStore, _sessionVault, _accountStore, TimeSpan.FromMilliseconds(50));
+            var ex = await Assert.ThrowsAsync<AccountEnrollmentException>(
+                () => contendingService.EnrollCoreAsync());
+
+            Assert.Equal("Account enrollment ownership did not become available in time; retry the operation.", ex.Message);
+            Assert.DoesNotContain("manual recovery", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("retry", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+            var lifecycleQuarantine = RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
+            Assert.False(lifecycleQuarantine.IsMarked);
+            Assert.False(_sessionVault.IsQuarantined);
+        }
+        finally
+        {
+            delayingStore.ReleaseRead();
+        }
+
+        var holderResult = await holderTask;
+        Assert.True(holderResult.Success);
+        Assert.False(RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch").IsMarked);
+        Assert.False(_sessionVault.IsQuarantined);
+    }
+
+    [Fact]
+    public async Task LifecycleLockContention_ReportsRetryableContention_WithoutManualRecoveryOrQuarantine()
+    {
+        const string email = "lifecycle-contention@example.com";
+        _mockAdapter.CurrentAccount = new AccountIdentityDto(email, "Synthetic");
+        _winCredStore.Seed("gemini:antigravity", email, Encoding.UTF8.GetBytes("{\"token\":\"synthetic\"}"));
+
+        string switchResource = _sessionVault.GetVaultPath() + ".switch";
+        var switchLock = PathLockRegistry.Get(switchResource);
+        await switchLock.WaitAsync();
+
+        try
+        {
+            var contendingService = new AccountEnrollmentService(
+                _mockAdapter, _winCredStore, _sessionVault, _accountStore, TimeSpan.FromMilliseconds(50));
+            var ex = await Assert.ThrowsAsync<AccountEnrollmentException>(
+                () => contendingService.EnrollCoreAsync());
+
+            Assert.Equal("Account lifecycle ownership did not become available in time; retry the operation.", ex.Message);
+            Assert.DoesNotContain("manual recovery", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("retry", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+            var lifecycleQuarantine = RecoveryQuarantineRegistry.Get(switchResource);
+            Assert.False(lifecycleQuarantine.IsMarked);
+            Assert.False(_sessionVault.IsQuarantined);
+            Assert.Null(await _accountStore.GetAccountByEmailAsync(email));
+        }
+        finally
+        {
+            switchLock.Release();
+        }
+
+        var retryService = new AccountEnrollmentService(_mockAdapter, _winCredStore, _sessionVault, _accountStore);
+        var retryResult = await retryService.EnrollCurrentAccountAsync();
+        Assert.True(retryResult.Success);
+        Assert.NotNull(await _accountStore.GetAccountByEmailAsync(email));
+        Assert.True(await _sessionVault.HasSessionAsync(retryResult.Account.Id));
+        Assert.False(RecoveryQuarantineRegistry.Get(switchResource).IsMarked);
+        Assert.False(_sessionVault.IsQuarantined);
+    }
+
     private sealed class ThrowingDpapiProvider : IDpapiProvider
     {
         public Task<byte[]> EncryptAsync(byte[] plaintext, CancellationToken cancellationToken = default) =>
@@ -1049,6 +1129,33 @@ public class AccountEnrollmentServiceTests : IDisposable
             string? expectedActiveId, string targetId, UpdateAccountInput updates,
             CancellationToken cancellationToken = default) =>
             inner.TryFinalizeSwitchAsync(expectedActiveId, targetId, updates, cancellationToken);
+    }
+
+    private sealed class DelayingAccountStore(IAccountStore inner) : IAccountStore
+    {
+        private readonly TaskCompletionSource _readEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task ReadEntered => _readEntered.Task;
+        public void ReleaseRead() => _releaseRead.TrySetResult();
+
+        public async Task<AccountMetadata?> GetAccountByEmailAsync(string email, CancellationToken cancellationToken = default)
+        {
+            _readEntered.TrySetResult();
+            await _releaseRead.Task.WaitAsync(cancellationToken);
+            return await inner.GetAccountByEmailAsync(email, cancellationToken);
+        }
+
+        public Task<IReadOnlyList<AccountMetadata>> ListAccountsAsync(CancellationToken cancellationToken = default) => inner.ListAccountsAsync(cancellationToken);
+        public Task<AccountMetadata?> GetAccountAsync(string id, CancellationToken cancellationToken = default) => inner.GetAccountAsync(id, cancellationToken);
+        public Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default) => inner.AddAccountAsync(input, cancellationToken);
+        public Task<AccountMetadata?> UpdateAccountAsync(string id, UpdateAccountInput updates, CancellationToken cancellationToken = default) => inner.UpdateAccountAsync(id, updates, cancellationToken);
+        public Task<bool> RemoveAccountAsync(string id, CancellationToken cancellationToken = default) => inner.RemoveAccountAsync(id, cancellationToken);
+        public Task<bool> RemoveAccountIfUnchangedAsync(AccountMetadata expected, CancellationToken cancellationToken = default) => inner.RemoveAccountIfUnchangedAsync(expected, cancellationToken);
+        public Task<bool> RestoreAccountIfUnchangedAsync(AccountMetadata expected, AccountMetadata previous, CancellationToken cancellationToken = default) => inner.RestoreAccountIfUnchangedAsync(expected, previous, cancellationToken);
+        public Task<string?> GetActiveAccountIdAsync(CancellationToken cancellationToken = default) => inner.GetActiveAccountIdAsync(cancellationToken);
+        public Task SetActiveAccountIdAsync(string? id, CancellationToken cancellationToken = default) => inner.SetActiveAccountIdAsync(id, cancellationToken);
+        public Task<bool> CompareExchangeActiveAccountIdAsync(string? expectedId, string? newId, CancellationToken cancellationToken = default) => inner.CompareExchangeActiveAccountIdAsync(expectedId, newId, cancellationToken);
+        public Task<AccountMetadata?> TryFinalizeSwitchAsync(string? expectedActiveId, string targetId, UpdateAccountInput updates, CancellationToken cancellationToken = default) => inner.TryFinalizeSwitchAsync(expectedActiveId, targetId, updates, cancellationToken);
     }
 
     private sealed class RejectActiveCasAccountStore(IAccountStore inner) : IAccountStore
