@@ -11,6 +11,7 @@ using Xunit;
 
 namespace AG2Router.Tests;
 
+[Collection("SwitchCoordinator")]
 public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
 {
     private readonly string _tempDir = Path.Combine(Path.GetTempPath(), $"ag2_switch_{Guid.NewGuid():N}");

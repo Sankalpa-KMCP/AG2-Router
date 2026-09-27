@@ -19,7 +19,8 @@ public sealed class SwitchJournalStore : ISwitchJournalStore
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.Never
+        DefaultIgnoreCondition = JsonIgnoreCondition.Never,
+        Converters = { new JsonStringEnumConverter<SwitchJournalState>(allowIntegerValues: false) }
     };
 
     private readonly string _journalFilePath;

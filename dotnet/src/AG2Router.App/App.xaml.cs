@@ -134,13 +134,16 @@ public partial class App : System.Windows.Application
             _wincredWriter = new WindowsWinCredWriter();
             _enrollmentService = new AccountEnrollmentService(_ag2Adapter, _wincredReader, _sessionVault, _accountStore);
             var processLifecycle = new WindowsAG2ProcessLifecycle(processDetector);
+            string journalPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "switch-journal.json");
+            var switchJournalStore = new SwitchJournalStore(journalPath);
             _switchCoordinator = new NativeAccountSwitchCoordinator(
                 _accountStore,
                 _sessionVault,
                 _wincredReader,
                 _wincredWriter,
                 _ag2Adapter,
-                processLifecycle);
+                processLifecycle,
+                switchJournalStore: switchJournalStore);
 
             Log("Initializing NativeAutoRouter and AutostartService...");
             string configPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "config.json");
