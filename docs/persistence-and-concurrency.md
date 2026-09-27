@@ -32,6 +32,13 @@ Readers treat malformed or unsupported persisted data as an error. SessionVault 
 
 Atomic replacement protects the destination snapshot; it does not by itself serialize multiple read-modify-write actors. Locks and rebasing are separate requirements.
 
+### Router configuration validation
+
+RouterConfig is validated immediately when loaded by NativeAutoRouter during initialization. Malformed JSON or out-of-contract persisted configuration (such as invalid polling intervals or threshold percentages) is rejected before polling or routing startup begins. In such cases, application startup fails visibly with an actionable error dialog rather than silently falling back to defaults or running with invalid runtime constraints.
+
+Partial or older configuration files whose missing fields deserialize to current valid defaults remain supported where current serializer and model semantics provide that behavior. However, previously API-written out-of-range values or corrupted configuration files may require correction before startup can succeed. This is an intentional fail-closed contract designed to prevent routing loops and invalid timers, not an accidental crash.
+
+
 ## Locking model
 
 - PathLockRegistry returns one in-process SemaphoreSlim per canonical full path.

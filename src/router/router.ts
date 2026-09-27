@@ -18,6 +18,31 @@ import {
   SelectionResult
 } from './types.js';
 
+export function validateRouterConfig(config: RouterConfig): void {
+  if (!config) {
+    throw new Error('Router configuration must not be null or undefined.');
+  }
+  if (typeof config.pollingIntervalMs !== 'number' || !Number.isFinite(config.pollingIntervalMs) || config.pollingIntervalMs <= 0) {
+    throw new RangeError('Polling interval must be positive.');
+  }
+  if (
+    typeof config.lowQuotaThresholdPercent !== 'number' ||
+    !Number.isFinite(config.lowQuotaThresholdPercent) ||
+    config.lowQuotaThresholdPercent < 5 ||
+    config.lowQuotaThresholdPercent > 50
+  ) {
+    throw new RangeError('Low quota threshold must be between 5% and 50%.');
+  }
+  if (
+    typeof config.minimumCandidateQuotaPercent !== 'number' ||
+    !Number.isFinite(config.minimumCandidateQuotaPercent) ||
+    config.minimumCandidateQuotaPercent < 10 ||
+    config.minimumCandidateQuotaPercent > 90
+  ) {
+    throw new RangeError('Minimum candidate quota must be between 10% and 90%.');
+  }
+}
+
 export class QuotaRouter {
   private config: RouterConfig;
   private safetyGate: SafetyGate;
@@ -36,7 +61,9 @@ export class QuotaRouter {
   ) {
     this.accountStore = accountStore;
     this.adapter = adapter;
-    this.config = { ...DEFAULT_ROUTER_CONFIG, ...config };
+    const initialConfig: RouterConfig = { ...DEFAULT_ROUTER_CONFIG, ...config };
+    validateRouterConfig(initialConfig);
+    this.config = initialConfig;
     this.safetyGate = new SafetyGate();
   }
 
@@ -45,10 +72,12 @@ export class QuotaRouter {
   }
 
   public updateConfig(updates: Partial<RouterConfig>): RouterConfig {
-    this.config = {
+    const candidate: RouterConfig = {
       ...this.config,
       ...updates
     };
+    validateRouterConfig(candidate);
+    this.config = candidate;
     return this.getConfig();
   }
 

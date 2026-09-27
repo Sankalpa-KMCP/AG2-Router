@@ -157,6 +157,50 @@ describe('AppServer (Loopback HTTP & API)', () => {
     assert.equal(updated.lowQuotaThresholdPercent, 20);
   });
 
+  it('should reject invalid configuration bounds via POST /api/config and preserve config', async () => {
+    // Current config snapshot
+    const baselineRes = await request('/api/config');
+    assert.equal(baselineRes.status, 200);
+    const baselineCfg = JSON.parse(baselineRes.body).config;
+
+    const invalidPayloads = [
+      { pollingIntervalMs: 0 },
+      { pollingIntervalMs: -100 },
+      { lowQuotaThresholdPercent: 4 },
+      { lowQuotaThresholdPercent: 55 },
+      { minimumCandidateQuotaPercent: 9 },
+      { minimumCandidateQuotaPercent: 95 }
+    ];
+
+    for (const payload of invalidPayloads) {
+      const res = await request('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      } as http.RequestOptions & { body: string });
+
+      assert.equal(res.status, 400, `Expected 400 Bad Request for ${JSON.stringify(payload)}`);
+      const body = JSON.parse(res.body);
+      assert.ok(body.error, 'Error message must be present in response');
+
+      // Verify router config remained unchanged
+      const checkRes = await request('/api/config');
+      assert.deepEqual(JSON.parse(checkRes.body).config, baselineCfg);
+    }
+  });
+
+  it('should reject non-object or malformed body via POST /api/config', async () => {
+    const res = await request('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify('not-an-object')
+    } as http.RequestOptions & { body: string });
+
+    assert.equal(res.status, 400);
+    const body = JSON.parse(res.body);
+    assert.ok(body.error);
+  });
+
   it('should serve static dashboard assets (index.html, styles.css, app.js)', async () => {
     const htmlRes = await request('/');
     assert.equal(htmlRes.status, 200);

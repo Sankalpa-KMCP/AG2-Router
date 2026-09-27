@@ -6,6 +6,7 @@ using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Security;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
+using AG2Router.Core.Validation;
 using AG2Router.Windows.Lifecycle;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -521,6 +522,7 @@ public class LoopbackServer : IAsyncDisposable
                 {
                     return Results.Json(new { error = "Invalid configuration payload." }, statusCode: StatusCodes.Status400BadRequest);
                 }
+                RouterConfigValidator.Validate(body);
                 var updated = autoRouter.UpdateConfig(body);
                 if (body.PollingIntervalMs > 0)
                 {

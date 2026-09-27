@@ -31,7 +31,7 @@ Trust checks and their limits are defined in [security-and-trust-model.md](secur
 | POST /api/accounts/{id}/switch-plan | none | 501 | Unsupported legacy endpoint; no dashboard Plan Switch workflow |
 | POST /api/accounts/{id}/switch | { confirm: true } plus switch token header | NativeSwitchResult | Status depends on stable string result code |
 | GET /api/config | none | { config: RouterConfigDto } | Persisted configuration loaded at startup |
-| POST /api/config | complete RouterConfigDto | { config } | Durable write precedes runtime update; failure is not success |
+| POST /api/config | complete RouterConfigDto | { success, config } | Validated by RouterConfigValidator before lock or durable write; invalid bounds return 400 |
 | GET /api/router/status | none | { router: RouterStatusDto } | Detailed router state |
 | POST /api/router/reset-recovery | none | { success, router } | Explicitly clears manual-recovery state when present |
 | GET /api/settings/autostart | none | { enabled, supported } | Native registry-backed capability when configured |
@@ -64,7 +64,11 @@ Do not describe loopback binding or Origin checks as user authentication. See [s
 
 Common meanings in current handlers:
 
-- 400: invalid payload, invalid identifier, validation failure, or rejected enrollment input.
+- 400: invalid payload, invalid identifier, validation failure, or rejected enrollment input. For POST /api/config, RouterConfigValidator enforces:
+  - PollingIntervalMs >= 1 (must be positive).
+  - LowQuotaThresholdPercent between 5 and 50 inclusive.
+  - MinimumCandidateQuotaPercent between 10 and 90 inclusive.
+  Any value outside these ranges is rejected with 400 Bad Request prior to lock acquisition or persistence.
 - 403: remote/invalid Host, disallowed Origin, cross-site metadata mutation, or missing/invalid explicit switch token.
 - 404: account not found.
 - 408: the CANCELLED switch result, including cancellation before process mutation, is mapped to request timeout.
