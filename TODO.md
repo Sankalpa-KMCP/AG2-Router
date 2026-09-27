@@ -14,16 +14,6 @@ stay in `docs/known-limitations.md`.
 
 ## Now — verified defects
 
-### TODO-001 · OPEN DEFECT · RouterConfig has no server-side validation boundary (AUD-109)
-
-- Priority: 1 — runtime breakage after restart; requires only a same-user local actor.
-- Problem: the `POST /api/config` handler in `dotnet/src/AG2Router.App/Server/LoopbackServer.cs` deserializes a `RouterConfigDto` and applies it via `NativeAutoRouter.UpdateConfig` without range validation, and `UpdateConfig` (`dotnet/src/AG2Router.AG2/Routing/NativeAutoRouter.cs`) persists the value verbatim before applying it. At startup, `App` composes `TelemetryPollingCoordinator` with `TimeSpan.FromMilliseconds(config.PollingIntervalMs)`; a persisted non-positive interval throws in the `PeriodicTimer` construction inside `TelemetryPollingCoordinator.Start` (outside that method's exception handling), leaving the polling task faulted after the initial poll — status and auto-routing never refresh again until `config.json` is repaired by hand. Thresholds are equally unvalidated: a negative `MinimumCandidateQuotaPercent` lets `CandidateSelector` admit zero-quota candidates, and a negative `LowQuotaThresholdPercent` silently prevents low-quota triggering. The dashboard form clamps inputs via HTML constraint validation (`frontend/src/lib/components/RoutingConfigSection.svelte`), but the loopback API and the TypeScript reference server (`src/server/server.ts` config handler) do not.
-- Why it matters: a bad config write returns success today and silently disables telemetry and automatic switching after the next launch.
-- Evidence: `dotnet/src/AG2Router.App/Server/LoopbackServer.cs`, `dotnet/src/AG2Router.AG2/Routing/NativeAutoRouter.cs`, `dotnet/src/AG2Router.App/Services/TelemetryPollingCoordinator.cs`, `dotnet/src/AG2Router.App/App.xaml.cs`, `dotnet/src/AG2Router.AG2/Routing/CandidateSelector.cs`, `src/server/server.ts`.
-- Completion criteria: one authoritative validation boundary rejects invalid `RouterConfig` values with a machine-readable 400 (non-positive `PollingIntervalMs`; threshold ranges consistent with the bounds the dashboard form documents); the persisted-config-to-startup path cannot receive an invalid interval; focused negative-path tests cover the API handler, `UpdateConfig`, and the startup construction; TypeScript reference parity addressed or explicitly tracked; `docs/api-contracts.md` and `docs/known-limitations.md` updated in the same change.
-- Implementation constraint: remediation must not deepen the existing synchronous-over-async durable-write pattern while holding NativeAutoRouter state synchronization.
-- Dependencies: none.
-
 ### TODO-002 · OPEN DEFECT · Misleading enrollment contention wording (AUD-110)
 
 - Priority: 2 — user-facing correctness of operator guidance; no state corruption.
@@ -125,3 +115,4 @@ Owned by `docs/known-limitations.md` and the subject documents; recorded here on
 
 - AUD-001 release tag/version guard — fixed: the release workflow derives the canonical version from `dotnet/Directory.Build.props` and fails on mismatch.
 - AUD-101 through AUD-108 — closed; re-verified fixed at the HEAD shown above: frontend helper ownership with import-boundary test (AUD-101), unified account/quota observation (AUD-102), frontend API type alignment with drift test (AUD-103), dead-seam removal in `NativeAutoRouter` (AUD-104), case-sensitive release tag guard (AUD-105), workflow permissions/concurrency/timeouts (AUD-106), action SHA pinning (AUD-107), truthful README routing wording (AUD-108). Reopen only on regression evidence.
+- TODO-001 · CLOSED · RouterConfig has no server-side validation boundary (AUD-109) — closed via PR #25 (`fix: validate router configuration`): authoritative RouterConfig validation rejects invalid API and runtime configuration before persistence or application; invalid persisted configuration fails closed before polling or routing startup; routing threshold bounds are enforced across .NET and the TypeScript reference server; startup configuration errors retain actionable validation detail without exposing the full config filesystem path in user-facing dialogs; full diagnostic exception context preserved in application logs; covered by focused negative and regression tests.
