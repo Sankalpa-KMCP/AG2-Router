@@ -34,6 +34,7 @@ public static class SwitchJournalConstants
 public sealed record SwitchJournalEntry
 {
     public const string ExpectedMagic = SwitchJournalConstants.Magic;
+    public const string CurrentMagic = SwitchJournalConstants.Magic;
     public const int CurrentSchemaVersion = SwitchJournalConstants.CurrentSchemaVersion;
 
     [JsonPropertyName("magic")]

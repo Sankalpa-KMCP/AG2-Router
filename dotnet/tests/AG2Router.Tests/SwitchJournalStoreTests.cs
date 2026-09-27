@@ -539,6 +539,44 @@ public sealed class SwitchJournalStoreTests : IDisposable
         }
     }
 
+    // 19. Numeric state token ("state": 0) -> Corrupt classification and file bytes unchanged (LOW-1)
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(999)]
+    public async Task Scenario19_Read_WhenStateIsNumericToken_ReturnsCorrupt_AndPreservesFileBytes(int numericState)
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        string numericStateJson = $$"""
+        {
+          "magic": "AG2SWITCHJRNL",
+          "schemaVersion": 1,
+          "transactionId": "11111111-2222-3333-4444-555555555555",
+          "state": {{numericState}},
+          "updatedAt": "2026-09-27T12:00:00.0000000Z",
+          "sourceAccountId": "acc-1",
+          "targetAccountId": "acc-2",
+          "quarantineReasonCode": null
+        }
+        """;
+
+        byte[] originalBytes = System.Text.Encoding.UTF8.GetBytes(numericStateJson);
+        await File.WriteAllBytesAsync(path, originalBytes);
+
+        var result = await store.ReadAsync();
+
+        Assert.Equal(SwitchJournalReadStatus.Corrupt, result.Status);
+        Assert.NotNull(result.ErrorMessage);
+        Assert.Contains("state", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(result.Entry);
+
+        Assert.True(File.Exists(path));
+        byte[] currentBytes = await File.ReadAllBytesAsync(path);
+        Assert.Equal(originalBytes, currentBytes);
+    }
+
     private sealed class TestDurableFileWriterSpy : IDurableFileWriter
     {
         public string? WrittenPath { get; private set; }

@@ -25,6 +25,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     private readonly TimeSpan _rollbackTimeout;
     private readonly TimeSpan _transactionTimeout;
     private readonly RecoveryQuarantine _recoveryQuarantine;
+    private readonly ISwitchJournalStore? _journalStore;
     private readonly object _statusLock = new();
     private readonly CancellationTokenSource _shutdownCts = new();
     private volatile bool _isShuttingDown;
@@ -45,7 +46,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         TimeSpan? verificationTimeout = null,
         TimeSpan? pollInterval = null,
         TimeSpan? rollbackTimeout = null,
-        TimeSpan? transactionTimeout = null)
+        TimeSpan? transactionTimeout = null,
+        ISwitchJournalStore? switchJournalStore = null)
     {
         _accountStore = accountStore ?? throw new ArgumentNullException(nameof(accountStore));
         _sessionVault = sessionVault ?? throw new ArgumentNullException(nameof(sessionVault));
@@ -62,6 +64,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             (_processTimeout + _verificationTimeout + _rollbackTimeout + TimeSpan.FromSeconds(30));
         if (_transactionTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(transactionTimeout));
         _recoveryQuarantine = RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
+        _journalStore = switchJournalStore;
     }
 
     public NativeSwitchStatus GetStatus()
@@ -193,9 +196,10 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     "Switch coordinator is shutting down.", [], now, DateTimeOffset.UtcNow.ToString("O"));
             }
 
-            string transactionId = $"tx_{Guid.NewGuid():N}";
+            string transactionId = Guid.NewGuid().ToString("D");
             var stages = new List<string>();
             AccountMetadata? target = null;
+            AccountMetadata? sourceAccount = null;
             string? previousAccountId = null;
             string? previousEmail = null;
             WinCredEntry? originalCredential = null;
@@ -249,7 +253,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             if (planIsCurrent != null &&
                 (!planIsCurrent() || !string.Equals(previousAccountId, expectedActiveAccountId, StringComparison.Ordinal)))
                 throw new SwitchRejectedException(SwitchResultCodes.Cancelled, "Automatic switch plan became stale.");
-            var sourceAccount = previousAccountId == null ? null :
+            sourceAccount = previousAccountId == null ? null :
                 await _accountStore.GetAccountAsync(previousAccountId, cancellationToken).ConfigureAwait(false);
             var currentIdentity = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
             previousEmail = currentIdentity?.Email;
@@ -370,6 +374,18 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             mutationCts.CancelAfter(mutationTimeout);
             var mutationToken = mutationCts.Token;
 
+            // Phase Transition a: RECORDED (strictly before StopVerifiedAsync)
+            if (_journalStore != null)
+            {
+                await WriteJournalStateAsync(
+                    transactionId,
+                    SwitchJournalState.RECORDED,
+                    sourceAccount!.Id,
+                    target.Id,
+                    quarantineReasonCode: null,
+                    cancellationToken: mutationToken).ConfigureAwait(false);
+            }
+
             await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken,
                     async token =>
                     {
@@ -415,6 +431,18 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 targetSession);
             ValidateCredential(targetCredential, requireConfiguredTarget: true);
 
+            // Phase Transition b: CREDENTIAL_APPLYING (strictly before WriteCredentialAsync)
+            if (_journalStore != null)
+            {
+                await WriteJournalStateAsync(
+                    transactionId,
+                    SwitchJournalState.CREDENTIAL_APPLYING,
+                    sourceAccount!.Id,
+                    target.Id,
+                    quarantineReasonCode: null,
+                    cancellationToken: mutationToken).ConfigureAwait(false);
+            }
+
             SetState(NativeSwitchStates.ApplyingCredential);
             credentialWriteAttempted = true;
             bool written = await _winCredWriter.WriteCredentialAsync(targetCredential, mutationToken)
@@ -444,6 +472,19 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 throw new InvalidOperationException(
                     "Process generation changed after target verification and before metadata finalization.");
             }
+
+            // Phase Transition c: TARGET_IDENTITY_VERIFIED_PRECOMMIT (strictly before TryFinalizeSwitchAsync)
+            if (_journalStore != null)
+            {
+                await WriteJournalStateAsync(
+                    transactionId,
+                    SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT,
+                    sourceAccount!.Id,
+                    target.Id,
+                    quarantineReasonCode: null,
+                    cancellationToken: mutationToken).ConfigureAwait(false);
+            }
+
             var updated = await _accountStore.TryFinalizeSwitchAsync(previousAccountId, target.Id, new UpdateAccountInput(
                 ValidationStatus: AccountValidationStatus.Valid,
                 HasVaultedSession: true,
@@ -452,18 +493,40 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 throw new InvalidOperationException("Account metadata changed during atomic switch finalization.");
             stages.Add("METADATA_COMMITTED");
 
+            // Phase Transition d: Success Deletion (only after TryFinalizeSwitchAsync succeeds)
+            try
+            {
+                if (_journalStore != null)
+                {
+                    await _journalStore.DeleteAsync(mutationToken).ConfigureAwait(false);
+                }
+            }
+            catch (Exception)
+            {
+                // Deletion failure: do not fail switch, do not revert metadata.
+                // TARGET_IDENTITY_VERIFIED_PRECOMMIT remains on disk for Step 3 startup reconciliation.
+            }
+
             return Terminal(transactionId, true, SwitchResultCodes.Success, NativeSwitchStates.Complete,
                 target.Id, target.Email, previousAccountId, previousEmail,
                 "Target account was activated and verified.", stages, now);
         }
         catch (SwitchRejectedException ex) when (!processTransitionStarted)
         {
+            if (_journalStore != null)
+            {
+                try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+            }
             return Terminal(transactionId, false, ex.Code, NativeSwitchStates.Failed,
                 requestedId, target?.Email, previousAccountId, previousEmail,
                 AG2Security.RedactSensitiveText(ex.Message), stages, now);
         }
         catch (OperationCanceledException) when (!processTransitionStarted)
         {
+            if (_journalStore != null)
+            {
+                try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+            }
             return Terminal(transactionId, false, SwitchResultCodes.Cancelled, NativeSwitchStates.Failed,
                 requestedId, target?.Email, previousAccountId, previousEmail,
                 "Switch request was cancelled before credential mutation.", stages, now);
@@ -472,6 +535,10 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         {
             if (!processTransitionStarted || originalCredential == null || processSnapshot == null)
             {
+                if (_journalStore != null)
+                {
+                    try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+                }
                 return Terminal(transactionId, false,
                     switchError is OperationCanceledException ? SwitchResultCodes.Cancelled : SwitchResultCodes.TelemetryUnavailable,
                     NativeSwitchStates.Failed, requestedId, target?.Email, previousAccountId, previousEmail,
@@ -480,6 +547,34 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
             SetState(NativeSwitchStates.RollingBack);
             stages.Add("ROLLBACK_STARTED");
+
+            // Phase Transition e: ROLLING_BACK (strictly before QuiesceForRollbackAsync or restoring credentials)
+            try
+            {
+                if (_journalStore != null)
+                {
+                    await WriteJournalStateAsync(
+                        transactionId,
+                        SwitchJournalState.ROLLING_BACK,
+                        sourceAccount?.Id ?? previousAccountId ?? string.Empty,
+                        target?.Id ?? requestedId,
+                        quarantineReasonCode: null,
+                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            catch (Exception rollbackJournalError)
+            {
+                // CRITICAL SAFETY RULE: If writing ROLLING_BACK fails/throws:
+                // Do NOT call QuiesceForRollbackAsync, do NOT restore credentials under unrecorded rollback!
+                // Leave prior conservative journal state (CREDENTIAL_APPLYING or RECORDED) on disk.
+                _recoveryQuarantine.Mark();
+                stages.Add("ROLLBACK_FAILED");
+                return Terminal(transactionId, false, SwitchResultCodes.SwitchFailedRollbackFailed,
+                    NativeSwitchStates.Failed, requestedId, target?.Email, previousAccountId, previousEmail,
+                    $"Switch and rollback failed; manual recovery is required. {SafeFailure(rollbackJournalError)}",
+                    stages, now);
+            }
+
             try
             {
                 using var rollbackCts = new CancellationTokenSource(_rollbackTimeout);
@@ -518,13 +613,48 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     .ConfigureAwait(false);
                 stages.Add("SOURCE_IDENTITY_VERIFIED");
 
+                // Phase Transition f: Rollback Success Deletion
+                try
+                {
+                    if (_journalStore != null)
+                    {
+                        await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception)
+                {
+                    // If deletion fails/throws: log warning; rollback succeeded.
+                }
+
                 return Terminal(transactionId, false, SwitchResultCodes.SwitchFailedRolledBack,
                     NativeSwitchStates.RolledBack, requestedId, target?.Email, previousAccountId, previousEmail,
                     "Switch failed; the original credential and verified source identity were restored.", stages, now);
             }
             catch (Exception rollbackError)
             {
+                // Phase Transition g: Rollback Failure / Uncertain Quarantine
                 stages.Add("ROLLBACK_FAILED");
+                _recoveryQuarantine.Mark();
+
+                try
+                {
+                    if (_journalStore != null)
+                    {
+                        await WriteJournalStateAsync(
+                            transactionId,
+                            SwitchJournalState.QUARANTINED,
+                            sourceAccount?.Id ?? previousAccountId ?? string.Empty,
+                            target?.Id ?? requestedId,
+                            quarantineReasonCode: "ROLLBACK_FAILED",
+                            cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception)
+                {
+                    // If writing QUARANTINED throws: mark in-process quarantine anyway (already marked),
+                    // return uncertain/manual-recovery failure.
+                }
+
                 return Terminal(transactionId, false, SwitchResultCodes.SwitchFailedRollbackFailed,
                     NativeSwitchStates.Failed, requestedId, target?.Email, previousAccountId, previousEmail,
                     $"Switch and rollback failed; manual recovery is required. {SafeFailure(rollbackError)}",
@@ -789,6 +919,31 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             _lastResult = result;
         }
         return result;
+    }
+
+    private async Task WriteJournalStateAsync(
+        string transactionId,
+        SwitchJournalState state,
+        string sourceAccountId,
+        string targetAccountId,
+        string? quarantineReasonCode = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_journalStore == null) return;
+
+        var entry = new SwitchJournalEntry
+        {
+            Magic = SwitchJournalEntry.CurrentMagic,
+            SchemaVersion = SwitchJournalEntry.CurrentSchemaVersion,
+            TransactionId = transactionId,
+            State = state,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            SourceAccountId = sourceAccountId,
+            TargetAccountId = targetAccountId,
+            QuarantineReasonCode = quarantineReasonCode
+        };
+
+        await _journalStore.WriteEntryAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
     private sealed class SwitchRejectedException : Exception
