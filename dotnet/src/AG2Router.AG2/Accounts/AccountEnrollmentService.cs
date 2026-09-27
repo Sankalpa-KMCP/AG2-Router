@@ -72,8 +72,8 @@ public class AccountEnrollmentService
         }
     }
 
-    private async Task<EnrollmentResult> EnrollCoreAsync(
-        EnrollmentOptions? options, CancellationToken cancellationToken)
+    internal async Task<EnrollmentResult> EnrollCoreAsync(
+        EnrollmentOptions? options = null, CancellationToken cancellationToken = default)
     {
         try
         {
@@ -135,14 +135,14 @@ public class AccountEnrollmentService
                 var enrollmentLock = EnrollmentLocks.GetOrAdd(email, static _ => new SemaphoreSlim(1, 1));
                 if (!await enrollmentLock.WaitAsync(_completionTimeout, cancellationToken).ConfigureAwait(false))
                     throw new AccountEnrollmentException(
-                        "Account enrollment ownership did not become available; manual recovery is required.");
+                        "Account enrollment ownership did not become available in time; retry the operation.");
                 try
                 {
                     string enrollmentResource = GetEnrollmentResourcePath();
                     var resourceLock = PathLockRegistry.Get(enrollmentResource);
                     if (!await resourceLock.WaitAsync(_completionTimeout, cancellationToken).ConfigureAwait(false))
                         throw new AccountEnrollmentException(
-                            "Account lifecycle ownership did not become available; manual recovery is required.");
+                            "Account lifecycle ownership did not become available in time; retry the operation.");
                     try
                     {
                         EnsureLifecycleAvailable();
