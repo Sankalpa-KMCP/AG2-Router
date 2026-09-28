@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Switching;
@@ -572,6 +573,235 @@ public sealed class SwitchJournalStoreTests : IDisposable
         Assert.Contains("state", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
         Assert.Null(result.Entry);
 
+        Assert.True(File.Exists(path));
+        byte[] currentBytes = await File.ReadAllBytesAsync(path);
+        Assert.Equal(originalBytes, currentBytes);
+    }
+
+    // 20. DeleteIfUnchangedAsync when exact match deletes file and returns Deleted
+    [Fact]
+    public async Task Scenario20_DeleteIfUnchanged_WhenExactMatch_DeletesFile_AndReturnsDeleted()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        var entry = CreateSampleEntry(state: SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT);
+        await store.WriteEntryAsync(entry);
+        Assert.True(File.Exists(path));
+
+        var readResult = await store.ReadAsync();
+        Assert.Equal(SwitchJournalReadStatus.Valid, readResult.Status);
+
+        var deleteResult = await store.DeleteIfUnchangedAsync(readResult.Entry!);
+        Assert.Equal(SwitchJournalDeleteStatus.Deleted, deleteResult.Status);
+        Assert.False(File.Exists(path));
+    }
+
+    // 21. DeleteIfUnchangedAsync when absent returns Absent
+    [Fact]
+    public async Task Scenario21_DeleteIfUnchanged_WhenAbsent_ReturnsAbsent()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        Assert.False(File.Exists(path));
+
+        var entry = CreateSampleEntry();
+        var deleteResult = await store.DeleteIfUnchangedAsync(entry);
+
+        Assert.Equal(SwitchJournalDeleteStatus.Absent, deleteResult.Status);
+    }
+
+    // 22. DeleteIfUnchangedAsync when state differs returns NotMatched and preserves file
+    [Fact]
+    public async Task Scenario22_DeleteIfUnchanged_WhenStateDiffers_ReturnsNotMatched_AndPreservesFile()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        var onDiskEntry = CreateSampleEntry(state: SwitchJournalState.ROLLING_BACK);
+        await store.WriteEntryAsync(onDiskEntry);
+
+        var readResult = await store.ReadAsync();
+        Assert.Equal(SwitchJournalReadStatus.Valid, readResult.Status);
+
+        var expectedEntry = readResult.Entry! with { State = SwitchJournalState.CREDENTIAL_APPLYING };
+        var deleteResult = await store.DeleteIfUnchangedAsync(expectedEntry);
+
+        Assert.Equal(SwitchJournalDeleteStatus.NotMatched, deleteResult.Status);
+        Assert.True(File.Exists(path));
+
+        var verifyStillOnDisk = await store.ReadAsync();
+        Assert.Equal(SwitchJournalReadStatus.Valid, verifyStillOnDisk.Status);
+        Assert.Equal(SwitchJournalState.ROLLING_BACK, verifyStillOnDisk.Entry!.State);
+    }
+
+    // 23. DeleteIfUnchangedAsync when transactionId differs returns NotMatched and preserves file
+    [Fact]
+    public async Task Scenario23_DeleteIfUnchanged_WhenTransactionIdDiffers_ReturnsNotMatched_AndPreservesFile()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        var onDiskEntry = CreateSampleEntry();
+        await store.WriteEntryAsync(onDiskEntry);
+
+        var readResult = await store.ReadAsync();
+        Assert.Equal(SwitchJournalReadStatus.Valid, readResult.Status);
+
+        var expectedEntry = readResult.Entry! with { TransactionId = Guid.NewGuid().ToString("D") };
+        var deleteResult = await store.DeleteIfUnchangedAsync(expectedEntry);
+
+        Assert.Equal(SwitchJournalDeleteStatus.NotMatched, deleteResult.Status);
+        Assert.True(File.Exists(path));
+    }
+
+    // 24. DeleteIfUnchangedAsync when SourceAccountId differs returns NotMatched and preserves file
+    [Fact]
+    public async Task Scenario24_DeleteIfUnchanged_WhenSourceAccountIdDiffers_ReturnsNotMatched_AndPreservesFile()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        var onDiskEntry = CreateSampleEntry();
+        await store.WriteEntryAsync(onDiskEntry);
+
+        var readResult = await store.ReadAsync();
+        var expectedEntry = readResult.Entry! with { SourceAccountId = "different-source" };
+        var deleteResult = await store.DeleteIfUnchangedAsync(expectedEntry);
+
+        Assert.Equal(SwitchJournalDeleteStatus.NotMatched, deleteResult.Status);
+        Assert.True(File.Exists(path));
+    }
+
+    // 25. DeleteIfUnchangedAsync when TargetAccountId differs returns NotMatched and preserves file
+    [Fact]
+    public async Task Scenario25_DeleteIfUnchanged_WhenTargetAccountIdDiffers_ReturnsNotMatched_AndPreservesFile()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        var onDiskEntry = CreateSampleEntry();
+        await store.WriteEntryAsync(onDiskEntry);
+
+        var readResult = await store.ReadAsync();
+        var expectedEntry = readResult.Entry! with { TargetAccountId = "different-target" };
+        var deleteResult = await store.DeleteIfUnchangedAsync(expectedEntry);
+
+        Assert.Equal(SwitchJournalDeleteStatus.NotMatched, deleteResult.Status);
+        Assert.True(File.Exists(path));
+    }
+
+    // 26. DeleteIfUnchangedAsync when corrupt returns NotMatched and preserves file
+    [Fact]
+    public async Task Scenario26_DeleteIfUnchanged_WhenCorrupt_ReturnsNotMatched_AndPreservesFile()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        byte[] corruptBytes = Encoding.UTF8.GetBytes("INVALID_NOT_JSON");
+        await File.WriteAllBytesAsync(path, corruptBytes);
+
+        var entry = CreateSampleEntry();
+        var deleteResult = await store.DeleteIfUnchangedAsync(entry);
+
+        Assert.Equal(SwitchJournalDeleteStatus.NotMatched, deleteResult.Status);
+        Assert.True(File.Exists(path));
+        Assert.Equal(corruptBytes, await File.ReadAllBytesAsync(path));
+    }
+
+    // 27. DeleteIfUnchangedAsync throws when expectedEntry is null
+    [Fact]
+    public async Task Scenario27_DeleteIfUnchanged_ThrowsWhenExpectedEntryIsNull()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() => store.DeleteIfUnchangedAsync(null!));
+    }
+
+    // 28. DeleteIfUnchangedWindows excludes concurrent writers during the validation window (F-272-1)
+    [Fact]
+    public async Task Scenario28_DeleteIfUnchanged_ExcludesConcurrentWriters_DuringValidationWindow()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        var entry = CreateSampleEntry(state: SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT);
+        await store.WriteEntryAsync(entry);
+
+        var readResult = await store.ReadAsync();
+        Assert.Equal(SwitchJournalReadStatus.Valid, readResult.Status);
+
+        var hookEnteredTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeHookTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        store.BeforeDispositionHookAsync = async () =>
+        {
+            hookEnteredTcs.TrySetResult();
+            await resumeHookTcs.Task;
+        };
+
+        var deleteOperation = store.DeleteIfUnchangedAsync(readResult.Entry!);
+
+        // Wait until store has opened handle with FILE_SHARE_READ | FILE_SHARE_DELETE (no FILE_SHARE_WRITE)
+        await hookEnteredTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Attempt concurrent write while handle is held
+        var sharingViolationCaught = false;
+        try
+        {
+            using var concurrentWriter = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Write,
+                FileShare.ReadWrite | FileShare.Delete);
+        }
+        catch (IOException ex)
+        {
+            sharingViolationCaught = true;
+            // Win32 error 32 (ERROR_SHARING_VIOLATION): HResult 0x80070020
+            const int errorSharingViolation = unchecked((int)0x80070020);
+            Assert.Equal(errorSharingViolation, ex.HResult);
+        }
+
+        Assert.True(sharingViolationCaught, "Expected IOException (ERROR_SHARING_VIOLATION) when opening file for write while DeleteIfUnchanged holds handle.");
+
+        // Unblock disposition
+        resumeHookTcs.TrySetResult();
+
+        var deleteResult = await deleteOperation.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SwitchJournalDeleteStatus.Deleted, deleteResult.Status);
+        Assert.False(File.Exists(path));
+    }
+
+    // 29. DeleteIfUnchanged on non-Windows platform fails closed without deleting or mutating file (F-272-2)
+    [Fact]
+    public async Task Scenario29_DeleteIfUnchanged_OnNonWindowsPlatform_FailsClosedWithoutDeleting()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path)
+        {
+            IsWindowsPlatform = () => false
+        };
+
+        var entry = CreateSampleEntry(state: SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT);
+        await store.WriteEntryAsync(entry);
+        Assert.True(File.Exists(path));
+
+        byte[] originalBytes = await File.ReadAllBytesAsync(path);
+
+        var result = await store.DeleteIfUnchangedAsync(entry);
+
+        Assert.Equal(SwitchJournalDeleteStatus.UnsupportedPlatform, result.Status);
+        Assert.NotNull(result.Message);
+        Assert.Contains("Windows", result.Message);
+
+        // Verify file remains on disk with byte-for-byte identical content
         Assert.True(File.Exists(path));
         byte[] currentBytes = await File.ReadAllBytesAsync(path);
         Assert.Equal(originalBytes, currentBytes);

@@ -1,7 +1,10 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AG2Router.AG2.Persistence;
+using Microsoft.Win32.SafeHandles;
 
 namespace AG2Router.AG2.Switching;
 
@@ -80,6 +83,14 @@ public sealed class SwitchJournalStore : ISwitchJournalStore
             return SwitchJournalReadResult.IoError(ex);
         }
 
+        return ParseEntryFromText(text);
+    }
+
+    /// <summary>
+    /// Parses and classifies the switch journal text into a SwitchJournalReadResult.
+    /// </summary>
+    public static SwitchJournalReadResult ParseEntryFromText(string text)
+    {
         if (string.IsNullOrWhiteSpace(text))
         {
             return SwitchJournalReadResult.Corrupt("Journal file contains only whitespace.");
@@ -218,6 +229,159 @@ public sealed class SwitchJournalStore : ISwitchJournalStore
             return SwitchJournalReadResult.Valid(entry);
         }
     }
+
+    internal Func<bool> IsWindowsPlatform { get; set; } = OperatingSystem.IsWindows;
+    internal Func<Task>? BeforeDispositionHookAsync { get; set; }
+
+    /// <summary>
+    /// Deletes the journal file if and only if its current on-disk content matches expectedEntry.
+    /// Under Windows, ties verification and deletion to the same underlying file handle to eliminate
+    /// post-read replacement races.
+    /// </summary>
+    public async Task<SwitchJournalDeleteResult> DeleteIfUnchangedAsync(
+        SwitchJournalEntry expectedEntry,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(expectedEntry);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (IsWindowsPlatform())
+        {
+            return await DeleteIfUnchangedWindowsAsync(expectedEntry, cancellationToken).ConfigureAwait(false);
+        }
+
+        return DeleteIfUnchangedNonWindows(expectedEntry);
+    }
+
+    private async Task<SwitchJournalDeleteResult> DeleteIfUnchangedWindowsAsync(
+        SwitchJournalEntry expectedEntry,
+        CancellationToken cancellationToken)
+    {
+        SafeFileHandle handle = CreateFileW(
+            _journalFilePath,
+            GENERIC_READ | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error is 2 /* ERROR_FILE_NOT_FOUND */ or 3 /* ERROR_PATH_NOT_FOUND */)
+            {
+                return SwitchJournalDeleteResult.Absent();
+            }
+
+            return SwitchJournalDeleteResult.IoError(new Win32Exception(error, $"Failed to open journal file for verification: win32 error {error}"));
+        }
+
+        using (handle)
+        {
+            string text;
+            try
+            {
+                long length = RandomAccess.GetLength(handle);
+                if (length == 0)
+                {
+                    return SwitchJournalDeleteResult.NotMatched("Journal file is empty (zero bytes).");
+                }
+                if (length > 1_000_000)
+                {
+                    return SwitchJournalDeleteResult.NotMatched("Journal file exceeds maximum expected size.");
+                }
+
+                byte[] buffer = new byte[length];
+                int read = await RandomAccess.ReadAsync(handle, buffer.AsMemory(), 0, cancellationToken).ConfigureAwait(false);
+                if (read != length)
+                {
+                    return SwitchJournalDeleteResult.NotMatched("Failed to read complete journal file contents.");
+                }
+                text = Encoding.UTF8.GetString(buffer);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return SwitchJournalDeleteResult.IoError(ex);
+            }
+
+            var parseResult = ParseEntryFromText(text);
+            if (parseResult.Status != SwitchJournalReadStatus.Valid || parseResult.Entry == null)
+            {
+                return SwitchJournalDeleteResult.NotMatched($"Journal is not in valid state: {parseResult.ErrorMessage ?? parseResult.Status.ToString()}");
+            }
+
+            var actual = parseResult.Entry;
+            if (!EntriesMatch(actual, expectedEntry))
+            {
+                return SwitchJournalDeleteResult.NotMatched("Journal contents do not match expected entry.");
+            }
+
+            if (BeforeDispositionHookAsync != null)
+            {
+                await BeforeDispositionHookAsync().ConfigureAwait(false);
+            }
+
+            var disposition = new FILE_DISPOSITION_INFO { DeleteFile = true };
+            if (!SetFileInformationByHandle(handle, FileDispositionInfo, ref disposition, (uint)Marshal.SizeOf<FILE_DISPOSITION_INFO>()))
+            {
+                int err = Marshal.GetLastWin32Error();
+                return SwitchJournalDeleteResult.IoError(new Win32Exception(err, $"Failed to set delete disposition: win32 error {err}"));
+            }
+
+            return SwitchJournalDeleteResult.Deleted();
+        }
+    }
+
+    private static SwitchJournalDeleteResult DeleteIfUnchangedNonWindows(SwitchJournalEntry expectedEntry)
+    {
+        return SwitchJournalDeleteResult.UnsupportedPlatform("Conditional switch journal deletion is only supported on Windows.");
+    }
+
+    private static bool EntriesMatch(SwitchJournalEntry actual, SwitchJournalEntry expected)
+    {
+        return string.Equals(actual.Magic, expected.Magic, StringComparison.Ordinal)
+            && actual.SchemaVersion == expected.SchemaVersion
+            && string.Equals(actual.TransactionId, expected.TransactionId, StringComparison.Ordinal)
+            && actual.State == expected.State
+            && actual.UpdatedAt == expected.UpdatedAt
+            && string.Equals(actual.SourceAccountId, expected.SourceAccountId, StringComparison.Ordinal)
+            && string.Equals(actual.TargetAccountId, expected.TargetAccountId, StringComparison.Ordinal)
+            && string.Equals(actual.QuarantineReasonCode, expected.QuarantineReasonCode, StringComparison.Ordinal);
+    }
+
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint DELETE = 0x00010000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const int FileDispositionInfo = 4;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_DISPOSITION_INFO
+    {
+        [MarshalAs(UnmanagedType.U1)]
+        public bool DeleteFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeFileHandle CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(
+        SafeFileHandle hFile,
+        int FileInformationClass,
+        ref FILE_DISPOSITION_INFO lpFileInformation,
+        uint dwBufferSize);
 
     /// <summary>
     /// Validates and writes a journal entry atomically to disk.

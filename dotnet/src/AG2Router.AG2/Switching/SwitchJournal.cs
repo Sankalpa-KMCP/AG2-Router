@@ -109,6 +109,33 @@ public sealed record SwitchJournalReadResult(
 }
 
 /// <summary>
+/// Status classification for conditional deletion of the durable switch transaction journal file.
+/// </summary>
+public enum SwitchJournalDeleteStatus
+{
+    Deleted,
+    NotMatched,
+    Absent,
+    IoError,
+    UnsupportedPlatform
+}
+
+/// <summary>
+/// Result of conditional deletion of the durable switch transaction journal file.
+/// </summary>
+public sealed record SwitchJournalDeleteResult(
+    SwitchJournalDeleteStatus Status,
+    string? Message = null,
+    Exception? Exception = null)
+{
+    public static SwitchJournalDeleteResult Deleted() => new(SwitchJournalDeleteStatus.Deleted);
+    public static SwitchJournalDeleteResult NotMatched(string message) => new(SwitchJournalDeleteStatus.NotMatched, Message: message);
+    public static SwitchJournalDeleteResult Absent() => new(SwitchJournalDeleteStatus.Absent);
+    public static SwitchJournalDeleteResult IoError(Exception ex) => new(SwitchJournalDeleteStatus.IoError, Message: ex?.Message, Exception: ex);
+    public static SwitchJournalDeleteResult UnsupportedPlatform(string message) => new(SwitchJournalDeleteStatus.UnsupportedPlatform, Message: message);
+}
+
+/// <summary>
 /// Contract for switch journal persistence.
 /// </summary>
 public interface ISwitchJournalStore
@@ -121,6 +148,7 @@ public interface ISwitchJournalStore
     Task<SwitchJournalReadResult> ReadAsync(CancellationToken cancellationToken = default);
     Task WriteEntryAsync(SwitchJournalEntry entry, CancellationToken cancellationToken = default);
     Task DeleteAsync(CancellationToken cancellationToken = default);
+    Task<SwitchJournalDeleteResult> DeleteIfUnchangedAsync(SwitchJournalEntry expectedEntry, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
