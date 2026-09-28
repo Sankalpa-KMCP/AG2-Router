@@ -1064,6 +1064,25 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
 
             await _underlying.DeleteAsync(cancellationToken).ConfigureAwait(false);
         }
+
+        public async Task<SwitchJournalDeleteResult> DeleteIfUnchangedAsync(SwitchJournalEntry expectedEntry, CancellationToken cancellationToken = default)
+        {
+            _timeline.Add("JOURNAL_DELETE_CONDITIONAL");
+            Operations.Add("DELETE_CONDITIONAL");
+            DeleteCount++;
+
+            if (DeleteBehavior != null)
+            {
+                await DeleteBehavior(cancellationToken);
+            }
+
+            if (FailOnDelete)
+            {
+                throw new IOException("Simulated journal delete failure");
+            }
+
+            return await _underlying.DeleteIfUnchangedAsync(expectedEntry, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private sealed class TestAccountStore : InMemoryAccountStore, IAccountStore

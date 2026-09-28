@@ -1206,6 +1206,9 @@ public class NativeAutoRouterTests : IAsyncDisposable
 
         public NativeSwitchStatus GetStatus() => new(null, NativeSwitchStates.Idle, null);
 
+        public Task<JournalResolutionResult> ResolveQuarantinedJournalAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present."));
+
         public Task<NativeSwitchResult> SwitchAsync(string targetAccountId, CancellationToken cancellationToken = default)
         {
             CallCount++;

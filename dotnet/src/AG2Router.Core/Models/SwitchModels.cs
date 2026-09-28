@@ -53,6 +53,29 @@ public sealed record ExplicitSwitchRequest(
     [property: JsonPropertyName("confirm")] bool Confirm
 );
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum JournalResolutionStatus
+{
+    NoJournal,
+    CleanCleanupCompleted,
+    ResolvedRestartRequired,
+    NotResolvable,
+    ProofFailed,
+    PersistenceFailure
+}
+
+public sealed record JournalResolutionResult(
+    [property: JsonPropertyName("status")] JournalResolutionStatus Status,
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("coherentAccountId")] string? CoherentAccountId = null,
+    [property: JsonPropertyName("restartRequired")] bool RestartRequired = false,
+    [property: JsonPropertyName("reasonCode")] string? ReasonCode = null
+);
+
+public sealed record ResolveQuarantineRequest(
+    [property: JsonPropertyName("confirm")] bool Confirm
+);
+
 public record NativeSwitchStatus(
     [property: JsonPropertyName("activeTransactionId")] string? ActiveTransactionId,
     [property: JsonPropertyName("currentState")] string CurrentState,
@@ -65,6 +88,7 @@ public interface INativeAccountSwitchCoordinator
     Task<NativeSwitchResult> SwitchAutomaticallyAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
         CancellationToken cancellationToken = default) => SwitchAsync(targetAccountId, cancellationToken);
+    Task<JournalResolutionResult> ResolveQuarantinedJournalAsync(CancellationToken cancellationToken = default);
     NativeSwitchStatus GetStatus();
     Task CoordinateShutdownAsync(TimeSpan timeout, CancellationToken cancellationToken = default);
 }

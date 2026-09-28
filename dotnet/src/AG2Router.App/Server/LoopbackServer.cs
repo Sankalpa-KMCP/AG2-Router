@@ -497,6 +497,134 @@ public class LoopbackServer : IAsyncDisposable
             return Results.Json(result, statusCode: statusCode);
         });
 
+        // POST /api/switching/resolve-quarantine - Proof-based operator journal resolution
+        _app.MapPost("/api/switching/resolve-quarantine", async (HttpContext context) =>
+        {
+            if (switchCoordinator == null)
+            {
+                return Results.Json(new { error = "Native account switching is not configured." },
+                    statusCode: StatusCodes.Status501NotImplemented);
+            }
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Resolution origin is not authorized." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+            string suppliedToken = context.Request.Headers["X-AG2-Switch-Token"].ToString();
+            if (!FixedTimeEquals(suppliedToken, switchIntentToken))
+            {
+                return Results.Json(new { error = "Switch authorization is required." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            ResolveQuarantineRequest? request;
+            try
+            {
+                request = await context.Request.ReadFromJsonAsync<ResolveQuarantineRequest>(
+                    cancellationToken: context.RequestAborted);
+            }
+            catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+            {
+                return Results.Json(new { error = "A valid resolution confirmation request is required." },
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+            if (request?.Confirm != true)
+            {
+                return Results.Json(new { error = "Confirmation is required to resolve switch quarantine." },
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            JournalResolutionResult result;
+            try
+            {
+                result = await switchCoordinator.ResolveQuarantinedJournalAsync(context.RequestAborted);
+            }
+            catch (Exception)
+            {
+                return Results.Json(new { error = "An unexpected error occurred during quarantine resolution." },
+                    statusCode: StatusCodes.Status500InternalServerError);
+            }
+
+            string safeMessage = (result.Status, result.ReasonCode) switch
+            {
+                (JournalResolutionStatus.NoJournal, _) => "No switch journal present.",
+                (JournalResolutionStatus.CleanCleanupCompleted, "CLEAN_RECORDED_REMOVED") => "Switch journal cleaned up successfully.",
+                (JournalResolutionStatus.CleanCleanupCompleted, "CLEAN_COMMITTED_PRECOMMIT_REMOVED") => "Switch journal cleaned up successfully; target metadata already active.",
+                (JournalResolutionStatus.CleanCleanupCompleted, _) => "Switch journal cleaned up successfully.",
+                (JournalResolutionStatus.ResolvedRestartRequired, _) => "Switch journal successfully resolved and removed. Application restart is required before normal routing resumes.",
+                (JournalResolutionStatus.NotResolvable, "CORRUPT_JOURNAL") => "The switch journal is corrupted and cannot be resolved automatically.",
+                (JournalResolutionStatus.NotResolvable, "UNSUPPORTED_VERSION") => "The switch journal uses an unsupported schema version and cannot be resolved automatically.",
+                (JournalResolutionStatus.NotResolvable, _) => "The switch journal cannot be resolved automatically.",
+                (JournalResolutionStatus.ProofFailed, "LIVE_IDENTITY_UNAVAILABLE") => "Live Antigravity identity is unavailable; start Antigravity and ensure an account is active before resolving.",
+                (JournalResolutionStatus.ProofFailed, "LIVE_IDENTITY_MISMATCH") => "Live Antigravity identity does not match the active account metadata.",
+                (JournalResolutionStatus.ProofFailed, "NO_ACTIVE_ACCOUNT") => "No active account is set in metadata.",
+                (JournalResolutionStatus.ProofFailed, "ACTIVE_ACCOUNT_NOT_FOUND") => "The active account was not found in metadata.",
+                (JournalResolutionStatus.ProofFailed, "ACCOUNT_NOT_ENROLLED") => "The active account is not validly enrolled or has no vaulted session.",
+                (JournalResolutionStatus.ProofFailed, "CREDENTIAL_MISSING") => "Windows Credential Manager entry is missing or empty.",
+                (JournalResolutionStatus.ProofFailed, "VAULT_SESSION_MISSING") => "Vaulted session for the active account is missing or empty.",
+                (JournalResolutionStatus.ProofFailed, "CREDENTIAL_MISMATCH") => "Windows Credential Manager payload does not match the vaulted session.",
+                (JournalResolutionStatus.ProofFailed, "CONCURRENT_MUTATION") => "State changed concurrently during resolution proof.",
+                (JournalResolutionStatus.ProofFailed, _) => "Account state coherence could not be verified.",
+                (JournalResolutionStatus.PersistenceFailure, "LOCK_TIMEOUT") => "Lock acquisition timed out during journal resolution.",
+                (JournalResolutionStatus.PersistenceFailure, "LEASE_ACQUISITION_FAILED") => "Cross-process lease acquisition failed.",
+                (JournalResolutionStatus.PersistenceFailure, "IO_ERROR") => "An I/O error occurred while accessing the switch journal.",
+                (JournalResolutionStatus.PersistenceFailure, "UNSUPPORTED_PLATFORM") => "Conditional switch journal deletion is not supported on this platform.",
+                (JournalResolutionStatus.PersistenceFailure, "DELETE_FAILED") => "Failed to delete the switch journal file.",
+                (JournalResolutionStatus.PersistenceFailure, _) => "A persistence failure occurred during journal resolution.",
+                _ => "An unexpected resolution state occurred."
+            };
+
+            string? safeReasonCode = (result.Status, result.ReasonCode) switch
+            {
+                (JournalResolutionStatus.NoJournal, null) => null,
+                (JournalResolutionStatus.NoJournal, "NO_JOURNAL") => "NO_JOURNAL",
+                (JournalResolutionStatus.ResolvedRestartRequired, null) => null,
+                (JournalResolutionStatus.CleanCleanupCompleted, "CLEAN_RECORDED_REMOVED") => "CLEAN_RECORDED_REMOVED",
+                (JournalResolutionStatus.CleanCleanupCompleted, "CLEAN_COMMITTED_PRECOMMIT_REMOVED") => "CLEAN_COMMITTED_PRECOMMIT_REMOVED",
+                (JournalResolutionStatus.CleanCleanupCompleted, null) => null,
+                (JournalResolutionStatus.NotResolvable, "CORRUPT_JOURNAL") => "CORRUPT_JOURNAL",
+                (JournalResolutionStatus.NotResolvable, "UNSUPPORTED_VERSION") => "UNSUPPORTED_VERSION",
+                (JournalResolutionStatus.ProofFailed, "LIVE_IDENTITY_UNAVAILABLE") => "LIVE_IDENTITY_UNAVAILABLE",
+                (JournalResolutionStatus.ProofFailed, "LIVE_IDENTITY_MISMATCH") => "LIVE_IDENTITY_MISMATCH",
+                (JournalResolutionStatus.ProofFailed, "NO_ACTIVE_ACCOUNT") => "NO_ACTIVE_ACCOUNT",
+                (JournalResolutionStatus.ProofFailed, "ACTIVE_ACCOUNT_NOT_FOUND") => "ACTIVE_ACCOUNT_NOT_FOUND",
+                (JournalResolutionStatus.ProofFailed, "ACCOUNT_NOT_ENROLLED") => "ACCOUNT_NOT_ENROLLED",
+                (JournalResolutionStatus.ProofFailed, "CREDENTIAL_MISSING") => "CREDENTIAL_MISSING",
+                (JournalResolutionStatus.ProofFailed, "VAULT_SESSION_MISSING") => "VAULT_SESSION_MISSING",
+                (JournalResolutionStatus.ProofFailed, "CREDENTIAL_MISMATCH") => "CREDENTIAL_MISMATCH",
+                (JournalResolutionStatus.ProofFailed, "CONCURRENT_MUTATION") => "CONCURRENT_MUTATION",
+                (JournalResolutionStatus.PersistenceFailure, "LOCK_TIMEOUT") => "LOCK_TIMEOUT",
+                (JournalResolutionStatus.PersistenceFailure, "LEASE_ACQUISITION_FAILED") => "LEASE_ACQUISITION_FAILED",
+                (JournalResolutionStatus.PersistenceFailure, "IO_ERROR") => "IO_ERROR",
+                (JournalResolutionStatus.PersistenceFailure, "UNSUPPORTED_PLATFORM") => "UNSUPPORTED_PLATFORM",
+                (JournalResolutionStatus.PersistenceFailure, "DELETE_FAILED") => "DELETE_FAILED",
+                (_, null) => null,
+                _ => "UNKNOWN"
+            };
+
+            var safeResponse = new JournalResolutionResult(
+                Status: result.Status,
+                Message: safeMessage,
+                CoherentAccountId: result.CoherentAccountId,
+                RestartRequired: result.RestartRequired,
+                ReasonCode: safeReasonCode
+            );
+
+            int statusCode = safeResponse.Status switch
+            {
+                JournalResolutionStatus.NoJournal => StatusCodes.Status200OK,
+                JournalResolutionStatus.CleanCleanupCompleted => StatusCodes.Status200OK,
+                JournalResolutionStatus.ResolvedRestartRequired => StatusCodes.Status200OK,
+                JournalResolutionStatus.NotResolvable => StatusCodes.Status409Conflict,
+                JournalResolutionStatus.ProofFailed when safeResponse.ReasonCode == "LIVE_IDENTITY_UNAVAILABLE" => StatusCodes.Status503ServiceUnavailable,
+                JournalResolutionStatus.ProofFailed => StatusCodes.Status409Conflict,
+                JournalResolutionStatus.PersistenceFailure => StatusCodes.Status500InternalServerError,
+                _ => StatusCodes.Status500InternalServerError
+            };
+
+            return Results.Json(safeResponse, statusCode: statusCode);
+        });
+
         // GET /api/config
         _app.MapGet("/api/config", () =>
         {

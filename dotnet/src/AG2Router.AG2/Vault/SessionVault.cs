@@ -403,6 +403,94 @@ public class SessionVault : ISessionVault
     }
 
     /// <summary>
+    /// Read-only recovery retrieval of an account session during quarantine.
+    /// Bypasses EnsureVaultAvailable() to permit proof-based reconciliation,
+    /// but strictly validates path lock, file lease, and identity framing without performing any mutations.
+    /// </summary>
+    internal async Task<byte[]?> GetSessionForRecoveryAsync(string accountId, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(accountId))
+        {
+            throw new VaultException("accountId is required");
+        }
+
+        VaultAccountRecord? record;
+        if (!await _pathLock.WaitAsync(AdmissionTimeout, cancellationToken).ConfigureAwait(false))
+        {
+            throw new VaultMutationUncertainException("Vault ownership did not become available.");
+        }
+
+        try
+        {
+            await using var lease = await CrossProcessFileLease.AcquireAsync(_vaultFilePath, cancellationToken).ConfigureAwait(false);
+            var envelope = ReadEnvelope();
+            if (!envelope.Records.TryGetValue(accountId, out record))
+            {
+                return null;
+            }
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
+
+        byte[] ciphertext = Convert.FromBase64String(record.EncryptedPayloadBase64);
+        byte[] decryptedBytes;
+
+        try
+        {
+            decryptedBytes = await _dpapiProvider.DecryptAsync(ciphertext, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw new VaultCorruptionException(
+                $"Failed to decrypt vaulted session for account '{accountId}': {ex.Message}", ex);
+        }
+
+        VaultedSessionPlaintext? plaintext;
+        try
+        {
+            plaintext = JsonSerializer.Deserialize<VaultedSessionPlaintext>(decryptedBytes, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            throw new VaultCorruptionException(
+                $"Vault record for account '{accountId}' decrypted but contained malformed JSON payload: {ex.Message}", ex);
+        }
+        finally
+        {
+            // Best-effort memory hygiene
+            CryptographicOperations.ZeroMemory(decryptedBytes);
+        }
+
+        if (plaintext == null)
+        {
+            throw new VaultCorruptionException($"Vault record for account '{accountId}' deserialized to null");
+        }
+
+        // Identity Framing Verification
+        if (plaintext.Version != VaultConstants.SchemaVersion)
+        {
+            throw new VaultCorruptionException(
+                $"Unsupported vaulted session version '{plaintext.Version}' for account '{accountId}'");
+        }
+
+        if (plaintext.AccountId != accountId)
+        {
+            throw new VaultCorruptionException(
+                $"Identity framing violation: payload accountId '{plaintext.AccountId}' does not match record '{accountId}'");
+        }
+
+        if (plaintext.Target != record.Target)
+        {
+            throw new VaultCorruptionException(
+                $"Target mismatch: payload target '{plaintext.Target}' does not match record target '{record.Target}'");
+        }
+
+        return Convert.FromBase64String(plaintext.CredentialBlobBase64);
+    }
+
+    /// <summary>
     /// Check if a session exists for the given accountId without decrypting it.
     /// </summary>
     public async Task<bool> HasSessionAsync(string accountId, CancellationToken cancellationToken = default)

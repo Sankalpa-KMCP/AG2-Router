@@ -252,6 +252,298 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
     }
 
+    private sealed record CoherenceProofOutcome(
+        bool IsProven,
+        string? ActiveAccountId,
+        string SafeMessage,
+        string? ReasonCode = null);
+
+    private async Task<CoherenceProofOutcome> VerifyCoherenceProofAsync(CancellationToken cancellationToken)
+    {
+        // 1. Persisted active account ID
+        string? activeAccountId;
+        try
+        {
+            activeAccountId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            return new CoherenceProofOutcome(false, null, "Failed to read active account from metadata.", "NO_ACTIVE_ACCOUNT");
+        }
+
+        if (string.IsNullOrWhiteSpace(activeAccountId))
+        {
+            return new CoherenceProofOutcome(false, null, "No active account is set in metadata.", "NO_ACTIVE_ACCOUNT");
+        }
+
+        // 2. Corresponding account metadata still exists
+        AccountMetadata? activeAccount;
+        try
+        {
+            activeAccount = await _accountStore.GetAccountAsync(activeAccountId, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            return new CoherenceProofOutcome(false, activeAccountId, "The active account was not found in metadata.", "ACTIVE_ACCOUNT_NOT_FOUND");
+        }
+
+        if (activeAccount == null)
+        {
+            return new CoherenceProofOutcome(false, activeAccountId, "The active account was not found in metadata.", "ACTIVE_ACCOUNT_NOT_FOUND");
+        }
+
+        // 3. Current enrollment/validation status is still acceptable
+        if (activeAccount.ValidationStatus != AccountValidationStatus.Valid || !activeAccount.HasVaultedSession)
+        {
+            return new CoherenceProofOutcome(false, activeAccountId, "The active account is not validly enrolled or has no vaulted session.", "ACCOUNT_NOT_ENROLLED");
+        }
+
+        // 4. Fresh live Antigravity identity still corresponds to the same active account
+        AccountIdentityDto? liveIdentity;
+        try
+        {
+            liveIdentity = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            return new CoherenceProofOutcome(false, activeAccountId, "Live Antigravity identity is unavailable; start Antigravity and ensure an account is active before resolving.", "LIVE_IDENTITY_UNAVAILABLE");
+        }
+
+        if (liveIdentity == null || string.IsNullOrWhiteSpace(liveIdentity.Email))
+        {
+            return new CoherenceProofOutcome(false, activeAccountId, "Live Antigravity identity is unavailable; start Antigravity and ensure an account is active before resolving.", "LIVE_IDENTITY_UNAVAILABLE");
+        }
+
+        if (!string.Equals(activeAccount.Email?.Trim(), liveIdentity.Email?.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            return new CoherenceProofOutcome(false, activeAccountId, "Live Antigravity identity does not match the active account metadata.", "LIVE_IDENTITY_MISMATCH");
+        }
+
+        // 5. Fresh WinCred & Recovery Vault Payload
+        WinCredEntry? winCred = null;
+        byte[]? vaultedSession = null;
+        try
+        {
+            try
+            {
+                winCred = await _winCredReader.ReadCredentialAsync(WinCredTarget, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                return new CoherenceProofOutcome(false, activeAccountId, "Windows Credential Manager entry is missing or empty.", "CREDENTIAL_MISSING");
+            }
+
+            if (winCred?.Blob == null || winCred.Blob.Length == 0)
+            {
+                return new CoherenceProofOutcome(false, activeAccountId, "Windows Credential Manager entry is missing or empty.", "CREDENTIAL_MISSING");
+            }
+
+            try
+            {
+                vaultedSession = await _sessionVault.GetSessionForRecoveryAsync(activeAccountId, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                return new CoherenceProofOutcome(false, activeAccountId, "Vaulted session for the active account is missing or empty.", "VAULT_SESSION_MISSING");
+            }
+
+            if (vaultedSession == null || vaultedSession.Length == 0)
+            {
+                return new CoherenceProofOutcome(false, activeAccountId, "Vaulted session for the active account is missing or empty.", "VAULT_SESSION_MISSING");
+            }
+
+            // 6. WinCred payload equals vaulted session using constant-time byte comparison
+            bool credsMatch = winCred.Blob.Length == vaultedSession.Length
+                           && CryptographicOperations.FixedTimeEquals(winCred.Blob, vaultedSession);
+
+            if (!credsMatch)
+            {
+                return new CoherenceProofOutcome(false, activeAccountId, "Windows Credential Manager payload does not match the vaulted session.", "CREDENTIAL_MISMATCH");
+            }
+
+            return new CoherenceProofOutcome(true, activeAccountId, "Coherence verified.");
+        }
+        finally
+        {
+            if (winCred?.Blob != null) CryptographicOperations.ZeroMemory(winCred.Blob);
+            if (vaultedSession != null) CryptographicOperations.ZeroMemory(vaultedSession);
+        }
+    }
+
+    public async Task<JournalResolutionResult> ResolveQuarantinedJournalAsync(CancellationToken cancellationToken = default)
+    {
+        await SwitchGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            string switchResource = _sessionVault.GetVaultPath() + ".switch";
+            var switchLock = PathLockRegistry.Get(switchResource);
+            if (!await switchLock.WaitAsync(_transactionTimeout, cancellationToken).ConfigureAwait(false))
+            {
+                return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Lock acquisition timed out during journal resolution.", ReasonCode: "LOCK_TIMEOUT");
+            }
+
+            CrossProcessFileLease? switchLease = null;
+            try
+            {
+                try
+                {
+                    switchLease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Cross-process lease acquisition failed.", ReasonCode: "LEASE_ACQUISITION_FAILED");
+                }
+
+                SwitchJournalReadResult readResult;
+                try
+                {
+                    readResult = await _journalStore.ReadAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR");
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.Absent)
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false);
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.Corrupt)
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.NotResolvable, "The switch journal is corrupted and cannot be resolved automatically.", ReasonCode: "CORRUPT_JOURNAL");
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.UnsupportedVersion)
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.NotResolvable, "The switch journal uses an unsupported schema version and cannot be resolved automatically.", ReasonCode: "UNSUPPORTED_VERSION");
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.IoError)
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR");
+                }
+
+                if (readResult.Status != SwitchJournalReadStatus.Valid || readResult.Entry == null)
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR");
+                }
+
+                var entry = readResult.Entry;
+
+                // F-270-3: Clean-only states alignment with Step 3
+                if (entry.State == SwitchJournalState.RECORDED)
+                {
+                    // No durable credential or metadata mutation began before crash. Clean cleanup.
+                    var del = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
+                    return del.Status switch
+                    {
+                        SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(JournalResolutionStatus.CleanCleanupCompleted, "Switch journal cleaned up successfully.", RestartRequired: false, ReasonCode: "CLEAN_RECORDED_REMOVED"),
+                        SwitchJournalDeleteStatus.Absent => new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false),
+                        SwitchJournalDeleteStatus.NotMatched => new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"),
+                        SwitchJournalDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Conditional switch journal deletion is not supported on this platform.", RestartRequired: false, ReasonCode: "UNSUPPORTED_PLATFORM"),
+                        _ => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Failed to delete the switch journal file.", ReasonCode: "DELETE_FAILED")
+                    };
+                }
+
+                if (entry.State == SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT)
+                {
+                    string? currentActiveId = null;
+                    try
+                    {
+                        currentActiveId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Fall through to unresolved proof path
+                    }
+
+                    if (string.Equals(currentActiveId, entry.TargetAccountId, StringComparison.Ordinal))
+                    {
+                        // Metadata commit already completed before crash. Clean cleanup.
+                        var del = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
+                        return del.Status switch
+                        {
+                            SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(JournalResolutionStatus.CleanCleanupCompleted, "Switch journal cleaned up successfully.", RestartRequired: false, ReasonCode: "CLEAN_COMMITTED_PRECOMMIT_REMOVED"),
+                            SwitchJournalDeleteStatus.Absent => new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false),
+                            SwitchJournalDeleteStatus.NotMatched => new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"),
+                            SwitchJournalDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Conditional switch journal deletion is not supported on this platform.", RestartRequired: false, ReasonCode: "UNSUPPORTED_PLATFORM"),
+                            _ => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Failed to delete the switch journal file.", ReasonCode: "DELETE_FAILED")
+                        };
+                    }
+                }
+
+                // Primary Proof-Resolution Cases (CREDENTIAL_APPLYING, unresolved PRECOMMIT, ROLLING_BACK, QUARANTINED):
+                // 1. Initial 4-Pillar Proof:
+                var initialProof = await VerifyCoherenceProofAsync(cancellationToken).ConfigureAwait(false);
+                if (!initialProof.IsProven)
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.ProofFailed, initialProof.SafeMessage, ReasonCode: initialProof.ReasonCode);
+                }
+
+                // 2. Final 4-Pillar Proof (F-270-1) immediately before delete:
+                var finalProof = await VerifyCoherenceProofAsync(cancellationToken).ConfigureAwait(false);
+                if (!finalProof.IsProven)
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.ProofFailed, finalProof.SafeMessage, ReasonCode: finalProof.ReasonCode);
+                }
+
+                if (!string.Equals(finalProof.ActiveAccountId, initialProof.ActiveAccountId, StringComparison.Ordinal))
+                {
+                    return new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION");
+                }
+
+                // 3. Conditional Journal Deletion (F-270-2):
+                var deleteResult = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
+                return deleteResult.Status switch
+                {
+                    SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(
+                        JournalResolutionStatus.ResolvedRestartRequired,
+                        "Switch journal successfully resolved and removed. Application restart is required before normal routing resumes.",
+                        CoherentAccountId: finalProof.ActiveAccountId,
+                        RestartRequired: true),
+                    SwitchJournalDeleteStatus.NotMatched => new JournalResolutionResult(
+                        JournalResolutionStatus.ProofFailed,
+                        "State changed concurrently during resolution proof.",
+                        ReasonCode: "CONCURRENT_MUTATION"),
+                    SwitchJournalDeleteStatus.Absent => new JournalResolutionResult(
+                        JournalResolutionStatus.NoJournal,
+                        "No switch journal present.",
+                        RestartRequired: false),
+                    SwitchJournalDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(
+                        JournalResolutionStatus.PersistenceFailure,
+                        "Conditional switch journal deletion is not supported on this platform.",
+                        CoherentAccountId: finalProof.ActiveAccountId,
+                        RestartRequired: false,
+                        ReasonCode: "UNSUPPORTED_PLATFORM"),
+                    _ => new JournalResolutionResult(
+                        JournalResolutionStatus.PersistenceFailure,
+                        "Failed to delete the switch journal file.",
+                        CoherentAccountId: finalProof.ActiveAccountId,
+                        RestartRequired: true,
+                        ReasonCode: "DELETE_FAILED")
+                };
+            }
+            finally
+            {
+                if (BeforeLeaseReleaseAsync is { } beforeRelease)
+                {
+                    try { await beforeRelease().ConfigureAwait(false); } catch { }
+                }
+                if (switchLease != null)
+                {
+                    await switchLease.DisposeAsync().ConfigureAwait(false);
+                }
+                switchLock.Release();
+            }
+        }
+        finally
+        {
+            SwitchGate.Release();
+        }
+    }
+
+
     public async Task<NativeSwitchResult> SwitchAsync(
         string targetAccountId,
         CancellationToken cancellationToken = default)
