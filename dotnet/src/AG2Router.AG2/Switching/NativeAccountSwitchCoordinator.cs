@@ -25,7 +25,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     private readonly TimeSpan _rollbackTimeout;
     private readonly TimeSpan _transactionTimeout;
     private readonly RecoveryQuarantine _recoveryQuarantine;
-    private readonly ISwitchJournalStore? _journalStore;
+    private readonly ISwitchJournalStore _journalStore;
     private readonly object _statusLock = new();
     private readonly CancellationTokenSource _shutdownCts = new();
     private volatile bool _isShuttingDown;
@@ -42,12 +42,12 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         IWinCredWriter winCredWriter,
         IAG2Adapter adapter,
         IAG2ProcessLifecycle processLifecycle,
+        ISwitchJournalStore switchJournalStore,
         TimeSpan? processTimeout = null,
         TimeSpan? verificationTimeout = null,
         TimeSpan? pollInterval = null,
         TimeSpan? rollbackTimeout = null,
-        TimeSpan? transactionTimeout = null,
-        ISwitchJournalStore? switchJournalStore = null)
+        TimeSpan? transactionTimeout = null)
     {
         _accountStore = accountStore ?? throw new ArgumentNullException(nameof(accountStore));
         _sessionVault = sessionVault ?? throw new ArgumentNullException(nameof(sessionVault));
@@ -55,6 +55,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         _winCredWriter = winCredWriter ?? throw new ArgumentNullException(nameof(winCredWriter));
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _processLifecycle = processLifecycle ?? throw new ArgumentNullException(nameof(processLifecycle));
+        _journalStore = switchJournalStore ?? throw new ArgumentNullException(nameof(switchJournalStore));
         _processTimeout = processTimeout ?? TimeSpan.FromSeconds(10);
         _verificationTimeout = verificationTimeout ?? TimeSpan.FromSeconds(20);
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(200);
@@ -64,7 +65,6 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             (_processTimeout + _verificationTimeout + _rollbackTimeout + TimeSpan.FromSeconds(30));
         if (_transactionTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(transactionTimeout));
         _recoveryQuarantine = RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
-        _journalStore = switchJournalStore;
     }
 
     public NativeSwitchStatus GetStatus()
@@ -102,6 +102,153 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             throw new TimeoutException("An account switch is still completing or recovering; shutdown was not completed.");
+        }
+    }
+
+    public async Task<StartupJournalReconciliationResult> ReconcileStartupJournalAsync(CancellationToken cancellationToken = default)
+    {
+        await SwitchGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            string switchResource = _sessionVault.GetVaultPath() + ".switch";
+            var switchLock = PathLockRegistry.Get(switchResource);
+            if (!await switchLock.WaitAsync(_transactionTimeout, cancellationToken).ConfigureAwait(false))
+            {
+                _sessionVault.QuarantineUnresolvedMutation();
+                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Lock acquisition timed out during startup reconciliation.");
+            }
+
+            CrossProcessFileLease? switchLease = null;
+            try
+            {
+                try
+                {
+                    switchLease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _sessionVault.QuarantineUnresolvedMutation();
+                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Cross-process lease acquisition failed: {ex.Message}");
+                }
+
+                SwitchJournalReadResult readResult;
+                try
+                {
+                    readResult = await _journalStore.ReadAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _sessionVault.QuarantineUnresolvedMutation();
+                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"I/O error reading switch journal: {ex.Message}");
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.Absent)
+                {
+                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "No switch journal present.");
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.Corrupt)
+                {
+                    _sessionVault.QuarantineUnresolvedMutation();
+                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Corrupt switch journal found: {readResult.ErrorMessage}");
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.UnsupportedVersion)
+                {
+                    _sessionVault.QuarantineUnresolvedMutation();
+                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unsupported switch journal schema: {readResult.ErrorMessage}");
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.IoError)
+                {
+                    _sessionVault.QuarantineUnresolvedMutation();
+                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"I/O error reading switch journal: {readResult.ErrorMessage}");
+                }
+
+                if (readResult.Status == SwitchJournalReadStatus.Valid)
+                {
+                    var entry = readResult.Entry!;
+                    switch (entry.State)
+                    {
+                        case SwitchJournalState.RECORDED:
+                            try
+                            {
+                                await _journalStore.DeleteAsync(cancellationToken).ConfigureAwait(false);
+                                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "RECORDED journal cleaned up.", RetainedEntry: null);
+                            }
+                            catch (Exception ex)
+                            {
+                                // Proven clean underlying state. Do NOT quarantine!
+                                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Degraded, $"Failed to delete RECORDED journal: {ex.Message}", RetainedEntry: entry);
+                            }
+
+                        case SwitchJournalState.CREDENTIAL_APPLYING:
+                            _sessionVault.QuarantineUnresolvedMutation();
+                            return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Unresolved CREDENTIAL_APPLYING journal found.", RetainedEntry: entry);
+
+                        case SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT:
+                            string? activeAccountId;
+                            try
+                            {
+                                activeAccountId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                _sessionVault.QuarantineUnresolvedMutation();
+                                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Failed to read metadata for PRECOMMIT journal: {ex.Message}", RetainedEntry: entry);
+                            }
+
+                            if (string.Equals(activeAccountId, entry.TargetAccountId, StringComparison.Ordinal))
+                            {
+                                // Metadata commit already completed!
+                                try
+                                {
+                                    await _journalStore.DeleteAsync(cancellationToken).ConfigureAwait(false);
+                                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "PRECOMMIT journal cleaned up; target metadata already active.", RetainedEntry: null);
+                                }
+                                catch (Exception ex)
+                                {
+                                    // Proven coherent. Do NOT quarantine!
+                                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Degraded, $"Failed to delete PRECOMMIT journal: {ex.Message}", RetainedEntry: entry);
+                                }
+                            }
+                            else
+                            {
+                                // Active account is source, other, or null. Quarantine!
+                                // NEVER call TryFinalizeSwitchAsync during startup!
+                                _sessionVault.QuarantineUnresolvedMutation();
+                                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"PRECOMMIT journal found but active account '{activeAccountId}' does not match target '{entry.TargetAccountId}'.", RetainedEntry: entry);
+                            }
+
+                        case SwitchJournalState.ROLLING_BACK:
+                            _sessionVault.QuarantineUnresolvedMutation();
+                            return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Unresolved ROLLING_BACK journal found.", RetainedEntry: entry);
+
+                        case SwitchJournalState.QUARANTINED:
+                            _sessionVault.QuarantineUnresolvedMutation();
+                            return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "QUARANTINED journal found.", RetainedEntry: entry);
+
+                        default:
+                            _sessionVault.QuarantineUnresolvedMutation();
+                            return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unrecognized journal state '{entry.State}'.", RetainedEntry: entry);
+                    }
+                }
+
+                _sessionVault.QuarantineUnresolvedMutation();
+                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unknown switch journal read status '{readResult.Status}'.");
+            }
+            finally
+            {
+                if (switchLease != null)
+                {
+                    await switchLease.DisposeAsync().ConfigureAwait(false);
+                }
+                switchLock.Release();
+            }
+        }
+        finally
+        {
+            SwitchGate.Release();
         }
     }
 
@@ -375,16 +522,13 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             var mutationToken = mutationCts.Token;
 
             // Phase Transition a: RECORDED (strictly before StopVerifiedAsync)
-            if (_journalStore != null)
-            {
-                await WriteJournalStateAsync(
-                    transactionId,
-                    SwitchJournalState.RECORDED,
-                    sourceAccount!.Id,
-                    target.Id,
-                    quarantineReasonCode: null,
-                    cancellationToken: mutationToken).ConfigureAwait(false);
-            }
+            await WriteJournalStateAsync(
+                transactionId,
+                SwitchJournalState.RECORDED,
+                sourceAccount!.Id,
+                target.Id,
+                quarantineReasonCode: null,
+                cancellationToken: mutationToken).ConfigureAwait(false);
 
             await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken,
                     async token =>
@@ -432,16 +576,13 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             ValidateCredential(targetCredential, requireConfiguredTarget: true);
 
             // Phase Transition b: CREDENTIAL_APPLYING (strictly before WriteCredentialAsync)
-            if (_journalStore != null)
-            {
-                await WriteJournalStateAsync(
-                    transactionId,
-                    SwitchJournalState.CREDENTIAL_APPLYING,
-                    sourceAccount!.Id,
-                    target.Id,
-                    quarantineReasonCode: null,
-                    cancellationToken: mutationToken).ConfigureAwait(false);
-            }
+            await WriteJournalStateAsync(
+                transactionId,
+                SwitchJournalState.CREDENTIAL_APPLYING,
+                sourceAccount!.Id,
+                target.Id,
+                quarantineReasonCode: null,
+                cancellationToken: mutationToken).ConfigureAwait(false);
 
             SetState(NativeSwitchStates.ApplyingCredential);
             credentialWriteAttempted = true;
@@ -474,16 +615,13 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             }
 
             // Phase Transition c: TARGET_IDENTITY_VERIFIED_PRECOMMIT (strictly before TryFinalizeSwitchAsync)
-            if (_journalStore != null)
-            {
-                await WriteJournalStateAsync(
-                    transactionId,
-                    SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT,
-                    sourceAccount!.Id,
-                    target.Id,
-                    quarantineReasonCode: null,
-                    cancellationToken: mutationToken).ConfigureAwait(false);
-            }
+            await WriteJournalStateAsync(
+                transactionId,
+                SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT,
+                sourceAccount!.Id,
+                target.Id,
+                quarantineReasonCode: null,
+                cancellationToken: mutationToken).ConfigureAwait(false);
 
             var updated = await _accountStore.TryFinalizeSwitchAsync(previousAccountId, target.Id, new UpdateAccountInput(
                 ValidationStatus: AccountValidationStatus.Valid,
@@ -496,10 +634,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             // Phase Transition d: Success Deletion (only after TryFinalizeSwitchAsync succeeds)
             try
             {
-                if (_journalStore != null)
-                {
-                    await _journalStore.DeleteAsync(mutationToken).ConfigureAwait(false);
-                }
+                await _journalStore.DeleteAsync(mutationToken).ConfigureAwait(false);
             }
             catch (Exception)
             {
@@ -513,20 +648,14 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
         catch (SwitchRejectedException ex) when (!processTransitionStarted)
         {
-            if (_journalStore != null)
-            {
-                try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
-            }
+            try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
             return Terminal(transactionId, false, ex.Code, NativeSwitchStates.Failed,
                 requestedId, target?.Email, previousAccountId, previousEmail,
                 AG2Security.RedactSensitiveText(ex.Message), stages, now);
         }
         catch (OperationCanceledException) when (!processTransitionStarted)
         {
-            if (_journalStore != null)
-            {
-                try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
-            }
+            try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
             return Terminal(transactionId, false, SwitchResultCodes.Cancelled, NativeSwitchStates.Failed,
                 requestedId, target?.Email, previousAccountId, previousEmail,
                 "Switch request was cancelled before credential mutation.", stages, now);
@@ -535,10 +664,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         {
             if (!processTransitionStarted || originalCredential == null || processSnapshot == null)
             {
-                if (_journalStore != null)
-                {
-                    try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
-                }
+                try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
                 return Terminal(transactionId, false,
                     switchError is OperationCanceledException ? SwitchResultCodes.Cancelled : SwitchResultCodes.TelemetryUnavailable,
                     NativeSwitchStates.Failed, requestedId, target?.Email, previousAccountId, previousEmail,
@@ -551,16 +677,13 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             // Phase Transition e: ROLLING_BACK (strictly before QuiesceForRollbackAsync or restoring credentials)
             try
             {
-                if (_journalStore != null)
-                {
-                    await WriteJournalStateAsync(
-                        transactionId,
-                        SwitchJournalState.ROLLING_BACK,
-                        sourceAccount?.Id ?? previousAccountId ?? string.Empty,
-                        target?.Id ?? requestedId,
-                        quarantineReasonCode: null,
-                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
-                }
+                await WriteJournalStateAsync(
+                    transactionId,
+                    SwitchJournalState.ROLLING_BACK,
+                    sourceAccount?.Id ?? previousAccountId ?? string.Empty,
+                    target?.Id ?? requestedId,
+                    quarantineReasonCode: null,
+                    cancellationToken: CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception rollbackJournalError)
             {
@@ -616,10 +739,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 // Phase Transition f: Rollback Success Deletion
                 try
                 {
-                    if (_journalStore != null)
-                    {
-                        await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
-                    }
+                    await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (Exception)
                 {
@@ -638,16 +758,13 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
                 try
                 {
-                    if (_journalStore != null)
-                    {
-                        await WriteJournalStateAsync(
-                            transactionId,
-                            SwitchJournalState.QUARANTINED,
-                            sourceAccount?.Id ?? previousAccountId ?? string.Empty,
-                            target?.Id ?? requestedId,
-                            quarantineReasonCode: "ROLLBACK_FAILED",
-                            cancellationToken: CancellationToken.None).ConfigureAwait(false);
-                    }
+                    await WriteJournalStateAsync(
+                        transactionId,
+                        SwitchJournalState.QUARANTINED,
+                        sourceAccount?.Id ?? previousAccountId ?? string.Empty,
+                        target?.Id ?? requestedId,
+                        quarantineReasonCode: "ROLLBACK_FAILED",
+                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (Exception)
                 {
@@ -929,8 +1046,6 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         string? quarantineReasonCode = null,
         CancellationToken cancellationToken = default)
     {
-        if (_journalStore == null) return;
-
         var entry = new SwitchJournalEntry
         {
             Magic = SwitchJournalEntry.CurrentMagic,

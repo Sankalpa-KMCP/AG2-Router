@@ -124,6 +124,25 @@ public interface ISwitchJournalStore
 }
 
 /// <summary>
+/// Status classification for startup switch transaction journal reconciliation.
+/// </summary>
+public enum StartupJournalReconciliationStatus
+{
+    Clean,
+    Quarantined,
+    Degraded
+}
+
+/// <summary>
+/// Result of startup switch transaction journal reconciliation conforming to ADR-001.
+/// </summary>
+public sealed record StartupJournalReconciliationResult(
+    StartupJournalReconciliationStatus Status,
+    string? Message = null,
+    SwitchJournalEntry? RetainedEntry = null
+);
+
+/// <summary>
 /// Formats DateTimeOffset as ISO-8601 UTC in roundtrip "O" format.
 /// </summary>
 internal sealed class IsoDateTimeOffsetConverter : JsonConverter<DateTimeOffset>
