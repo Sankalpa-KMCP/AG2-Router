@@ -82,15 +82,36 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
             _credentials,
             _adapter,
             _process,
+            _journal,
             processTimeout: TimeSpan.FromMilliseconds(100),
             verificationTimeout: verificationTimeout ?? TimeSpan.FromMilliseconds(100),
             pollInterval: TimeSpan.FromMilliseconds(5),
             rollbackTimeout: TimeSpan.FromMilliseconds(500),
-            transactionTimeout: transactionTimeout ?? TimeSpan.FromSeconds(5),
-            switchJournalStore: _journal);
+            transactionTimeout: transactionTimeout ?? TimeSpan.FromSeconds(5));
 
     private static WinCredEntry CreateCredential(string user, string secret) =>
         new("gemini:antigravity", 1, user, 2, Encoding.UTF8.GetBytes(secret));
+
+    private async Task SeedJournalAsync(SwitchJournalState state, string sourceId, string targetId, string? reason = null)
+    {
+        var entry = new SwitchJournalEntry
+        {
+            Magic = SwitchJournalConstants.Magic,
+            SchemaVersion = SwitchJournalConstants.CurrentSchemaVersion,
+            TransactionId = Guid.NewGuid().ToString("D"),
+            State = state,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            SourceAccountId = sourceId,
+            TargetAccountId = targetId,
+            QuarantineReasonCode = reason
+        };
+        await _journal.WriteEntryAsync(entry);
+    }
+
+    private async Task WriteRawJournalAsync(string text)
+    {
+        await File.WriteAllTextAsync(_journal.JournalFilePath, text, Encoding.UTF8);
+    }
 
     // 1. Happy path: verifies exact sequence of journal writes:
     // RECORDED -> CREDENTIAL_APPLYING -> TARGET_IDENTITY_VERIFIED_PRECOMMIT -> DeleteAsync
@@ -474,6 +495,512 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         }
     }
 
+    // =========================================================================
+    // ADR-001 Step 3: Startup Switch Journal Reconciliation Tests (AC 1-30)
+    // =========================================================================
+
+    // 1. no journal -> Clean
+    [Fact]
+    public async Task Reconciliation_01_NoJournal_ReturnsClean()
+    {
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, result.Status);
+        Assert.Null(result.RetainedEntry);
+        Assert.False(_vault.IsQuarantined);
+    }
+
+    // 2. RECORDED -> delete -> Clean
+    [Fact]
+    public async Task Reconciliation_02_Recorded_DeletesJournalAndReturnsClean()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, result.Status);
+        Assert.Null(result.RetainedEntry);
+        Assert.False(File.Exists(_journal.JournalFilePath));
+        Assert.False(_vault.IsQuarantined);
+    }
+
+    // 3. RECORDED delete failure -> Degraded + retained + no quarantine
+    [Fact]
+    public async Task Reconciliation_03_Recorded_DeleteFailure_ReturnsDegradedAndRetains_NoQuarantine()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+        _journal.FailOnDelete = true;
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Degraded, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.RECORDED, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.False(_vault.IsQuarantined);
+    }
+
+    // 4. CREDENTIAL_APPLYING -> retain + quarantine
+    [Fact]
+    public async Task Reconciliation_04_CredentialApplying_RetainsAndQuarantines()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.CREDENTIAL_APPLYING, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.True(_vault.IsQuarantined);
+    }
+
+    // 5. PRECOMMIT + metadata target -> delete -> Clean
+    [Fact]
+    public async Task Reconciliation_05_Precommit_MetadataTarget_DeletesJournalAndReturnsClean()
+    {
+        await SeedAccountsAsync();
+        await _accounts.SetActiveAccountIdAsync(_target!.Id);
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source!.Id, _target!.Id);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, result.Status);
+        Assert.Null(result.RetainedEntry);
+        Assert.False(File.Exists(_journal.JournalFilePath));
+        Assert.False(_vault.IsQuarantined);
+    }
+
+    // 6. PRECOMMIT + metadata target delete failure -> Degraded + retained + no quarantine
+    [Fact]
+    public async Task Reconciliation_06_Precommit_MetadataTarget_DeleteFailure_ReturnsDegradedAndRetains_NoQuarantine()
+    {
+        await SeedAccountsAsync();
+        await _accounts.SetActiveAccountIdAsync(_target!.Id);
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source!.Id, _target!.Id);
+        _journal.FailOnDelete = true;
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Degraded, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.False(_vault.IsQuarantined);
+    }
+
+    // 7. PRECOMMIT + metadata source -> quarantine + no metadata finalize
+    [Fact]
+    public async Task Reconciliation_07_Precommit_MetadataSource_QuarantinesAndDoesNotFinalize()
+    {
+        await SeedAccountsAsync();
+        // Active account is _source.Id
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source!.Id, _target!.Id);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.True(_vault.IsQuarantined);
+        Assert.Equal(0, _accounts.FinalizeCalls);
+        Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
+    }
+
+    // 8. PRECOMMIT + metadata other -> quarantine
+    [Fact]
+    public async Task Reconciliation_08_Precommit_MetadataOther_Quarantines()
+    {
+        await SeedAccountsAsync();
+        var other = await _accounts.AddAccountAsync(new CreateAccountInput(Email: "other@example.com"));
+        await _accounts.SetActiveAccountIdAsync(other.Id);
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source!.Id, _target!.Id);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.True(_vault.IsQuarantined);
+    }
+
+    // 9. PRECOMMIT + metadata null/missing -> quarantine
+    [Fact]
+    public async Task Reconciliation_09_Precommit_MetadataNullOrMissing_Quarantines()
+    {
+        await SeedAccountsAsync();
+        _accounts.GetActiveAccountIdBehavior = _ => Task.FromResult<string?>(null);
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source!.Id, _target!.Id);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.True(_vault.IsQuarantined);
+    }
+
+    // 10. PRECOMMIT + metadata read failure -> quarantine
+    [Fact]
+    public async Task Reconciliation_10_Precommit_MetadataReadFailure_Quarantines()
+    {
+        await SeedAccountsAsync();
+        _accounts.GetActiveAccountIdBehavior = _ => Task.FromException<string?>(new IOException("Disk read failure"));
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source!.Id, _target!.Id);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.True(_vault.IsQuarantined);
+    }
+
+    // 11. ROLLING_BACK -> quarantine
+    [Fact]
+    public async Task Reconciliation_11_RollingBack_Quarantines()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.ROLLING_BACK, _source!.Id, _target!.Id);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.ROLLING_BACK, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.True(_vault.IsQuarantined);
+    }
+
+    // 12. QUARANTINED -> re-mark quarantine
+    [Fact]
+    public async Task Reconciliation_12_Quarantined_ReMarksQuarantine()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.QUARANTINED, _source!.Id, _target!.Id, reason: "ROLLBACK_FAILED");
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.NotNull(result.RetainedEntry);
+        Assert.Equal(SwitchJournalState.QUARANTINED, result.RetainedEntry.State);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.True(_vault.IsQuarantined);
+    }
+
+    // 13. malformed JSON -> bytes preserved + quarantine
+    [Fact]
+    public async Task Reconciliation_13_MalformedJson_PreservesBytesAndQuarantines()
+    {
+        const string malformed = "{\"magic\": \"AG2SWITCHJRNL\", \"state\": ";
+        await WriteRawJournalAsync(malformed);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.True(_vault.IsQuarantined);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.Equal(malformed, await File.ReadAllTextAsync(_journal.JournalFilePath));
+    }
+
+    // 14. truncated JSON -> bytes preserved + quarantine
+    [Fact]
+    public async Task Reconciliation_14_TruncatedJson_PreservesBytesAndQuarantines()
+    {
+        const string truncated = "{\"magic\": \"AG2SWITCHJRNL\"";
+        await WriteRawJournalAsync(truncated);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.True(_vault.IsQuarantined);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.Equal(truncated, await File.ReadAllTextAsync(_journal.JournalFilePath));
+    }
+
+    // 15. wrong magic -> artifact preserved + quarantine
+    [Fact]
+    public async Task Reconciliation_15_WrongMagic_PreservesArtifactAndQuarantines()
+    {
+        const string wrongMagic = "{\"magic\": \"WRONGMAGIC\", \"schemaVersion\": 1, \"transactionId\": \"123\", \"state\": \"RECORDED\"}";
+        await WriteRawJournalAsync(wrongMagic);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.True(_vault.IsQuarantined);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.Equal(wrongMagic, await File.ReadAllTextAsync(_journal.JournalFilePath));
+    }
+
+    // 16. unsupported future schema -> artifact preserved + quarantine
+    [Fact]
+    public async Task Reconciliation_16_UnsupportedFutureSchema_PreservesArtifactAndQuarantines()
+    {
+        const string futureSchema = "{\"magic\": \"AG2SWITCHJRNL\", \"schemaVersion\": 999, \"transactionId\": \"123\", \"state\": \"RECORDED\"}";
+        await WriteRawJournalAsync(futureSchema);
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.True(_vault.IsQuarantined);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.Equal(futureSchema, await File.ReadAllTextAsync(_journal.JournalFilePath));
+    }
+
+    // 17. journal read I/O error -> NOT clean/absent; quarantine
+    [Fact]
+    public async Task Reconciliation_17_JournalReadIoError_Quarantines()
+    {
+        _journal.ReadBehavior = _ => Task.FromResult(SwitchJournalReadResult.IoError(new IOException("Simulated file lock/disk I/O error")));
+
+        var result = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.True(_vault.IsQuarantined);
+    }
+
+    // 18. path/cross-process lease timeout -> fail closed; no journal/metadata mutation
+    [Fact]
+    public async Task Reconciliation_18_PathOrCrossProcessLeaseTimeout_FailsClosedNoMutation()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+
+        string switchResource = _vault.GetVaultPath() + ".switch";
+        var existingLock = PathLockRegistry.Get(switchResource);
+        Assert.True(await existingLock.WaitAsync(TimeSpan.FromSeconds(5)));
+        try
+        {
+            var coordinator = CreateCoordinator(transactionTimeout: TimeSpan.FromMilliseconds(50));
+            var result = await coordinator.ReconcileStartupJournalAsync();
+
+            Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+            Assert.Contains("timed out", result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.True(_vault.IsQuarantined);
+            // Must not delete journal or mutate metadata
+            Assert.True(File.Exists(_journal.JournalFilePath));
+            Assert.Equal(0, _accounts.FinalizeCalls);
+        }
+        finally
+        {
+            existingLock.Release();
+        }
+    }
+
+    // 19. startup quarantine blocks switch
+    [Fact]
+    public async Task Reconciliation_19_StartupQuarantine_BlocksSwitch()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+
+        var switchResult = await coordinator.SwitchAsync(_target!.Id);
+        Assert.False(switchResult.Success);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, switchResult.Code);
+        Assert.True(switchResult.ManualRecoveryRequired);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+    }
+
+    // 20. startup quarantine blocks enrollment
+    [Fact]
+    public async Task Reconciliation_20_StartupQuarantine_BlocksEnrollment()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+
+        var enrollmentService = new AccountEnrollmentService(_adapter, _credentials, _vault, _accounts);
+        var ex = await Assert.ThrowsAsync<AccountEnrollmentException>(() => enrollmentService.EnrollCurrentAccountAsync());
+        Assert.Contains("unresolved", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // 21. startup quarantine blocks removal
+    [Fact]
+    public async Task Reconciliation_21_StartupQuarantine_BlocksRemoval()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+
+        var removalService = new AccountRemovalService(_accounts, _vault);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => removalService.RemoveAsync(_target!.Id));
+        Assert.Contains("unresolved", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // 22. reconciliation makes zero WinCred mutation calls
+    [Fact]
+    public async Task Reconciliation_22_MakesZeroWinCredMutationCalls()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    // 23. reconciliation makes zero process lifecycle mutation calls
+    [Fact]
+    public async Task Reconciliation_23_MakesZeroProcessLifecycleMutationCalls()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _process.QuiesceCount);
+        Assert.Equal(0, _process.LaunchCount);
+        Assert.Equal(0, _process.RestoreCount);
+    }
+
+    // 24. reconciliation never calls TryFinalizeSwitchAsync
+    [Fact]
+    public async Task Reconciliation_24_NeverCallsTryFinalizeSwitchAsync()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(0, _accounts.FinalizeCalls);
+    }
+
+    // 25. ordinary reconciliation makes zero live identity/RPC calls
+    [Fact]
+    public async Task Reconciliation_25_OrdinaryReconciliation_MakesZeroLiveIdentityOrRpcCalls()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(0, _adapter.CallCount);
+    }
+
+    // 26. coordinator requires a journal dependency at construction (ArgumentNullException when null)
+    [Fact]
+    public void Reconciliation_26_CoordinatorRequiresJournalDependencyAtConstruction_ThrowsArgumentNullException()
+    {
+        var ex = Assert.Throws<ArgumentNullException>(() => new NativeAccountSwitchCoordinator(
+            _accounts,
+            _vault,
+            _credentials,
+            _credentials,
+            _adapter,
+            _process,
+            switchJournalStore: null!));
+
+        Assert.Equal("switchJournalStore", ex.ParamName);
+    }
+
+    // 27. hanging ReadAsync retains mutation ownership until settlement (use TCS fake)
+    [Fact]
+    public async Task Reconciliation_27_HangingReadAsync_RetainsMutationOwnershipUntilSettlement()
+    {
+        var readEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _journal.ReadBehavior = async ct =>
+        {
+            readEntered.TrySetResult();
+            await resumeRead.Task;
+            return SwitchJournalReadResult.Absent();
+        };
+
+        var coordinator = CreateCoordinator();
+        var reconcileTask = coordinator.ReconcileStartupJournalAsync();
+        await readEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        string switchResource = _vault.GetVaultPath() + ".switch";
+        var pathLock = PathLockRegistry.Get(switchResource);
+        bool lockAcquired = await pathLock.WaitAsync(TimeSpan.FromMilliseconds(50));
+        Assert.False(lockAcquired);
+
+        resumeRead.TrySetResult();
+        var result = await reconcileTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, result.Status);
+
+        Assert.True(await pathLock.WaitAsync(TimeSpan.FromSeconds(5)));
+        pathLock.Release();
+    }
+
+    // 28. hanging DeleteAsync retains mutation ownership until settlement (use TCS fake)
+    [Fact]
+    public async Task Reconciliation_28_HangingDeleteAsync_RetainsMutationOwnershipUntilSettlement()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+        var deleteEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeDelete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _journal.DeleteBehavior = async ct =>
+        {
+            deleteEntered.TrySetResult();
+            await resumeDelete.Task;
+        };
+
+        var coordinator = CreateCoordinator();
+        var reconcileTask = coordinator.ReconcileStartupJournalAsync();
+        await deleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        string switchResource = _vault.GetVaultPath() + ".switch";
+        var pathLock = PathLockRegistry.Get(switchResource);
+        bool lockAcquired = await pathLock.WaitAsync(TimeSpan.FromMilliseconds(50));
+        Assert.False(lockAcquired);
+
+        resumeDelete.TrySetResult();
+        var result = await reconcileTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, result.Status);
+
+        Assert.True(await pathLock.WaitAsync(TimeSpan.FromSeconds(5)));
+        pathLock.Release();
+    }
+
+    // 29. retained unresolved journal re-marks quarantine on repeated startup
+    [Fact]
+    public async Task Reconciliation_29_RetainedUnresolvedJournal_ReMarksQuarantineOnRepeatedStartup()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator1 = CreateCoordinator();
+        var result1 = await coordinator1.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result1.Status);
+        Assert.True(_vault.IsQuarantined);
+
+        // Simulate subsequent startup by creating a new coordinator with the same underlying journal
+        var coordinator2 = CreateCoordinator();
+        var result2 = await coordinator2.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result2.Status);
+        Assert.True(_vault.IsQuarantined);
+        Assert.NotNull(result2.RetainedEntry);
+        Assert.Equal(SwitchJournalState.CREDENTIAL_APPLYING, result2.RetainedEntry.State);
+    }
+
+    // 30. clean/degraded-cleanup path does not spuriously mark quarantine
+    [Fact]
+    public async Task Reconciliation_30_CleanOrDegradedCleanupPath_DoesNotSpuriouslyMarkQuarantine()
+    {
+        // 1. Clean path (no journal)
+        var resultClean = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, resultClean.Status);
+        Assert.False(_vault.IsQuarantined);
+
+        // 2. Degraded path (RECORDED delete failure)
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+        _journal.FailOnDelete = true;
+
+        var resultDegraded = await CreateCoordinator().ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Degraded, resultDegraded.Status);
+        Assert.False(_vault.IsQuarantined);
+    }
+
     // Test doubles & spies
 
     private sealed class TestJournalStore : ISwitchJournalStore
@@ -486,6 +1013,8 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         public SwitchJournalState? FailOnState { get; set; }
         public bool FailOnDelete { get; set; }
         public int DeleteCount { get; private set; }
+        public Func<CancellationToken, Task<SwitchJournalReadResult>>? ReadBehavior { get; set; }
+        public Func<CancellationToken, Task>? DeleteBehavior { get; set; }
 
         public string JournalFilePath => _underlying.JournalFilePath;
 
@@ -495,8 +1024,13 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
             _timeline = timeline;
         }
 
-        public Task<SwitchJournalReadResult> ReadAsync(CancellationToken cancellationToken = default) =>
-            _underlying.ReadAsync(cancellationToken);
+        public async Task<SwitchJournalReadResult> ReadAsync(CancellationToken cancellationToken = default)
+        {
+            _timeline.Add("JOURNAL_READ");
+            Operations.Add("READ");
+            if (ReadBehavior != null) return await ReadBehavior(cancellationToken);
+            return await _underlying.ReadAsync(cancellationToken);
+        }
 
         public async Task WriteEntryAsync(SwitchJournalEntry entry, CancellationToken cancellationToken = default)
         {
@@ -518,6 +1052,11 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
             Operations.Add("DELETE");
             DeleteCount++;
 
+            if (DeleteBehavior != null)
+            {
+                await DeleteBehavior(cancellationToken);
+            }
+
             if (FailOnDelete)
             {
                 throw new IOException("Simulated journal delete failure");
@@ -532,11 +1071,22 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         private readonly List<string>? _timeline;
 
         public bool FailFinalize { get; set; }
+        public int FinalizeCalls { get; private set; }
+        public Func<CancellationToken, Task<string?>>? GetActiveAccountIdBehavior { get; set; }
 
         public TestAccountStore(List<string>? timeline = null)
         {
             _timeline = timeline;
         }
+
+        Task<string?> IAccountStore.GetActiveAccountIdAsync(CancellationToken cancellationToken)
+        {
+            if (GetActiveAccountIdBehavior != null) return GetActiveAccountIdBehavior(cancellationToken);
+            return base.GetActiveAccountIdAsync(cancellationToken);
+        }
+
+        public new Task<string?> GetActiveAccountIdAsync(CancellationToken cancellationToken = default) =>
+            ((IAccountStore)this).GetActiveAccountIdAsync(cancellationToken);
 
         Task<AccountMetadata?> IAccountStore.TryFinalizeSwitchAsync(
             string? expectedActiveAccountId,
@@ -544,6 +1094,7 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
             UpdateAccountInput targetUpdates,
             CancellationToken cancellationToken)
         {
+            FinalizeCalls++;
             _timeline?.Add("METADATA_FINALIZE");
             if (FailFinalize)
             {
@@ -604,18 +1155,18 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         public AccountIdentityDto? Identity { get; set; }
         public ActivityStatusDto Activity { get; set; } = new("IDLE", 0, 0, DateTimeOffset.UtcNow.ToString("O"));
         public Ag2StatusDto Status { get; set; } = new(true, "HEALTHY", new ActivityStatusDto("IDLE", 0, 0, DateTimeOffset.UtcNow.ToString("O")), "synthetic");
+        public int CallCount { get; private set; }
 
         public TestAdapter(List<string> timeline)
         {
             _timeline = timeline;
         }
 
-        public Task<Ag2StatusDto> GetStatusAsync(CancellationToken cancellationToken = default) => Task.FromResult(Status);
-        public Task<AccountIdentityDto?> GetCurrentAccountAsync(CancellationToken cancellationToken = default) => Task.FromResult(Identity);
-        public Task<QuotaSnapshotDto?> GetQuotaAsync(CancellationToken cancellationToken = default) => Task.FromResult<QuotaSnapshotDto?>(null);
-        public Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult(new AccountQuotaObservation(Identity, null));
-        public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default) => Task.FromResult(Activity);
+        public Task<Ag2StatusDto> GetStatusAsync(CancellationToken cancellationToken = default) { CallCount++; return Task.FromResult(Status); }
+        public Task<AccountIdentityDto?> GetCurrentAccountAsync(CancellationToken cancellationToken = default) { CallCount++; return Task.FromResult(Identity); }
+        public Task<QuotaSnapshotDto?> GetQuotaAsync(CancellationToken cancellationToken = default) { CallCount++; return Task.FromResult<QuotaSnapshotDto?>(null); }
+        public Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(CancellationToken cancellationToken = default) { CallCount++; return Task.FromResult(new AccountQuotaObservation(Identity, null)); }
+        public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default) { CallCount++; return Task.FromResult(Activity); }
     }
 
     private sealed class TestProcessLifecycle : IAG2ProcessLifecycle
@@ -631,6 +1182,7 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
 
         public int StopCount { get; private set; }
         public int QuiesceCount { get; private set; }
+        public int LaunchCount { get; private set; }
         public int RestoreCount { get; private set; }
         public Exception? RestoreError { get; set; }
         public Action? OnReplacement { get; set; }
@@ -660,8 +1212,11 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
             _timeline.Add("PROCESS_STOP");
         }
 
-        public Task<AG2ProcessGeneration> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default) =>
-            Task.FromResult(_replacement);
+        public Task<AG2ProcessGeneration> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default)
+        {
+            LaunchCount++;
+            return Task.FromResult(_replacement);
+        }
 
         public Task<AG2ProcessGeneration> WaitForHealthyReplacementAsync(
             AG2ProcessSnapshot original,

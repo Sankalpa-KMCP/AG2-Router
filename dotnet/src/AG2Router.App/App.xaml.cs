@@ -143,7 +143,11 @@ public partial class App : System.Windows.Application
                 _wincredWriter,
                 _ag2Adapter,
                 processLifecycle,
-                switchJournalStore: switchJournalStore);
+                switchJournalStore);
+
+            Log("Reconciling startup switch journal...");
+            var reconciliationResult = await _switchCoordinator.ReconcileStartupJournalAsync();
+            Log($"Startup switch journal reconciliation completed: {reconciliationResult.Status}. {reconciliationResult.Message}");
 
             Log("Initializing NativeAutoRouter and AutostartService...");
             string configPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "config.json");

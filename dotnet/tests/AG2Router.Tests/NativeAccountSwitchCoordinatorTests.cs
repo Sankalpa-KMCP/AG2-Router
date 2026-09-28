@@ -108,7 +108,8 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         var blockingVault = new SessionVault(_tempDir, new DelayedDecryptProvider(_dpapi,
             decryptEntered, resumeDecrypt));
         var coordinator = new NativeAccountSwitchCoordinator(_accounts, blockingVault,
-            _credentials, _credentials, _adapter, _process);
+            _credentials, _credentials, _adapter, _process,
+            new SwitchJournalStore(Path.Combine(_tempDir, "switch-journal.json")));
 
         var switching = coordinator.SwitchAsync(_target!.Id);
         await decryptEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -655,6 +656,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
         _process.QuiesceBehavior = token => Task.Delay(Timeout.Infinite, token);
         var coordinator = new NativeAccountSwitchCoordinator(
             _accounts, _vault, _credentials, _credentials, _adapter, _process,
+            new SwitchJournalStore(Path.Combine(_tempDir, "switch-journal.json")),
             processTimeout: TimeSpan.FromMilliseconds(100),
             verificationTimeout: TimeSpan.FromMilliseconds(100),
             rollbackTimeout: TimeSpan.FromMilliseconds(30));
@@ -823,6 +825,7 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
     private NativeAccountSwitchCoordinator Coordinator(
         TimeSpan? verificationTimeout = null, TimeSpan? transactionTimeout = null) =>
         new(_accounts, _vault, _credentials, _credentials, _adapter, _process,
+            new SwitchJournalStore(Path.Combine(_tempDir, "switch-journal.json")),
             processTimeout: TimeSpan.FromMilliseconds(100),
             verificationTimeout: verificationTimeout ?? TimeSpan.FromMilliseconds(100),
             pollInterval: TimeSpan.FromMilliseconds(5),
