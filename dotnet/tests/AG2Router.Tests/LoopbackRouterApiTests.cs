@@ -1,4 +1,5 @@
 using System.Net;
+using System.IO;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -106,6 +107,52 @@ public sealed class LoopbackRouterApiTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task ConfigRoundTrip_PreservesExplicitWorkloadModelAcrossUnrelatedEdit()
+    {
+        await StartAsync();
+        var config = new RouterConfigDto(WorkloadModelKey: "Model/Exact");
+        using var first = await _client.PostAsJsonAsync("/api/config", config);
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        using var second = await _client.PostAsJsonAsync("/api/config", config with { LowQuotaThresholdPercent = 20 });
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        using var doc = JsonDocument.Parse(await _client.GetStringAsync("/api/config"));
+        Assert.Equal("Model/Exact", doc.RootElement.GetProperty("config").GetProperty("workloadModelKey").GetString());
+    }
+
+    [Fact]
+    public async Task CandidateEvidenceEndpoint_UnsupportedProviderReportsUnavailable()
+    {
+        await StartAsync();
+        using var response = await _client.GetAsync("/api/router/candidate-evidence");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.False(doc.RootElement.GetProperty("available").GetBoolean());
+    }
+
+    [Fact]
+    public async Task CandidateEvidenceEndpoint_SerializesBackendEvidenceContract()
+    {
+        _autoRouter.EvidenceStatus = new("model/exact", 35, true,
+            [new("synthetic", "STALE", null, DateTimeOffset.Parse("2026-09-30T00:00:00Z"), 7200)]);
+        await StartAsync();
+        using var doc = JsonDocument.Parse(await _client.GetStringAsync("/api/router/candidate-evidence"));
+        Assert.Equal("model/exact", doc.RootElement.GetProperty("modelKey").GetString());
+        var row = doc.RootElement.GetProperty("candidates")[0];
+        Assert.Equal("STALE", row.GetProperty("state").GetString());
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("remainingFraction").ValueKind);
+        Assert.Equal(7200, row.GetProperty("ageSeconds").GetDouble());
+    }
+
+    [Fact]
+    public async Task CandidateEvidenceEndpoint_ReadFailureDoesNotReturnHealthyEvidence()
+    {
+        _autoRouter.EvidenceReadFails = true;
+        await StartAsync();
+        using var response = await _client.GetAsync("/api/router/candidate-evidence");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
+
+    [Fact]
     public async Task PostResetRecovery_ClearsManualRecoveryState()
     {
         await StartAsync();
@@ -168,6 +215,11 @@ public sealed class LoopbackRouterApiTests : IAsyncDisposable
 
     private sealed class FakeAutoRouter : INativeAutoRouter
     {
+        public CandidateEvidenceStatusDto? EvidenceStatus { get; set; }
+        public bool EvidenceReadFails { get; set; }
+        public Task<CandidateEvidenceStatusDto> GetCandidateEvidenceStatusAsync(CancellationToken cancellationToken = default) =>
+            EvidenceReadFails ? Task.FromException<CandidateEvidenceStatusDto>(new IOException("synthetic read failure")) :
+            Task.FromResult(EvidenceStatus ?? new(null, _config.MinimumCandidateQuotaPercent, false, []));
         private RouterConfigDto _config = new(AutoSwitchEnabled: true, LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30);
         public int ResetManualRecoveryCallCount { get; private set; }
 

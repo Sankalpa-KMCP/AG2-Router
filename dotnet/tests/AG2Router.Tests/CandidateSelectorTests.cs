@@ -39,6 +39,30 @@ public class CandidateSelectorTests
         Assert.Contains("unknown", Assert.Single(selection.Candidates).IneligibilityReason);
     }
 
+    [Fact]
+    public void RequestedModelQuotaOverridesOlderAggregateForEligibilityAndRanking()
+    {
+        var current = CreateAccount("current");
+        var candidate = CreateAccount("candidate");
+        var alternative = CreateAccount("alternative");
+        var modelQuotas = new Dictionary<string, IReadOnlyList<ModelQuotaDto>>
+        {
+            ["candidate"] = [new("Requested", "requested", 0.9, null, false)],
+            ["alternative"] = [new("Requested", "requested", 0.4, null, false)]
+        };
+
+        var selection = CandidateSelector.SelectBestCandidate("current", 0.05,
+            [current, candidate, alternative],
+            new Dictionary<string, double> { ["candidate"] = 0.1, ["alternative"] = 0.95 },
+            new RouterConfigDto(),
+            new HashSet<string> { "current", "candidate", "alternative" },
+            accountModelQuotas: modelQuotas, relevantModelKeys: ["requested"]);
+
+        Assert.True(selection.ShouldSwitch);
+        Assert.Equal("candidate", selection.BestCandidate?.Account.Id);
+        Assert.Equal(0.9, selection.BestCandidate?.RemainingFraction);
+    }
+
     private static AccountMetadata CreateAccount(
         string id,
         string email = "test@example.com",

@@ -17,6 +17,8 @@ AG2 Router v0.4.0 is a per-user Windows desktop application built on .NET 10 and
 
 The composition root is dotnet/src/AG2Router.App/App.xaml.cs. A service existing elsewhere does not prove that the shipped composition starts or uses it; confirm wiring here.
 
+The host creates SwitchJournalStore and a shared DurableQuotaObservationStore beside accounts.json, and loads router configuration from sibling config.json. It reconciles the journal before starting routing, polling, and the loopback dashboard. AG2LiveAdapter receives a provider for the router's configured WorkloadModelKey; it does not discover IDE dropdown selection. The router and real switch coordinator share durable candidate evidence authority.
+
 ## Project boundaries
 
 | Project/path | Responsibility | Must not own |
@@ -38,11 +40,15 @@ TelemetryPollingCoordinator periodically calls IAG2Adapter. AG2LiveAdapter uses 
 
 The coordinator also invokes NativeAutoRouter.EvaluateCycleAsync. Router policy and quota meaning are defined in [domain-rules.md](domain-rules.md).
 
+Automatic routing follows configured model intent → live active requested-model quota → durable candidate observations → eligibility/ranking → recovery/activity/identity/process admission → target switch and identity verification → fresh live target quota verification → metadata commit or verified rollback. The router revalidates the selected durable observation through admission; the coordinator verifies target quota before commit and conditionally invalidates disproven cached evidence. Manual switching uses the same coordinator without automatic workload/quota requirements. Detailed policy and transaction ownership remain in the linked domain and persistence documents.
+
 ### Dashboard
 
 The Svelte build produces src/ui. The .NET application project links those files into wwwroot at build/publish time. LoopbackServer serves wwwroot, and MainWindow navigates WebView2 to the bound ephemeral address.
 
 DashboardLifecycleManager avoids creating WebView2 until the dashboard is opened. WebView2EnvironmentCoordinator serializes environment creation and handles closing/reopening coordination. Detailed synchronization is in [persistence-and-concurrency.md](persistence-and-concurrency.md).
+
+Settings exposes all routing fields, including Workload Model. Telemetry-derived raw model-key suggestions supplement explicit entry; configuration saves preserve workload intent. The dashboard reads backend candidate-evidence status and switching/recovery status rather than inferring candidate health from displayed active quota. These endpoints do not query inactive accounts upstream. Wire fields and unavailable-state behavior are defined in [api-contracts.md](api-contracts.md).
 
 ### Enrollment and switching
 

@@ -212,12 +212,12 @@ export interface FormattedCreditPool {
   isIndeterminate: boolean;
 }
 
-export type RefreshResource = 'status' | 'accounts' | 'config';
+export type RefreshResource = 'status' | 'accounts' | 'config' | 'switch' | 'evidence';
 export interface RefreshTicket { resource: RefreshResource; sequence: number; mutationVersion: number }
 
 /** Rejects out-of-order reads and every read crossing a mutating request. */
 export class DashboardRefreshGate {
-  private readonly sequences: Record<RefreshResource, number> = { status: 0, accounts: 0, config: 0 };
+  private readonly sequences: Record<RefreshResource, number> = { status: 0, accounts: 0, config: 0, switch: 0, evidence: 0 };
   private mutationVersion = 0;
   private mutationsInFlight = 0;
 

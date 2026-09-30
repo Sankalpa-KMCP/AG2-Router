@@ -9,10 +9,12 @@ This document owns durable stores, mutation ownership, synchronization, transact
 | Account metadata and active account ID | LocalMetadataAccountStore; DATA_DIR/accounts.json when overridden, otherwise per-user LocalAppData/AG2-Router/data/accounts.json | Durable JSON |
 | Vaulted sessions | SessionVault; per-user LocalAppData/AG2-Router/vault/sessions.dat by default | Durable versioned JSON envelope containing DPAPI ciphertext |
 | Live Antigravity credential | Windows Credential Manager canonical target | External OS-managed state |
-| Router configuration | NativeAutoRouter config JSON under per-user app data | Durable; loaded before polling starts |
-| Observed account quotas and cooldowns | NativeAutoRouter | Process memory only |
+| Router configuration | NativeAutoRouter; config.json beside accounts.json | Durable; loaded before polling starts |
+| Candidate quota observations | DurableQuotaObservationStore; quota-observations.json beside accounts.json | Durable, versioned account/model evidence |
+| Router cooldowns and legacy quota fallback | NativeAutoRouter | Process memory only; fallback is not production candidate authority |
 | Poll/status snapshot | TelemetryPollingCoordinator | Process memory only |
 | Switch status and last result | NativeAccountSwitchCoordinator | Process memory only |
+| Switch transaction journal | SwitchJournalStore; switch-journal.json beside accounts.json | Durable, zero-secret recovery record |
 | WebView2 browser profile | WebView2EnvironmentCoordinator under per-user LocalAppData/AG2-Router/webview2 | WebView2-managed persistent state |
 | Autostart preference | WindowsRegistryAutostartService | Per-user registry state |
 
@@ -20,7 +22,7 @@ Paths above describe application contracts, not permission to inspect live user 
 
 ## File durability
 
-DurableFileWriter implements the shared write primitive for account metadata and vault state:
+DurableFileWriter implements the shared write primitive for account metadata, vault state, routing configuration, quota observations, and switch journal:
 
 1. Resolve the full destination and create its directory.
 2. Write a unique temporary sibling using asynchronous write-through.
@@ -37,6 +39,18 @@ Atomic replacement protects the destination snapshot; it does not by itself seri
 RouterConfig is validated immediately when loaded by NativeAutoRouter during initialization. Malformed JSON or out-of-contract persisted configuration (such as invalid polling intervals or threshold percentages) is rejected before polling or routing startup begins. In such cases, application startup fails visibly with an actionable error dialog rather than silently falling back to defaults or running with invalid runtime constraints.
 
 Partial or older configuration files whose missing fields deserialize to current valid defaults remain supported where current serializer and model semantics provide that behavior. However, previously API-written out-of-range values or corrupted configuration files may require correction before startup can succeed. This is an intentional fail-closed contract designed to prevent routing loops and invalid timers, not an accidental crash.
+
+WorkloadModelKey persists in config.json. Older files without it remain valid but leave automatic workload intent unconfigured; they do not infer a model. User-facing configuration and validation names are defined in [api-contracts.md](api-contracts.md).
+
+### Durable quota observations
+
+QuotaObservationsDocument writes schema version 2 and reads structurally valid version 1 documents. A nonexistent quota-observations.json means an empty store. An existing document must contain an explicit non-null observations array; an empty array is valid. Missing/null observations, empty/truncated/malformed JSON, invalid records, and unsupported versions fail closed through the store's InvalidDataException contract, rather than becoming a valid empty store. Corrupt storage is not overwritten by an update attempt.
+
+Records contain account ID, canonical model key, nullable remaining fraction, reset evidence, local observation time, and provenance; they contain no credential or session material. DurableQuotaObservationStore rereads under a path lock and cross-process lease before atomic writes. Newer unknown evidence replaces older known evidence; equal-time conflicts are conservative. Domain eligibility and duplicate-pool semantics are owned by [domain-rules.md](domain-rules.md#workload-model-and-candidate-evidence).
+
+Production NativeAutoRouter and NativeAccountSwitchCoordinator share this store. Plans bind and reread the selected record through execution admission, so still-fresh persisted evidence works after restart without in-memory injection. InvalidateIfUnchangedAsync conditionally replaces disproven evidence with unknown without erasing a newer observation. Successfully verified target observations can be recorded after commit; a derived-evidence write failure does not undo committed metadata.
+
+Evidence: QuotaObservationModels.cs, DurableQuotaObservationStore.cs, DurableQuotaObservationStoreTests, and DurableRoutingEvidenceTests.
 
 
 ## Locking model
@@ -87,15 +101,20 @@ Evidence: AccountEnrollmentService.cs, AccountEnrollmentServiceTests.cs, Session
 CURRENT IMPLEMENTATION in NativeAccountSwitchCoordinator:
 
 1. Acquire non-overlap gates and validate the target, vaulted session, current identity, activity, and process provenance.
-2. Capture and then refresh the rollback credential around source-process quiescence.
-3. Apply the target credential, restart the verified process generation, and verify target identity.
-4. Finalize metadata with a guarded active-account transition.
-5. On post-mutation failure, quiesce the owned replacement generation, restore the credential only if current state still matches the applied credential, restart, and verify the source identity.
-6. Return explicit rollback or manual-recovery results when restoration cannot be proven.
+2. Capture rollback state and durably record the transaction before process transition; refresh the rollback credential around source-process quiescence.
+3. Record mutation milestones, apply the target credential, restart the verified process generation, and verify target identity.
+4. For an automatic request, obtain fresh live target quota and verify the configured model and minimum quota before metadata finalization. Manual requests do not require this automatic-routing configuration.
+5. Record TARGET_IDENTITY_VERIFIED_PRECOMMIT and finalize metadata with a guarded active-account transition; clean up the completed journal.
+6. On failed live quota verification, conditionally invalidate unchanged cached target evidence. On post-mutation failure, quiesce the owned replacement generation, restore the credential only if current state still matches the applied credential, restart, and verify the source identity.
+7. Return explicit verified-rollback or manual-recovery results. Unproved rollback, evidence invalidation, or journal cleanup cannot be hidden as safe completion.
 
 Credential capture accepts structurally valid legacy usernames without treating them as account identity. A successful forward write uses the canonical WinCred username `antigravity`. Compensation restores the exact captured original credential, including a legacy username, after the existing conditional-restore check; there is no startup or background migration.
 
 Manual and automatic requests share switch ownership. Automatic plans revalidate both router epoch and persisted active identity under that ownership before mutation; manual completion reacquires that ownership and publishes success only if its target is still the authoritative active identity. Router quota observations are attributed only after rechecking epoch, active identity, and live identity inside that ownership boundary. Cooldown-probe and gate transitions revalidate their originating epoch under router state ownership, so an older evaluation cannot clear a newer cooldown or manual-recovery decision. Successful automatic publication likewise reacquires switch ownership before updating router state under its state lock. A delayed automatic rollback failure remains a terminal manual-recovery outcome even after a newer manual success; the operator must explicitly clear it. Newer manual success and manual-recovery terminal states cannot be overwritten by an earlier automatic success.
+
+The coordinator admits a manual or automatic switch only when its journal recovery state is `NONE` and neither switch-resource quarantine nor vault quarantine is active. It checks this before starting the switch task and again while holding switch ownership. In particular, a failed cleanup of a proven-clean `RECORDED` or committed `PRECOMMIT` journal can leave `ACTION_REQUIRED` without quarantine; that state still blocks backend switch admission. The router also reads the coordinator recovery state before evaluation and enters manual-recovery mode for any non-`NONE` state or independent quarantine, avoiding repeated automatic attempts. `RESTART_REQUIRED` remains terminal for the process lifetime.
+
+CanAdmitSwitch remains authoritative. Successful completion, verified rollback, or a safe pre-mutation failure permits reuse of the same coordinator only after active ownership is released and bounded journal readback proves absence, recovery is NONE, and quarantine is absent. The live transaction state then returns to IDLE while LastResult retains the terminal outcome. Active transactions and cleanup still exclude concurrent switches. A retained journal yields ACTION_REQUIRED, corrupt/unsupported storage yields NOT_RESOLVABLE, and uncertain readback yields UNKNOWN; no terminal-state reset bypasses those gates. Evidence: SwitchCoordinatorLifecycleTests and TargetQuotaVerificationSwitchTests.
 
 The coordinator rechecks the live source and active metadata after target-vault loading and again after process revalidation, immediately before stopping the verified source generation. That final boundary also re-observes activity: BUSY, UNKNOWN, or failed activity proof prevents the stop and credential mutation. Rollback quiescence is permitted only once the verified process stop has actually been attempted; a pre-stop proof failure must not stop the still-running original. A cleanup fault cannot hide an established rollback-failure result; an unclassified coordinator failure is treated as recovery-uncertain by automatic and explicit switch callers. An outer transaction deadline bounds the caller without detaching the inner transaction from its ownership; unresolved mutations quarantine subsequent admission.
 
@@ -107,15 +126,22 @@ TelemetryPollingCoordinator starts from the persisted router polling interval, p
 
 ### Dashboard configuration form
 
-App.svelte refreshes status, accounts, and configuration approximately every six seconds. Each resource has independent request sequencing, and reads that cross a mutation are discarded; failed reads retain the last good snapshot. RoutingConfigSection.svelte protects dirty edits from incoming config refreshes until save or reset, including edits made while a save is in flight.
+App.svelte refreshes status, accounts, configuration, switching status, and candidate evidence approximately every six seconds. Each resource has independent request sequencing, and reads that cross a mutation are discarded. Failed ordinary reads retain their last good snapshot; failed switching-status reads revoke safety authority and fail closed, while failed candidate-evidence reads show unavailable evidence instead of retaining a healthy claim. RoutingConfigSection.svelte protects dirty edits from incoming config refreshes until save or reset, including edits made while a save is in flight. Its complete save payload preserves WorkloadModelKey across unrelated edits.
 
 This is client-side UI concurrency/UX behavior. It does not demonstrate persistent-file corruption or a failed server-side atomic write.
 
 ## Interrupted switch consistency
 
-Switch transaction state, including the active transaction and last result, exists only in NativeAccountSwitchCoordinator memory. Applying the WinCred target and finalizing account metadata are separate durable operations. Abrupt process termination between those operations can leave live credential state and account metadata out of sync.
+Active transaction status and LastResult remain process-local, but SwitchJournalStore persists a versioned transaction record without credential material. App.xaml.cs calls ReconcileStartupJournalAsync before routing, polling, and dashboard service startup. This detects interrupted work; WinCred and metadata still are not one atomic cross-store transaction.
 
-Startup composition currently has no durable switch transaction journal or reconciliation step. Atomic account-metadata replacement protects that file's snapshot; it does not make WinCred plus metadata one atomic cross-store transaction. Repository evidence does not establish automatic or manual recovery behavior for this abrupt-termination case.
+- No journal permits clean startup. A proven pre-mutation RECORDED journal or TARGET_IDENTITY_VERIFIED_PRECOMMIT whose target metadata is already active can be conditionally cleaned up.
+- Unresolved CREDENTIAL_APPLYING, ROLLING_BACK, QUARANTINED, or uncommitted precommit records require ACTION_REQUIRED and quarantine. Failed cleanup of a proven-clean record also requires ACTION_REQUIRED.
+- Corrupt or unsupported journals yield NOT_RESOLVABLE and quarantine. I/O, ownership, or other uncertain reads yield UNKNOWN. Startup does not blindly roll back credentials or finalize uncertain metadata.
+- Every non-NONE recovery state (ACTION_REQUIRED, NOT_RESOLVABLE, UNKNOWN, RESTART_REQUIRED) blocks manual and automatic switching. Independent quarantine and active transactions also block admission.
+
+The dashboard exposes recovery status and an explicitly confirmed, token-protected resolve action. Clean journal cleanup is conditional. Resolution of unresolved state requires repeated current coherence proof across metadata, vault, live identity, and credential, then conditional journal deletion that preserves concurrent changes. Successful proof-based resolution returns ResolvedRestartRequired; it does not authorize switching in the same process. Failed proof, unsupported data, uncertainty, or changed authority remains blocking. NoJournal alone does not prove quarantine cleared, and the UI must obtain authoritative current status before permitting actions. Wire behavior is owned by [api-contracts.md](api-contracts.md).
+
+Evidence: SwitchJournalStoreTests, NativeAccountSwitchCoordinatorJournalTests, NativeAccountSwitchCoordinatorResolutionTests, SwitchCoordinatorLifecycleTests, LoopbackSwitchApiTests, and test/frontend-quarantine.test.ts. The original design proposal is retained as historical rationale in [ADR-001](decisions/ADR-001-switch-transaction-journal.md).
 
 ## Switch request cancellation
 

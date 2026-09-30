@@ -18,6 +18,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     private NativeAutoRouter CreateRouter(RouterConfigDto? config = null)
     {
         _switchCoordinator.CommitSuccess = id => _accountStore.ActiveAccountId = id;
+        _adapter.RequestedModelOrTier = "gemini-pro";
         _adapter.GetCurrentAccountFunc = _ => Task.FromResult<AccountIdentityDto?>(
             _accountStore.ActiveAccountId is { } id && _accountStore.Accounts.TryGetValue(id, out var account)
                 ? new AccountIdentityDto(account.Email)
@@ -55,6 +56,29 @@ public class NativeAutoRouterTests : IAsyncDisposable
 
     private static IReadOnlyList<ModelQuotaDto> CreateTestModelQuotas(double fraction, string key = "gemini-pro", string label = "Gemini Pro")
         => [new(label, key, fraction, null, false)];
+
+    [Theory]
+    [InlineData(JournalRecoveryStates.ActionRequired, false)]
+    [InlineData(JournalRecoveryStates.NotResolvable, false)]
+    [InlineData(JournalRecoveryStates.Unknown, false)]
+    [InlineData(JournalRecoveryStates.RestartRequired, false)]
+    [InlineData(JournalRecoveryStates.None, true)]
+    public async Task EvaluateCycleAsync_WhenBackendRecoveryBlocks_HaltsWithoutRetry(
+        string recoveryState, bool quarantineActive)
+    {
+        _switchCoordinator.JournalRecoveryState = recoveryState;
+        _switchCoordinator.QuarantineActive = quarantineActive;
+        await using var router = CreateRouter();
+
+        var first = await router.EvaluateCycleAsync();
+        var second = await router.EvaluateCycleAsync();
+
+        Assert.False(first.ShouldSwitch);
+        Assert.False(second.ShouldSwitch);
+        Assert.Equal(RoutingSafetyGateState.ManualRecoveryRequired, _safetyGate.State);
+        Assert.False(router.GetConfig().AutoSwitchEnabled);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+    }
 
     [Fact]
     public async Task EvaluateCycleAsync_WhenAntigravityOffline_ReturnsNoSwitchAndResetsPending()
@@ -307,7 +331,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task EvaluateCycleAsync_MixedModelSnapshot_ExhaustedModelForcesAccountLevelZero()
+    public async Task EvaluateCycleAsync_MixedModelSnapshot_UnrelatedExhaustionDoesNotTriggerRouting()
     {
         await using var router = CreateRouter();
 
@@ -338,10 +362,155 @@ public class NativeAutoRouterTests : IAsyncDisposable
 
         var result = await router.EvaluateCycleAsync();
 
-        // Weakest-link ensures Claude exhaustion is NOT masked by Gemini Pro health
-        Assert.True(result.ShouldSwitch);
-        Assert.NotNull(result.BestCandidate);
-        Assert.Equal("acc_candidate", result.BestCandidate.Account.Id);
+        // Only the requested Gemini Pro model is relevant to this workload.
+        Assert.False(result.ShouldSwitch);
+        Assert.Null(result.BestCandidate);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task RequestedModelUnknown_NeverStartsAutomaticSwitch()
+    {
+        await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = null;
+        var current = CreateAccount("current", "current@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9));
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), CreateTestModelQuotas(0.05), null, null));
+
+        var selection = await router.EvaluateCycleAsync();
+
+        Assert.False(selection.ShouldSwitch);
+        Assert.Contains("model is unknown", selection.Reason);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task RequestedModelExhausted_EvaluatesOnlyMatchingCandidateModel()
+    {
+        await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = "claude";
+        var current = CreateAccount("current", "current@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
+        router.SetObservedQuota(candidate.Id, 0.9, [
+            new("Gemini", "gemini", 0.9, null, false),
+            new("Claude", "claude", 0.8, null, false)]);
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), [
+                new("Gemini", "gemini", 0.9, null, false),
+                new("Claude", "claude", 0.0, null, true)], null, null));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto(
+            "IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+
+        var selection = await router.EvaluateCycleAsync();
+
+        Assert.True(selection.ShouldSwitch);
+        Assert.Equal(candidate.Id, selection.BestCandidate?.Account.Id);
+        Assert.Equal(1, _switchCoordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task RequestedModelChangesBeforeSwitch_AbortsPendingPlan()
+    {
+        await using var router = CreateRouter();
+        var current = CreateAccount("current", "current@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9));
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), CreateTestModelQuotas(0.05), null, null));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto(
+            "IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+        int modelCalls = 0;
+        _adapter.GetRequestedModelFunc = _ => Task.FromResult(new RequestedModelObservation(
+            new AccountIdentityDto(current.Email),
+            Interlocked.Increment(ref modelCalls) == 1 ? "gemini-pro" : "claude"));
+
+        var selection = await router.EvaluateCycleAsync();
+
+        Assert.False(selection.ShouldSwitch);
+        Assert.Contains("model changed", selection.Reason);
+        Assert.Equal(2, modelCalls);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task StaleFormerlyActiveQuotaCannotQualifyCandidate()
+    {
+        await using var router = CreateRouter();
+        var current = CreateAccount("current", "current@example.com");
+        var former = CreateAccount("former", "former@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[former.Id] = former;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.UnionWith([current.Id, former.Id]);
+        router.SetObservedQuota(former.Id, 0.9, CreateTestModelQuotas(0.9),
+            DateTimeOffset.UtcNow - TimeSpan.FromMinutes(1));
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), CreateTestModelQuotas(0.05), null, null));
+
+        var selection = await router.EvaluateCycleAsync();
+
+        Assert.False(selection.ShouldSwitch);
+        Assert.False(Assert.Single(selection.Candidates).IsEligible);
+        Assert.Equal(0, _switchCoordinator.CallCount);
+    }
+
+    [Fact]
+    public void CandidateFreshnessBoundary_IsExclusiveAndRejectsFutureObservation()
+    {
+        var now = new DateTimeOffset(2026, 9, 28, 12, 0, 0, TimeSpan.Zero);
+        var lifetime = NativeAutoRouter.CandidateEvidenceLifetime(10_000);
+        Assert.Equal(TimeSpan.FromSeconds(20), lifetime);
+        Assert.True(NativeAutoRouter.IsCandidateEvidenceFresh(now - lifetime + TimeSpan.FromTicks(1), now, lifetime));
+        Assert.False(NativeAutoRouter.IsCandidateEvidenceFresh(now - lifetime, now, lifetime));
+        Assert.False(NativeAutoRouter.IsCandidateEvidenceFresh(now + TimeSpan.FromTicks(1), now, lifetime));
+        Assert.Equal(TimeSpan.FromSeconds(30), NativeAutoRouter.CandidateEvidenceLifetime(60_000));
+    }
+
+    [Fact]
+    public async Task CandidateEvidenceExpiresAfterSelection_AbortsBeforeSwitchAdmission()
+    {
+        await using var router = CreateRouter();
+        var current = CreateAccount("current", "current@example.com");
+        var candidate = CreateAccount("candidate", "candidate@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[candidate.Id] = candidate;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.UnionWith([current.Id, candidate.Id]);
+        router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9));
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), CreateTestModelQuotas(0.05), null, null));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto(
+            "IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+        router.BeforeGatePublicationAsync = () =>
+        {
+            router.SetObservedQuota(candidate.Id, 0.9, CreateTestModelQuotas(0.9),
+                DateTimeOffset.UtcNow - TimeSpan.FromMinutes(1));
+            return Task.CompletedTask;
+        };
+
+        await router.EvaluateCycleAsync();
+
+        Assert.Equal(0, _switchCoordinator.CallCount);
+        Assert.Equal(RoutingSafetyGateState.Idle, router.GetStatus().State);
     }
 
     [Fact]
@@ -496,6 +665,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     public async Task ManualBusyContentionDoesNotLoseCompletedAutomaticIdentity()
     {
         await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = "gemini";
         var current = CreateAccount("acc_current", "curr@example.com");
         var candidate = CreateAccount("acc_candidate", "cand@example.com");
         _accountStore.Accounts[current.Id] = current;
@@ -577,6 +747,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     public async Task CompletedManualSuccessCannotBeOverwrittenByDelayedAutomaticPublication()
     {
         await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = "gemini";
         var former = CreateAccount("acc_current", "former@example.com");
         var autoTarget = CreateAccount("acc_candidate", "auto@example.com");
         var manualTarget = CreateAccount("manual", "manual@example.com");
@@ -617,6 +788,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     public async Task ManualCommitBeforeCallbackCannotBeOverwrittenByAutomaticPublication()
     {
         await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = "gemini";
         var former = CreateAccount("acc_current", "former@example.com");
         var autoTarget = CreateAccount("acc_candidate", "auto@example.com");
         var manualTarget = CreateAccount("manual", "manual@example.com");
@@ -660,6 +832,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     public async Task ManualRecoveryTerminalStateSurvivesDelayedAutomaticSuccess()
     {
         await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = "gemini";
         var former = CreateAccount("acc_current", "former@example.com");
         var autoTarget = CreateAccount("acc_candidate", "auto@example.com");
         var manualTarget = CreateAccount("manual", "manual@example.com");
@@ -699,6 +872,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     public async Task DelayedAutomaticRollbackFailureAfterManualSuccessStillRequiresRecovery()
     {
         await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = "gemini";
         var former = CreateAccount("former", "former@example.com");
         var autoTarget = CreateAccount("auto", "auto@example.com");
         var manualTarget = CreateAccount("manual", "manual@example.com");
@@ -961,6 +1135,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     public async Task UnknownActivityCannotAuthorizeAutomaticSwitch()
     {
         await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = "gemini";
         var current = CreateAccount("current", "current@example.com");
         var candidate = CreateAccount("candidate", "candidate@example.com");
         _accountStore.Accounts[current.Id] = current;
@@ -983,6 +1158,7 @@ public class NativeAutoRouterTests : IAsyncDisposable
     public async Task UnclassifiedCoordinatorFailureAfterAdmissionRequiresManualRecovery()
     {
         await using var router = CreateRouter();
+        _adapter.RequestedModelOrTier = "gemini";
         var current = CreateAccount("current", "current@example.com");
         var candidate = CreateAccount("candidate", "candidate@example.com");
         _accountStore.Accounts[current.Id] = current;
@@ -1201,10 +1377,43 @@ public class NativeAutoRouterTests : IAsyncDisposable
         public Action<string>? CommitSuccess { get; set; }
         public Func<string, CancellationToken, Task<NativeSwitchResult>>? SwitchBehavior { get; set; }
         public string NextCode { get; set; } = SwitchResultCodes.Success;
+        public string JournalRecoveryState { get; set; } = JournalRecoveryStates.None;
+        public bool QuarantineActive { get; set; }
         public int CallCount { get; private set; }
         public string? LastTargetAccountId { get; private set; }
+        public string? LastRequiredModelKey { get; private set; }
+        public double? LastMinimumCandidateQuotaPercent { get; private set; }
+        public Func<string?, (bool CanAdmit, string? Reason)>? CanAdmitSwitchBehavior { get; set; }
+        public bool CanAdmitSwitch(out string? blockingReason)
+        {
+            if (CanAdmitSwitchBehavior != null)
+            {
+                var (canAdmit, reason) = CanAdmitSwitchBehavior(null);
+                blockingReason = reason;
+                return canAdmit;
+            }
+            if (QuarantineActive)
+            {
+                blockingReason = "Switch blocked: account lifecycle is quarantined.";
+                return false;
+            }
+            if (!string.Equals(JournalRecoveryState, JournalRecoveryStates.None, StringComparison.Ordinal))
+            {
+                blockingReason = JournalRecoveryState switch
+                {
+                    JournalRecoveryStates.ActionRequired => "Switch blocked: journal recovery action is required.",
+                    JournalRecoveryStates.NotResolvable => "Switch blocked: switch journal is not resolvable.",
+                    JournalRecoveryStates.RestartRequired => "Switch blocked: application restart is required after journal resolution.",
+                    _ => "Switch blocked: journal recovery state is unknown."
+                };
+                return false;
+            }
+            blockingReason = null;
+            return true;
+        }
 
-        public NativeSwitchStatus GetStatus() => new(null, NativeSwitchStates.Idle, null);
+        public NativeSwitchStatus GetStatus() => new(null, NativeSwitchStates.Idle, null,
+            QuarantineActive, JournalRecoveryState);
 
         public Task<JournalResolutionResult> ResolveQuarantinedJournalAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present."));
@@ -1219,6 +1428,19 @@ public class NativeAutoRouterTests : IAsyncDisposable
             var result = MakeResult(targetAccountId);
             if (result.Success) CommitSuccess?.Invoke(targetAccountId);
             return Task.FromResult(result);
+        }
+
+        public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+            string targetAccountId,
+            string? expectedActiveAccountId,
+            Func<bool> planIsCurrent,
+            string? requiredWorkloadModelKey,
+            double? minimumCandidateQuotaPercent,
+            CancellationToken cancellationToken = default)
+        {
+            LastRequiredModelKey = requiredWorkloadModelKey;
+            LastMinimumCandidateQuotaPercent = minimumCandidateQuotaPercent;
+            return SwitchAsync(targetAccountId, cancellationToken);
         }
 
         public NativeSwitchResult MakeResult(string targetAccountId)

@@ -132,4 +132,87 @@ public class AG2LiveAdapterTests
         Assert.NotNull(observation.Quota);
         Assert.Equal(1, userStatusCalls);
     }
+
+    [Fact]
+    public async Task RequestedModelRemainsUnknownWithoutAuthoritativeRuntimeField()
+    {
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => throw new InvalidOperationException(
+                "Requested model lookup must not probe the live process")
+        };
+        var rpc = new MockAG2RpcClient();
+        var adapter = new AG2LiveAdapter(new AG2ProcessDetector(inspector, rpc), rpc);
+
+        var observation = await adapter.GetRequestedModelAsync();
+
+        Assert.Null(observation.Account);
+        Assert.Null(observation.ModelOrTier);
+    }
+
+    [Fact]
+    public async Task GetRequestedModelAsync_WithConfiguredModel_ReturnsActiveAccountAndCanonicalModel_WhenActiveAccountAuthenticated()
+    {
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>(new[] { _validProc }),
+            GetListeningPortsFunc = _ => Task.FromResult<IReadOnlyList<int>>(new[] { 51768 })
+        };
+        var rpc = new MockAG2RpcClient
+        {
+            GetUserStatusFunc = (_, _, _) => Task.FromResult<RawUserStatusResponse?>(new RawUserStatusResponse
+            {
+                UserStatus = new RawUserStatus { Email = "active@example.com" }
+            })
+        };
+        var adapter = new AG2LiveAdapter(
+            new AG2ProcessDetector(inspector, rpc),
+            rpc,
+            configuredModelProvider: () => "  GEMINI-2.5-PRO  ");
+
+        var observation = await adapter.GetRequestedModelAsync();
+
+        Assert.NotNull(observation.Account);
+        Assert.Equal("active@example.com", observation.Account.Email);
+        Assert.Equal("gemini-2.5-pro", observation.ModelOrTier);
+    }
+
+    [Fact]
+    public async Task GetRequestedModelAsync_WithConfiguredModel_ReturnsNull_WhenActiveAccountOffline()
+    {
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>(Array.Empty<DiscoveredProcessRaw>())
+        };
+        var rpc = new MockAG2RpcClient();
+        var adapter = new AG2LiveAdapter(
+            new AG2ProcessDetector(inspector, rpc),
+            rpc,
+            configuredModelProvider: () => "gemini-2.5-pro");
+
+        var observation = await adapter.GetRequestedModelAsync();
+
+        Assert.Null(observation.Account);
+        Assert.Null(observation.ModelOrTier);
+    }
+
+    [Fact]
+    public async Task GetRequestedModelAsync_WithWhitespaceConfiguredModel_ReturnsNull()
+    {
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => throw new InvalidOperationException(
+                "Whitespace model key lookup must not probe the live process")
+        };
+        var rpc = new MockAG2RpcClient();
+        var adapter = new AG2LiveAdapter(
+            new AG2ProcessDetector(inspector, rpc),
+            rpc,
+            configuredModelProvider: () => "   \t\n  ");
+
+        var observation = await adapter.GetRequestedModelAsync();
+
+        Assert.Null(observation.Account);
+        Assert.Null(observation.ModelOrTier);
+    }
 }

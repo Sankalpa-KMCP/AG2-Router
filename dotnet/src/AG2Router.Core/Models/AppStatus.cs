@@ -38,8 +38,16 @@ public record RouterConfigDto(
     bool AutoSwitchEnabled = false,
     int LowQuotaThresholdPercent = 15,
     int MinimumCandidateQuotaPercent = 30,
-    int PollingIntervalMs = 10000
+    int PollingIntervalMs = 10000,
+    string? WorkloadModelKey = null
 );
+
+// Read-only projection of the same durable evidence used by automatic routing.
+public record CandidateEvidenceStatusDto(string? ModelKey, int MinimumCandidateQuotaPercent,
+    bool Available, IReadOnlyList<CandidateQuotaStatusDto> Candidates);
+
+public record CandidateQuotaStatusDto(string AccountId, string State,
+    double? RemainingFraction, DateTimeOffset? ObservedAtUtc, double? AgeSeconds);
 
 public record TelemetryDto(
     AccountIdentityDto? CurrentAccount,

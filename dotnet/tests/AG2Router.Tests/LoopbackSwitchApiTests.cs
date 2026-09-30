@@ -118,10 +118,41 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         string json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
-        Assert.Equal("IDLE", doc.RootElement.GetProperty("status").GetProperty("currentState").GetString());
+        var status = doc.RootElement.GetProperty("status");
+        Assert.Equal("IDLE", status.GetProperty("currentState").GetString());
+        Assert.False(status.GetProperty("quarantineActive").GetBoolean());
+        Assert.Equal("NONE", status.GetProperty("journalRecoveryState").GetString());
         Assert.False(response.Headers.Contains("X-AG2-Switch-Token"));
         Assert.DoesNotContain("switchToken", json, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Theory]
+    [InlineData(true, JournalRecoveryStates.ActionRequired)]
+    [InlineData(true, JournalRecoveryStates.RestartRequired)]
+    [InlineData(true, JournalRecoveryStates.NotResolvable)]
+    [InlineData(true, JournalRecoveryStates.None)]
+    [InlineData(true, JournalRecoveryStates.Unknown)]
+    [InlineData(false, JournalRecoveryStates.None)]
+    public async Task SwitchingStatusSerializesQuarantineActiveAndJournalRecoveryState(
+        bool quarantineActive, string journalRecoveryState)
+    {
+        await StartAsync();
+        _coordinator.StatusToReturn = new NativeSwitchStatus(
+            ActiveTransactionId: "tx_test",
+            CurrentState: quarantineActive ? NativeSwitchStates.Failed : NativeSwitchStates.Idle,
+            LastResult: null,
+            QuarantineActive: quarantineActive,
+            JournalRecoveryState: journalRecoveryState);
+
+        using var response = await _client.GetAsync("/api/switching/status");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        string json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var status = doc.RootElement.GetProperty("status");
+        Assert.Equal(quarantineActive, status.GetProperty("quarantineActive").GetBoolean());
+        Assert.Equal(journalRecoveryState, status.GetProperty("journalRecoveryState").GetString());
+    }
+
 
     [Theory]
     [InlineData("Origin", "http://attacker.example")]
@@ -355,7 +386,8 @@ public sealed class LoopbackSwitchApiTests : IAsyncDisposable
         public Exception? ThrowOnResolve { get; set; }
         public int ResolveCallCount { get; private set; }
 
-        public NativeSwitchStatus GetStatus() => new(null, NativeSwitchStates.Idle, null);
+        public NativeSwitchStatus StatusToReturn { get; set; } = new(null, NativeSwitchStates.Idle, null);
+        public NativeSwitchStatus GetStatus() => StatusToReturn;
 
         public Task<NativeSwitchResult> SwitchAsync(
             string targetAccountId,

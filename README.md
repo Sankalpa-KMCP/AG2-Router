@@ -1,15 +1,15 @@
 # AG2 Router
 
-A lightweight, native Windows desktop application and service for Antigravity 2 that monitors active per-model quota, tracks observed capacity across connected accounts, and performs safe, automated account routing.
+A lightweight, native Windows desktop application for Antigravity 2 that monitors active per-model quota and manages enrolled accounts. Automatic routing protects an explicitly configured workload model using live active quota, durable candidate observations, and verified account switching. Unknown or unsafe evidence fails closed; see [domain rules](docs/domain-rules.md) and [remaining limitations](docs/known-limitations.md).
 
 ---
 
 ## 1. What AG2 Router Is
 
-AG2 Router eliminates session and quota exhaustion during heavy Antigravity agent workflows:
+AG2 Router is intended to reduce session and quota interruptions during heavy Antigravity agent workflows:
 
-* **Real-Time Quota Telemetry:** Continuously polls active Antigravity language server telemetry for active per-model quota alongside informational prompt and flow credit metrics. Connected candidate accounts retain last-observed quota evidence rather than being continuously polled simultaneously.
-* **Autonomous Low-Quota Routing:** Automatically identifies low-quota conditions on the active account and selects among eligible candidate accounts using reserve status, observed usable quota, configured priority, and deterministic tie-breaking.
+* **Real-Time Quota Telemetry:** Polls active Antigravity language server telemetry for per-model quota alongside informational prompt and flow credit metrics. Inactive accounts use expiring durable observations; they are not queried directly upstream.
+* **Low-Quota Routing Policy:** Uses the configured workload model, live active quota, and conservative candidate evidence. Candidates rank by reserve status, usable quota, priority, and deterministic tie-breaking. Automatic switches verify target identity and fresh live requested-model quota before metadata commit, or attempt verified rollback.
 * **Workload-Aware Safety Gating:** Strictly prevents account switching whenever Antigravity is active (`BUSY` or running trajectories $> 0$). Switches occur exclusively during verified `IDLE` states.
 * **Per-User Encrypted Session Vault:** Stores account tokens with native Windows DPAPI (`DataProtectionScope.CurrentUser`), preventing plaintext credential exposure.
 * **Tray-First Windows Desktop Architecture:** Runs quietly in the Windows notification area (system tray) with zero background window overhead and instant quick status tooltips.
@@ -33,6 +33,7 @@ dotnet/src/
 * **Persistent Data vs Binaries:**
   - Binaries are installed per-user to `%LOCALAPPDATA%\Programs\AG2Router\`.
   - Persistent user metadata is stored in `%LOCALAPPDATA%\AG2-Router\data\accounts.json`.
+  - Routing configuration, candidate evidence, and interrupted-switch records use sibling `config.json`, `quota-observations.json`, and `switch-journal.json` files. See [persistence and recovery](docs/persistence-and-concurrency.md).
   - Encrypted sessions are stored in `%LOCALAPPDATA%\AG2-Router\vault\sessions.dat`.
   - Application data is **never** deleted or overwritten during upgrades or uninstallation.
 
@@ -80,8 +81,14 @@ AG2 Router supports deterministic command-line controls for system startup and a
 | `AG2Router.exe --exit` | Signals the running instance to perform a graceful shutdown and exit. |
 
 ### Windows Autostart Registration
-Autostart can be toggled directly in the Dashboard Settings or via API. It writes a per-user registry key:
+Autostart is exposed through the native `/api/settings/autostart` API. It writes a per-user registry key:
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AG2Router` = `"{InstallDir}\AG2Router.exe" --tray`
+
+### Configure automatic routing
+
+Dashboard Settings exposes **Auto Switch**, **Workload Model**, **Low Quota Threshold**, **Minimum Candidate Quota**, and **Polling Interval**. Workload Model accepts an exact upstream model key and suggests valid keys observed in current telemetry; it does not use a fabricated model list. Saves preserve the configured model across other setting changes.
+
+The workload model expresses routing intent; AG2 Router does not automatically detect the IDE model dropdown. With Auto Switch enabled but no model configured, the dashboard explains that routing cannot operate. Candidate status distinguishes unobserved, unknown, stale, unavailable, and usable evidence. Manual switching does not require automatic-routing model or quota configuration, but retains the same activity, identity, recovery, and process safety gates.
 
 ---
 
@@ -125,6 +132,8 @@ The packaging script outputs:
 
 * **Dashboard displays "Waiting for Antigravity":** Antigravity is not currently running. The router will automatically connect when Antigravity starts.
 * **WebView2 runtime missing:** Ensure Microsoft Edge WebView2 Evergreen Runtime is installed. Download from Microsoft's official site.
+* **Automatic routing unavailable:** Configure Workload Model and inspect candidate evidence. An unknown or stale observation is not healthy quota; a reset time alone does not prove replenishment.
+* **Recovery or quarantine warning:** Use the dashboard recovery status and its available resolve action. Resolution requires current safety proof and may require application restart; absence of a journal alone does not clear quarantine. Do not delete recovery records to bypass admission. See [interrupted switch recovery](docs/persistence-and-concurrency.md#interrupted-switch-consistency).
 * **Resetting / Manual Recovery:** If you ever need to inspect or back up account data, all configuration files reside in:
   - Account metadata: `%LOCALAPPDATA%\AG2-Router\data\accounts.json`
   - Encrypted sessions: `%LOCALAPPDATA%\AG2-Router\vault\sessions.dat`

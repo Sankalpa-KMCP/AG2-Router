@@ -1,5 +1,7 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using AG2Router.AG2.Persistence;
+using AG2Router.AG2.Routing;
 using AG2Router.AG2.Security;
 using AG2Router.AG2.Vault;
 using AG2Router.Core.Contracts;
@@ -24,16 +26,23 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _rollbackTimeout;
     private readonly TimeSpan _transactionTimeout;
+    private readonly IQuotaObservationStore? _quotaObservationStore;
+    private readonly TimeProvider _timeProvider;
     private readonly RecoveryQuarantine _recoveryQuarantine;
     private readonly ISwitchJournalStore _journalStore;
     private readonly object _statusLock = new();
     private readonly CancellationTokenSource _shutdownCts = new();
     private volatile bool _isShuttingDown;
     internal Func<Task>? BeforeLeaseReleaseAsync { get; set; }
+    internal void SetJournalRecoveryStateForTest(string state) { lock (_statusLock) { _journalRecoveryState = state; } }
+    internal void SetActiveTransactionForTest(string? txId, string state = NativeSwitchStates.Idle) { lock (_statusLock) { _activeTransactionId = txId; _currentState = state; } }
+    internal static SemaphoreSlim SwitchGateForTest => SwitchGate;
+    internal void SetShuttingDownForTest(bool isShuttingDown) { lock (_statusLock) { _isShuttingDown = isShuttingDown; } }
 
     private string _currentState = NativeSwitchStates.Idle;
     private string? _activeTransactionId;
     private NativeSwitchResult? _lastResult;
+    private string _journalRecoveryState = JournalRecoveryStates.None;
 
     public NativeAccountSwitchCoordinator(
         IAccountStore accountStore,
@@ -47,7 +56,9 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         TimeSpan? verificationTimeout = null,
         TimeSpan? pollInterval = null,
         TimeSpan? rollbackTimeout = null,
-        TimeSpan? transactionTimeout = null)
+        TimeSpan? transactionTimeout = null,
+        IQuotaObservationStore? quotaObservationStore = null,
+        TimeProvider? timeProvider = null)
     {
         _accountStore = accountStore ?? throw new ArgumentNullException(nameof(accountStore));
         _sessionVault = sessionVault ?? throw new ArgumentNullException(nameof(sessionVault));
@@ -64,6 +75,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         _transactionTimeout = transactionTimeout ??
             (_processTimeout + _verificationTimeout + _rollbackTimeout + TimeSpan.FromSeconds(30));
         if (_transactionTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(transactionTimeout));
+        _quotaObservationStore = quotaObservationStore;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _recoveryQuarantine = RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch");
     }
 
@@ -81,9 +94,19 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                         string.Empty, null, null, null,
                         "Switch outcome is unresolved; manual recovery is required.",
                         [], now, now, ManualRecoveryRequired: true);
-                return new NativeSwitchStatus(_activeTransactionId, NativeSwitchStates.Failed, uncertain);
+                return new NativeSwitchStatus(
+                    _activeTransactionId,
+                    NativeSwitchStates.Failed,
+                    uncertain,
+                    QuarantineActive: true,
+                    JournalRecoveryState: _journalRecoveryState);
             }
-            return new NativeSwitchStatus(_activeTransactionId, _currentState, _lastResult);
+            return new NativeSwitchStatus(
+                _activeTransactionId,
+                _currentState,
+                _lastResult,
+                QuarantineActive: false,
+                JournalRecoveryState: _journalRecoveryState);
         }
     }
 
@@ -105,6 +128,19 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
     }
 
+    private StartupJournalReconciliationResult RecordStartupReconciliationResult(
+        StartupJournalReconciliationResult result, string recoveryState)
+    {
+        lock (_statusLock)
+        {
+            if (_journalRecoveryState != JournalRecoveryStates.RestartRequired)
+            {
+                _journalRecoveryState = recoveryState;
+            }
+        }
+        return result;
+    }
+
     public async Task<StartupJournalReconciliationResult> ReconcileStartupJournalAsync(CancellationToken cancellationToken = default)
     {
         await SwitchGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -115,7 +151,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             if (!await switchLock.WaitAsync(_transactionTimeout, cancellationToken).ConfigureAwait(false))
             {
                 _sessionVault.QuarantineUnresolvedMutation();
-                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Lock acquisition timed out during startup reconciliation.");
+                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Lock acquisition timed out during startup reconciliation."), JournalRecoveryStates.Unknown);
             }
 
             CrossProcessFileLease? switchLease = null;
@@ -128,7 +164,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 catch (Exception ex)
                 {
                     _sessionVault.QuarantineUnresolvedMutation();
-                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Cross-process lease acquisition failed: {ex.Message}");
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Cross-process lease acquisition failed: {ex.Message}"), JournalRecoveryStates.Unknown);
                 }
 
                 SwitchJournalReadResult readResult;
@@ -139,30 +175,30 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 catch (Exception ex)
                 {
                     _sessionVault.QuarantineUnresolvedMutation();
-                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"I/O error reading switch journal: {ex.Message}");
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"I/O error reading switch journal: {ex.Message}"), JournalRecoveryStates.Unknown);
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.Absent)
                 {
-                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "No switch journal present.");
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "No switch journal present."), JournalRecoveryStates.None);
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.Corrupt)
                 {
                     _sessionVault.QuarantineUnresolvedMutation();
-                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Corrupt switch journal found: {readResult.ErrorMessage}");
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Corrupt switch journal found: {readResult.ErrorMessage}"), JournalRecoveryStates.NotResolvable);
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.UnsupportedVersion)
                 {
                     _sessionVault.QuarantineUnresolvedMutation();
-                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unsupported switch journal schema: {readResult.ErrorMessage}");
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unsupported switch journal schema: {readResult.ErrorMessage}"), JournalRecoveryStates.NotResolvable);
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.IoError)
                 {
                     _sessionVault.QuarantineUnresolvedMutation();
-                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"I/O error reading switch journal: {readResult.ErrorMessage}");
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"I/O error reading switch journal: {readResult.ErrorMessage}"), JournalRecoveryStates.Unknown);
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.Valid)
@@ -174,17 +210,17 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                             try
                             {
                                 await _journalStore.DeleteAsync(cancellationToken).ConfigureAwait(false);
-                                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "RECORDED journal cleaned up.", RetainedEntry: null);
+                                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "RECORDED journal cleaned up.", RetainedEntry: null), JournalRecoveryStates.None);
                             }
                             catch (Exception ex)
                             {
                                 // Proven clean underlying state. Do NOT quarantine!
-                                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Degraded, $"Failed to delete RECORDED journal: {ex.Message}", RetainedEntry: entry);
+                                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Degraded, $"Failed to delete RECORDED journal: {ex.Message}", RetainedEntry: entry), JournalRecoveryStates.ActionRequired);
                             }
 
                         case SwitchJournalState.CREDENTIAL_APPLYING:
                             _sessionVault.QuarantineUnresolvedMutation();
-                            return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Unresolved CREDENTIAL_APPLYING journal found.", RetainedEntry: entry);
+                            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Unresolved CREDENTIAL_APPLYING journal found.", RetainedEntry: entry), JournalRecoveryStates.ActionRequired);
 
                         case SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT:
                             string? activeAccountId;
@@ -195,7 +231,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                             catch (Exception ex)
                             {
                                 _sessionVault.QuarantineUnresolvedMutation();
-                                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Failed to read metadata for PRECOMMIT journal: {ex.Message}", RetainedEntry: entry);
+                                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Failed to read metadata for PRECOMMIT journal: {ex.Message}", RetainedEntry: entry), JournalRecoveryStates.Unknown);
                             }
 
                             if (string.Equals(activeAccountId, entry.TargetAccountId, StringComparison.Ordinal))
@@ -204,12 +240,12 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                                 try
                                 {
                                     await _journalStore.DeleteAsync(cancellationToken).ConfigureAwait(false);
-                                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "PRECOMMIT journal cleaned up; target metadata already active.", RetainedEntry: null);
+                                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "PRECOMMIT journal cleaned up; target metadata already active.", RetainedEntry: null), JournalRecoveryStates.None);
                                 }
                                 catch (Exception ex)
                                 {
                                     // Proven coherent. Do NOT quarantine!
-                                    return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Degraded, $"Failed to delete PRECOMMIT journal: {ex.Message}", RetainedEntry: entry);
+                                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Degraded, $"Failed to delete PRECOMMIT journal: {ex.Message}", RetainedEntry: entry), JournalRecoveryStates.ActionRequired);
                                 }
                             }
                             else
@@ -217,25 +253,25 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                                 // Active account is source, other, or null. Quarantine!
                                 // NEVER call TryFinalizeSwitchAsync during startup!
                                 _sessionVault.QuarantineUnresolvedMutation();
-                                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"PRECOMMIT journal found but active account '{activeAccountId}' does not match target '{entry.TargetAccountId}'.", RetainedEntry: entry);
+                                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"PRECOMMIT journal found but active account '{activeAccountId}' does not match target '{entry.TargetAccountId}'.", RetainedEntry: entry), JournalRecoveryStates.ActionRequired);
                             }
 
                         case SwitchJournalState.ROLLING_BACK:
                             _sessionVault.QuarantineUnresolvedMutation();
-                            return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Unresolved ROLLING_BACK journal found.", RetainedEntry: entry);
+                            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Unresolved ROLLING_BACK journal found.", RetainedEntry: entry), JournalRecoveryStates.ActionRequired);
 
                         case SwitchJournalState.QUARANTINED:
                             _sessionVault.QuarantineUnresolvedMutation();
-                            return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "QUARANTINED journal found.", RetainedEntry: entry);
+                            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "QUARANTINED journal found.", RetainedEntry: entry), JournalRecoveryStates.ActionRequired);
 
                         default:
                             _sessionVault.QuarantineUnresolvedMutation();
-                            return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unrecognized journal state '{entry.State}'.", RetainedEntry: entry);
+                            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unrecognized journal state '{entry.State}'.", RetainedEntry: entry), JournalRecoveryStates.Unknown);
                     }
                 }
 
                 _sessionVault.QuarantineUnresolvedMutation();
-                return new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unknown switch journal read status '{readResult.Status}'.");
+                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unknown switch journal read status '{readResult.Status}'."), JournalRecoveryStates.Unknown);
             }
             finally
             {
@@ -370,6 +406,60 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
     }
 
+    private JournalResolutionResult RecordResolutionResult(JournalResolutionResult result)
+    {
+        lock (_statusLock)
+        {
+            if (_journalRecoveryState == JournalRecoveryStates.RestartRequired)
+            {
+                return result.Status is JournalResolutionStatus.CleanCleanupCompleted or JournalResolutionStatus.NoJournal
+                    ? result with { RestartRequired = true } : result;
+            }
+
+            switch (result.Status)
+            {
+                case JournalResolutionStatus.ResolvedRestartRequired:
+                    _journalRecoveryState = JournalRecoveryStates.RestartRequired;
+                    break;
+
+                case JournalResolutionStatus.CleanCleanupCompleted:
+                case JournalResolutionStatus.NoJournal:
+                    _journalRecoveryState = JournalRecoveryStates.None;
+                    if (IsQuarantinedOrRecoveryUnresolved())
+                        result = result with { RestartRequired = true, Message = "Journal cleanup completed, but switching remains quarantined. Restart AG2 Router before switching can resume." };
+                    break;
+
+                case JournalResolutionStatus.NotResolvable:
+                    _recoveryQuarantine.Mark();
+                    _journalRecoveryState = JournalRecoveryStates.NotResolvable;
+                    break;
+
+                case JournalResolutionStatus.ProofFailed:
+                    _recoveryQuarantine.Mark();
+                    _journalRecoveryState = JournalRecoveryStates.ActionRequired;
+                    break;
+
+                case JournalResolutionStatus.PersistenceFailure:
+                    _recoveryQuarantine.Mark();
+                    if (result.ReasonCode == "DELETE_FAILED" || result.ReasonCode == "UNSUPPORTED_PLATFORM")
+                    {
+                        _journalRecoveryState = JournalRecoveryStates.ActionRequired;
+                    }
+                    else
+                    {
+                        _journalRecoveryState = JournalRecoveryStates.Unknown;
+                    }
+                    break;
+
+                default:
+                    _recoveryQuarantine.Mark();
+                    _journalRecoveryState = JournalRecoveryStates.Unknown;
+                    break;
+            }
+        }
+        return result;
+    }
+
     public async Task<JournalResolutionResult> ResolveQuarantinedJournalAsync(CancellationToken cancellationToken = default)
     {
         await SwitchGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -379,7 +469,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             var switchLock = PathLockRegistry.Get(switchResource);
             if (!await switchLock.WaitAsync(_transactionTimeout, cancellationToken).ConfigureAwait(false))
             {
-                return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Lock acquisition timed out during journal resolution.", ReasonCode: "LOCK_TIMEOUT");
+                return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Lock acquisition timed out during journal resolution.", ReasonCode: "LOCK_TIMEOUT"));
             }
 
             CrossProcessFileLease? switchLease = null;
@@ -391,7 +481,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 }
                 catch
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Cross-process lease acquisition failed.", ReasonCode: "LEASE_ACQUISITION_FAILED");
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Cross-process lease acquisition failed.", ReasonCode: "LEASE_ACQUISITION_FAILED"));
                 }
 
                 SwitchJournalReadResult readResult;
@@ -401,32 +491,32 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 }
                 catch
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR");
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR"));
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.Absent)
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false);
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false));
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.Corrupt)
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.NotResolvable, "The switch journal is corrupted and cannot be resolved automatically.", ReasonCode: "CORRUPT_JOURNAL");
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.NotResolvable, "The switch journal is corrupted and cannot be resolved automatically.", ReasonCode: "CORRUPT_JOURNAL"));
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.UnsupportedVersion)
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.NotResolvable, "The switch journal uses an unsupported schema version and cannot be resolved automatically.", ReasonCode: "UNSUPPORTED_VERSION");
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.NotResolvable, "The switch journal uses an unsupported schema version and cannot be resolved automatically.", ReasonCode: "UNSUPPORTED_VERSION"));
                 }
 
                 if (readResult.Status == SwitchJournalReadStatus.IoError)
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR");
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR"));
                 }
 
                 if (readResult.Status != SwitchJournalReadStatus.Valid || readResult.Entry == null)
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR");
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR"));
                 }
 
                 var entry = readResult.Entry;
@@ -436,14 +526,14 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 {
                     // No durable credential or metadata mutation began before crash. Clean cleanup.
                     var del = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
-                    return del.Status switch
+                    return RecordResolutionResult(del.Status switch
                     {
                         SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(JournalResolutionStatus.CleanCleanupCompleted, "Switch journal cleaned up successfully.", RestartRequired: false, ReasonCode: "CLEAN_RECORDED_REMOVED"),
                         SwitchJournalDeleteStatus.Absent => new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false),
                         SwitchJournalDeleteStatus.NotMatched => new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"),
                         SwitchJournalDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Conditional switch journal deletion is not supported on this platform.", RestartRequired: false, ReasonCode: "UNSUPPORTED_PLATFORM"),
                         _ => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Failed to delete the switch journal file.", ReasonCode: "DELETE_FAILED")
-                    };
+                    });
                 }
 
                 if (entry.State == SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT)
@@ -462,14 +552,14 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     {
                         // Metadata commit already completed before crash. Clean cleanup.
                         var del = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
-                        return del.Status switch
+                        return RecordResolutionResult(del.Status switch
                         {
                             SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(JournalResolutionStatus.CleanCleanupCompleted, "Switch journal cleaned up successfully.", RestartRequired: false, ReasonCode: "CLEAN_COMMITTED_PRECOMMIT_REMOVED"),
                             SwitchJournalDeleteStatus.Absent => new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false),
                             SwitchJournalDeleteStatus.NotMatched => new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"),
                             SwitchJournalDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Conditional switch journal deletion is not supported on this platform.", RestartRequired: false, ReasonCode: "UNSUPPORTED_PLATFORM"),
                             _ => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Failed to delete the switch journal file.", ReasonCode: "DELETE_FAILED")
-                        };
+                        });
                     }
                 }
 
@@ -478,24 +568,24 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 var initialProof = await VerifyCoherenceProofAsync(cancellationToken).ConfigureAwait(false);
                 if (!initialProof.IsProven)
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.ProofFailed, initialProof.SafeMessage, ReasonCode: initialProof.ReasonCode);
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.ProofFailed, initialProof.SafeMessage, ReasonCode: initialProof.ReasonCode));
                 }
 
                 // 2. Final 4-Pillar Proof (F-270-1) immediately before delete:
                 var finalProof = await VerifyCoherenceProofAsync(cancellationToken).ConfigureAwait(false);
                 if (!finalProof.IsProven)
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.ProofFailed, finalProof.SafeMessage, ReasonCode: finalProof.ReasonCode);
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.ProofFailed, finalProof.SafeMessage, ReasonCode: finalProof.ReasonCode));
                 }
 
                 if (!string.Equals(finalProof.ActiveAccountId, initialProof.ActiveAccountId, StringComparison.Ordinal))
                 {
-                    return new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION");
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"));
                 }
 
                 // 3. Conditional Journal Deletion (F-270-2):
                 var deleteResult = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
-                return deleteResult.Status switch
+                return RecordResolutionResult(deleteResult.Status switch
                 {
                     SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(
                         JournalResolutionStatus.ResolvedRestartRequired,
@@ -522,7 +612,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                         CoherentAccountId: finalProof.ActiveAccountId,
                         RestartRequired: true,
                         ReasonCode: "DELETE_FAILED")
-                };
+                });
             }
             finally
             {
@@ -530,9 +620,19 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 {
                     try { await beforeRelease().ConfigureAwait(false); } catch { }
                 }
+                string? completedTransactionId;
+                lock (_statusLock) completedTransactionId = _activeTransactionId == null ? _lastResult?.TransactionId : null;
+                bool reusable = completedTransactionId != null &&
+                    await ProveTransactionReusableAsync(completedTransactionId).ConfigureAwait(false);
                 if (switchLease != null)
                 {
                     await switchLease.DisposeAsync().ConfigureAwait(false);
+                }
+                lock (_statusLock)
+                {
+                    if (reusable && _activeTransactionId == null && !IsQuarantinedOrRecoveryUnresolved() &&
+                        _currentState is NativeSwitchStates.Complete or NativeSwitchStates.RolledBack or NativeSwitchStates.Failed)
+                        _currentState = NativeSwitchStates.Idle;
                 }
                 switchLock.Release();
             }
@@ -547,24 +647,113 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     public async Task<NativeSwitchResult> SwitchAsync(
         string targetAccountId,
         CancellationToken cancellationToken = default)
-        => await ObserveSwitchAsync(targetAccountId, null, null, cancellationToken).ConfigureAwait(false);
+        => await ObserveSwitchAsync(targetAccountId, null, null, null, null, cancellationToken).ConfigureAwait(false);
 
     public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
         CancellationToken cancellationToken = default)
-        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, cancellationToken);
+        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, null, null, cancellationToken);
+
+    public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+        string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
+        string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
+        CancellationToken cancellationToken = default)
+        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken);
+
+    public bool CanAdmitSwitch(out string? blockingReason)
+    {
+        lock (_statusLock)
+        {
+            if (_isShuttingDown)
+            {
+                blockingReason = "Switch blocked: coordinator is shutting down.";
+                return false;
+            }
+
+            if (!string.Equals(_journalRecoveryState, JournalRecoveryStates.None, StringComparison.Ordinal))
+            {
+                blockingReason = _journalRecoveryState switch
+                {
+                    JournalRecoveryStates.ActionRequired => "Switch blocked: journal recovery action is required.",
+                    JournalRecoveryStates.NotResolvable => "Switch blocked: switch journal is not resolvable.",
+                    JournalRecoveryStates.RestartRequired => "Switch blocked: application restart is required after journal resolution.",
+                    _ => "Switch blocked: journal recovery state is unknown."
+                };
+                return false;
+            }
+
+            if (_activeTransactionId != null || !string.Equals(_currentState, NativeSwitchStates.Idle, StringComparison.Ordinal))
+            {
+                blockingReason = "Switch blocked: another switch transaction is currently in progress.";
+                return false;
+            }
+        }
+
+        if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined ||
+            RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch").IsMarked ||
+            RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked)
+        {
+            blockingReason = "Switch blocked: account lifecycle is quarantined.";
+            return false;
+        }
+
+        if (SwitchGate.CurrentCount == 0)
+        {
+            blockingReason = "Switch blocked: another switch transaction is currently in progress.";
+            return false;
+        }
+
+        blockingReason = null;
+        return true;
+    }
+
+    private bool IsRecoveryAdmissionBlocked() => !CanAdmitSwitch(out _);
+
+    private bool IsQuarantinedOrRecoveryUnresolved()
+    {
+        string recoveryState;
+        lock (_statusLock) recoveryState = _journalRecoveryState;
+        return !string.Equals(recoveryState, JournalRecoveryStates.None, StringComparison.Ordinal) ||
+            _recoveryQuarantine.IsMarked ||
+            _sessionVault.IsQuarantined ||
+            RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch").IsMarked ||
+            RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked;
+    }
 
     private async Task<NativeSwitchResult> ObserveSwitchAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool>? planIsCurrent,
+        string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
         CancellationToken cancellationToken)
     {
-        if (_recoveryQuarantine.IsMarked)
-            return RecoveryUncertain(targetAccountId);
+        if (!CanAdmitSwitch(out var blockingReason))
+        {
+            if (_isShuttingDown)
+            {
+                string now = DateTimeOffset.UtcNow.ToString("O");
+                return new NativeSwitchResult(null, false, SwitchResultCodes.Cancelled,
+                    NativeSwitchStates.Failed, targetAccountId?.Trim() ?? string.Empty, null, null, null,
+                    blockingReason ?? "Switch coordinator is shutting down.", [], now, now);
+            }
+            if (IsQuarantinedOrRecoveryUnresolved())
+            {
+                return RecoveryUncertain(targetAccountId, blockingReason);
+            }
+            if (!string.Equals(_currentState, NativeSwitchStates.Idle, StringComparison.Ordinal) ||
+                _activeTransactionId != null ||
+                SwitchGate.CurrentCount == 0)
+            {
+                string now = DateTimeOffset.UtcNow.ToString("O");
+                return new NativeSwitchResult(null, false, SwitchResultCodes.SwitchInProgress,
+                    GetStatus().CurrentState, targetAccountId?.Trim() ?? string.Empty, null, null, null,
+                    blockingReason ?? "Another account switch is already in progress.", [], now, now);
+            }
+            return RecoveryUncertain(targetAccountId, blockingReason);
+        }
 
         // The inner task owns every switch gate/lease until it actually finishes.
         // Timeout detaches only the caller, never the mutation or its serialization.
         Task<NativeSwitchResult> operation = SwitchCoreAsync(
-            targetAccountId, expectedActiveAccountId, planIsCurrent, cancellationToken);
+            targetAccountId, expectedActiveAccountId, planIsCurrent, requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken);
         try
         {
             return await operation.WaitAsync(_transactionTimeout).ConfigureAwait(false);
@@ -579,6 +768,10 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             {
                 _currentState = NativeSwitchStates.Failed;
                 _lastResult = uncertain;
+                if (_journalRecoveryState != JournalRecoveryStates.RestartRequired)
+                {
+                    _journalRecoveryState = JournalRecoveryStates.Unknown;
+                }
             }
             _ = operation.ContinueWith(static completed => _ = completed.Exception,
                 CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
@@ -586,7 +779,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
     }
 
-    private NativeSwitchResult RecoveryUncertain(string? targetAccountId)
+    private NativeSwitchResult RecoveryUncertain(string? targetAccountId, string? message = null)
     {
         string now = DateTimeOffset.UtcNow.ToString("O");
         string? activeTransactionId;
@@ -594,16 +787,39 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         return new NativeSwitchResult(activeTransactionId, false,
             SwitchResultCodes.SwitchFailedRollbackFailed, NativeSwitchStates.Failed,
             targetAccountId?.Trim() ?? string.Empty, null, null, null,
-            "Switch outcome is unresolved; manual recovery is required before another switch.",
+            message ?? "Switch outcome is unresolved; manual recovery is required before another switch.",
             [], now, now, ManualRecoveryRequired: true);
     }
 
     private async Task<NativeSwitchResult> SwitchCoreAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool>? planIsCurrent,
+        string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
         CancellationToken cancellationToken)
     {
-        if (_recoveryQuarantine.IsMarked)
-            return RecoveryUncertain(targetAccountId);
+        if (!CanAdmitSwitch(out var blockingReason))
+        {
+            if (_isShuttingDown)
+            {
+                string blockedNow = DateTimeOffset.UtcNow.ToString("O");
+                return new NativeSwitchResult(null, false, SwitchResultCodes.Cancelled,
+                    NativeSwitchStates.Failed, targetAccountId?.Trim() ?? string.Empty, null, null, null,
+                    blockingReason ?? "Switch coordinator is shutting down.", [], blockedNow, blockedNow);
+            }
+            if (IsQuarantinedOrRecoveryUnresolved())
+            {
+                return RecoveryUncertain(targetAccountId, blockingReason);
+            }
+            if (!string.Equals(_currentState, NativeSwitchStates.Idle, StringComparison.Ordinal) ||
+                _activeTransactionId != null ||
+                SwitchGate.CurrentCount == 0)
+            {
+                string blockedNow = DateTimeOffset.UtcNow.ToString("O");
+                return new NativeSwitchResult(null, false, SwitchResultCodes.SwitchInProgress,
+                    GetStatus().CurrentState, targetAccountId?.Trim() ?? string.Empty, null, null, null,
+                    blockingReason ?? "Another account switch is already in progress.", [], blockedNow, blockedNow);
+            }
+            return RecoveryUncertain(targetAccountId, blockingReason);
+        }
         string requestedId = targetAccountId?.Trim() ?? string.Empty;
         string now = DateTimeOffset.UtcNow.ToString("O");
         bool entered;
@@ -655,19 +871,29 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             if (!await switchLock.WaitAsync(_transactionTimeout, cancellationToken).ConfigureAwait(false))
             {
                 _recoveryQuarantine.Mark();
-                return RecoveryUncertain(requestedId);
+                var uncertain = RecoveryUncertain(requestedId);
+                lock (_statusLock)
+                {
+                    _currentState = NativeSwitchStates.Failed;
+                    _lastResult = uncertain;
+                    if (_journalRecoveryState != JournalRecoveryStates.RestartRequired)
+                    {
+                        _journalRecoveryState = JournalRecoveryStates.Unknown;
+                    }
+                }
+                return uncertain;
             }
 
             SetActive(transactionId, NativeSwitchStates.Preflight);
             try
             {
-            if (_recoveryQuarantine.IsMarked)
+            if (IsQuarantinedOrRecoveryUnresolved())
                 throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
                     "Account lifecycle is unresolved; manual recovery is required.");
             switchLease = await CrossProcessFileLease
                 .AcquireAsync(switchResource, cancellationToken)
                 .ConfigureAwait(false);
-            if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
+            if (IsQuarantinedOrRecoveryUnresolved())
                 throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
                     "Account lifecycle is unresolved; manual recovery is required.");
 
@@ -843,6 +1069,9 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                         if (!string.Equals(stopActivity.State, "IDLE", StringComparison.OrdinalIgnoreCase))
                             throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
                                 "Antigravity activity was not proven idle at the process-stop boundary.");
+                        if (planIsCurrent != null && !planIsCurrent())
+                            throw new SwitchRejectedException(SwitchResultCodes.Cancelled,
+                                "Automatic quota evidence changed or expired at the process-stop boundary.");
                         if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
                             throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
                                 "Account lifecycle became unresolved at the process-stop boundary.");
@@ -898,6 +1127,41 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             await VerifyIdentityAsync(target.Email, replacementGeneration, mutationToken).ConfigureAwait(false);
             stages.Add("TARGET_IDENTITY_VERIFIED");
 
+            List<AccountModelQuotaObservation>? verifiedTargetObservations = null;
+            if (!string.IsNullOrWhiteSpace(requiredWorkloadModelKey))
+            {
+                AccountModelQuotaObservation? cachedEvidence = null;
+                try
+                {
+                    if (_quotaObservationStore != null)
+                        cachedEvidence = await _quotaObservationStore.GetObservationAsync(target.Id,
+                            requiredWorkloadModelKey, mutationToken).ConfigureAwait(false);
+                    verifiedTargetObservations = await VerifyTargetQuotaAsync(
+                        target, replacementGeneration, requiredWorkloadModelKey,
+                        minimumCandidateQuotaPercent, stages, mutationToken).ConfigureAwait(false);
+                }
+                catch (SwitchVerificationException)
+                {
+                    if (_quotaObservationStore != null && cachedEvidence != null)
+                    {
+                        try
+                        {
+                            // Do not invalidate a newer independent observation. Persist
+                            // rejection before rollback; cooldown expiry must not revive it.
+                            await _quotaObservationStore.InvalidateIfUnchangedAsync(cachedEvidence,
+                                _timeProvider.GetUtcNow(), CancellationToken.None).ConfigureAwait(false);
+                            stages.Add("TARGET_QUOTA_EVIDENCE_INVALIDATED");
+                        }
+                        catch
+                        {
+                            _recoveryQuarantine.Mark();
+                            stages.Add("TARGET_QUOTA_INVALIDATION_FAILED");
+                        }
+                    }
+                    throw;
+                }
+            }
+
             SetState(NativeSwitchStates.Finalizing);
             if (!await _processLifecycle.IsGenerationCurrentAsync(replacementGeneration, mutationToken)
                     .ConfigureAwait(false))
@@ -922,6 +1186,20 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             if (updated == null)
                 throw new InvalidOperationException("Account metadata changed during atomic switch finalization.");
             stages.Add("METADATA_COMMITTED");
+
+            if (_quotaObservationStore != null && verifiedTargetObservations != null && verifiedTargetObservations.Count > 0)
+            {
+                try
+                {
+                    await _quotaObservationStore.RecordCompleteSnapshotAsync(
+                        target.Id, verifiedTargetObservations, verifiedTargetObservations[0].ObservedAtUtc,
+                        "LiveTargetVerification", mutationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best-effort derived telemetry persistence; transaction is already committed.
+                }
+            }
 
             // Phase Transition d: Success Deletion (only after TryFinalizeSwitchAsync succeeds)
             try
@@ -1031,16 +1309,25 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 // Phase Transition f: Rollback Success Deletion
                 try
                 {
-                    await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
+                    // If durable evidence rejection failed, retain the recovery
+                    // journal so restart cannot clear an in-memory-only quarantine
+                    // and route using the same disproven healthy observation.
+                    if (!_recoveryQuarantine.IsMarked)
+                        await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (Exception)
                 {
                     // If deletion fails/throws: log warning; rollback succeeded.
                 }
 
+                string failureDetail = SafeFailure(switchError);
+                string message = string.IsNullOrWhiteSpace(failureDetail)
+                    ? "Switch failed; the original credential and verified source identity were restored."
+                    : $"Switch failed; the original credential and verified source identity were restored. {failureDetail}";
+
                 return Terminal(transactionId, false, SwitchResultCodes.SwitchFailedRolledBack,
                     NativeSwitchStates.RolledBack, requestedId, target?.Email, previousAccountId, previousEmail,
-                    "Switch failed; the original credential and verified source identity were restored.", stages, now);
+                    message, stages, now);
             }
             catch (Exception rollbackError)
             {
@@ -1079,10 +1366,14 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             }
             if (targetSession != null) CryptographicOperations.ZeroMemory(targetSession);
             Exception? cleanupError = null;
+            bool journalProvenAbsent = false;
             try
             {
                 if (BeforeLeaseReleaseAsync is { } beforeRelease)
                     await beforeRelease().ConfigureAwait(false);
+                // Retain switch ownership while proving that terminal cleanup left
+                // no recovery artifact. A terminal result alone is not that proof.
+                journalProvenAbsent = await ProveTransactionReusableAsync(transactionId).ConfigureAwait(false);
                 if (switchLease != null) await switchLease.DisposeAsync().ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -1102,7 +1393,16 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             finally
             {
                 switchLock.Release();
-                lock (_statusLock) { _activeTransactionId = null; }
+                lock (_statusLock)
+                {
+                    _activeTransactionId = null;
+                    if (cleanupError == null && journalProvenAbsent &&
+                        _lastResult?.TransactionId == transactionId && !_lastResult.ManualRecoveryRequired &&
+                        _journalRecoveryState == JournalRecoveryStates.None &&
+                        !IsQuarantinedOrRecoveryUnresolved() &&
+                        _currentState is NativeSwitchStates.Complete or NativeSwitchStates.RolledBack or NativeSwitchStates.Failed)
+                        _currentState = NativeSwitchStates.Idle;
+                }
             }
             if (cleanupError != null)
             {
@@ -1140,6 +1440,43 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         {
             SwitchGate.Release();
         }
+    }
+
+    private async Task<bool> ProveTransactionReusableAsync(string transactionId)
+    {
+        lock (_statusLock)
+        {
+            if (_lastResult?.TransactionId != transactionId || _lastResult.ManualRecoveryRequired ||
+                IsQuarantinedOrRecoveryUnresolved()) return false;
+        }
+        SwitchJournalReadResult journal;
+        try
+        {
+            using var deadline = new CancellationTokenSource(_transactionTimeout);
+            journal = await _journalStore.ReadAsync(deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            lock (_statusLock)
+            {
+                if (_journalRecoveryState == JournalRecoveryStates.None)
+                    _journalRecoveryState = JournalRecoveryStates.Unknown;
+            }
+            return false;
+        }
+        if (journal.Status == SwitchJournalReadStatus.Absent) return true;
+        lock (_statusLock)
+        {
+            // Never clear established recovery state while retiring a transaction.
+            if (_journalRecoveryState == JournalRecoveryStates.None)
+                _journalRecoveryState = journal.Status switch
+                {
+                    SwitchJournalReadStatus.Valid => JournalRecoveryStates.ActionRequired,
+                    SwitchJournalReadStatus.Corrupt or SwitchJournalReadStatus.UnsupportedVersion => JournalRecoveryStates.NotResolvable,
+                    _ => JournalRecoveryStates.Unknown
+                };
+        }
+        return false;
     }
 
     private async Task<WinCredEntry> CaptureCurrentCredentialAsync(CancellationToken cancellationToken)
@@ -1320,9 +1657,15 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     Code = SwitchResultCodes.SwitchFailedRollbackFailed,
                     State = NativeSwitchStates.Failed,
                     ManualRecoveryRequired = true,
-                    Message = "Switch outcome remained quarantined after a deadline; manual recovery is required."
+                    Message = "Switch outcome remained quarantined; manual recovery is required."
                 };
                 state = NativeSwitchStates.Failed;
+                if (_journalRecoveryState != JournalRecoveryStates.RestartRequired &&
+                    _journalRecoveryState != JournalRecoveryStates.Unknown &&
+                    _journalRecoveryState != JournalRecoveryStates.NotResolvable)
+                {
+                    _journalRecoveryState = JournalRecoveryStates.ActionRequired;
+                }
             }
             _currentState = state;
             _lastResult = result;
@@ -1353,9 +1696,124 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         await _journalStore.WriteEntryAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
+    private async Task<List<AccountModelQuotaObservation>> VerifyTargetQuotaAsync(
+        AccountMetadata target,
+        AG2ProcessGeneration? generation,
+        string requiredWorkloadModelKey,
+        double? minimumCandidateQuotaPercent,
+        List<string> stages,
+        CancellationToken cancellationToken)
+    {
+        string? canonicalKey = CandidateSelector.CanonicalizeModelKey(requiredWorkloadModelKey);
+        if (string.IsNullOrWhiteSpace(canonicalKey))
+        {
+            throw new SwitchVerificationException(SwitchVerificationFailureReasons.InvalidWorkloadModelKey);
+        }
+
+        if (generation == null || !await _processLifecycle.IsGenerationCurrentAsync(generation, cancellationToken).ConfigureAwait(false))
+        {
+            throw new SwitchVerificationException(SwitchVerificationFailureReasons.ProcessGenerationChanged);
+        }
+
+        AccountQuotaObservation observation;
+        try
+        {
+            observation = await _adapter.GetAccountQuotaObservationAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw new SwitchVerificationException(SwitchVerificationFailureReasons.TelemetryUnavailable, innerException: ex);
+        }
+
+        if (generation == null || !await _processLifecycle.IsGenerationCurrentAsync(generation, cancellationToken).ConfigureAwait(false))
+        {
+            throw new SwitchVerificationException(SwitchVerificationFailureReasons.ProcessGenerationChanged);
+        }
+
+        if (observation == null || observation.Account == null ||
+            string.IsNullOrWhiteSpace(observation.Account.Email) ||
+            !string.Equals(observation.Account.Email.Trim(), target.Email.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new SwitchVerificationException(SwitchVerificationFailureReasons.TargetIdentityMismatch);
+        }
+
+        if (observation.Quota == null || observation.Quota.Models == null || observation.Quota.Models.Count == 0)
+        {
+            throw new SwitchVerificationException(SwitchVerificationFailureReasons.TelemetryUnavailable);
+        }
+
+        var matchingModels = observation.Quota.Models
+            .Where(m => string.Equals(CandidateSelector.GetModelKey(m), canonicalKey, StringComparison.Ordinal))
+            .ToList();
+
+        if (matchingModels.Count == 0)
+        {
+            throw new SwitchVerificationException(SwitchVerificationFailureReasons.RequestedModelAbsent);
+        }
+
+        double minRequiredFraction = (minimumCandidateQuotaPercent ?? 0.0) / 100.0;
+        foreach (var m in matchingModels)
+        {
+            if (m.IsExhausted)
+            {
+                throw new SwitchVerificationException(SwitchVerificationFailureReasons.RequestedModelExhausted);
+            }
+
+            if (!m.RemainingFraction.HasValue)
+            {
+                throw new SwitchVerificationException(SwitchVerificationFailureReasons.QuotaUnknown);
+            }
+
+            if (!double.IsFinite(m.RemainingFraction.Value) || m.RemainingFraction.Value < 0.0 || m.RemainingFraction.Value > 1.0)
+            {
+                throw new SwitchVerificationException(SwitchVerificationFailureReasons.QuotaInvalid);
+            }
+
+            if (m.RemainingFraction.Value < minRequiredFraction)
+            {
+                throw new SwitchVerificationException(SwitchVerificationFailureReasons.BelowMinimumThreshold);
+            }
+        }
+
+        stages.Add("TARGET_QUOTA_VERIFIED");
+
+        return QuotaObservationEvidence.Capture(target.Id, observation.Quota.Models,
+            _timeProvider.GetUtcNow(), "LiveTargetVerification").ToList();
+    }
+
     private sealed class SwitchRejectedException : Exception
     {
         public string Code { get; }
         public SwitchRejectedException(string code, string message) : base(message) => Code = code;
+    }
+}
+
+public static class SwitchVerificationFailureReasons
+{
+    public const string InvalidWorkloadModelKey = "InvalidWorkloadModelKey";
+    public const string ProcessGenerationChanged = "ProcessGenerationChanged";
+    public const string TelemetryUnavailable = "TelemetryUnavailable";
+    public const string TargetIdentityMismatch = "TargetIdentityMismatch";
+    public const string RequestedModelAbsent = "RequestedModelAbsent";
+    public const string RequestedModelExhausted = "RequestedModelExhausted";
+    public const string QuotaUnknown = "QuotaUnknown";
+    public const string QuotaInvalid = "QuotaInvalid";
+    public const string BelowMinimumThreshold = "BelowMinimumThreshold";
+}
+
+public sealed class SwitchVerificationException : Exception
+{
+    public string Reason { get; }
+
+    public SwitchVerificationException(string reason, string? message = null, Exception? innerException = null)
+        : base(message ?? $"Target quota verification failed: {reason}.", innerException)
+    {
+        Reason = reason;
+    }
+
+    public SwitchVerificationException(string reason, Exception? innerException)
+        : base($"Target quota verification failed: {reason}.", innerException)
+    {
+        Reason = reason;
     }
 }

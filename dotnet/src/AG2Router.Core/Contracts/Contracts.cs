@@ -36,10 +36,15 @@ public interface IAG2Adapter
     Task<AccountIdentityDto?> GetCurrentAccountAsync(CancellationToken cancellationToken = default);
     Task<QuotaSnapshotDto?> GetQuotaAsync(CancellationToken cancellationToken = default);
     Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(CancellationToken cancellationToken = default);
+    // Return the model selected for the current workload only when live runtime
+    // evidence proves it. Available/default/previously used models are not demand.
+    Task<RequestedModelObservation> GetRequestedModelAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult(new RequestedModelObservation(null, null));
     Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default);
 }
 
 public record AccountQuotaObservation(AccountIdentityDto? Account, QuotaSnapshotDto? Quota);
+public record RequestedModelObservation(AccountIdentityDto? Account, string? ModelOrTier);
 
 public interface ISessionVault
 {
