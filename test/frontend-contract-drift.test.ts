@@ -1,6 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import type { CanonicalModelDto, RouterConfigDto, RawModelQuotaDto, QuotaSnapshotDto } from '../frontend/src/lib/api/types.js';
+import type {
+  CanonicalModelDto,
+  RouterConfigDto,
+  RawModelQuotaDto,
+  QuotaSnapshotDto,
+  SwitchStatusDto,
+  JournalRecoveryState,
+  JournalResolutionResult,
+  JournalResolutionStatus
+} from '../frontend/src/lib/api/types.js';
 import { summarizeModelFamilies } from '../frontend/src/lib/utils/providerQuota.js';
 import { deriveLowestModelQuota } from '../frontend/src/lib/utils/helpers.js';
 
@@ -44,6 +53,29 @@ describe('AUD-103 API contract alignment & drift prevention', () => {
       assert.equal(config.lowQuotaThresholdPercent, 15);
       assert.equal(config.minimumCandidateQuotaPercent, 30);
       assert.equal(config.pollingIntervalMs, 10000);
+      assert.equal(config.workloadModelKey, undefined);
+    });
+
+    it('accepts workloadModelKey matching backend RouterConfigDto serialization', () => {
+      const configWithModel: RouterConfigDto = {
+        autoSwitchEnabled: true,
+        lowQuotaThresholdPercent: 15,
+        minimumCandidateQuotaPercent: 30,
+        pollingIntervalMs: 10000,
+        workloadModelKey: 'gemini-2.5-pro'
+      };
+
+      assert.equal(configWithModel.workloadModelKey, 'gemini-2.5-pro');
+
+      const configWithNullModel: RouterConfigDto = {
+        autoSwitchEnabled: false,
+        lowQuotaThresholdPercent: 15,
+        minimumCandidateQuotaPercent: 30,
+        pollingIntervalMs: 10000,
+        workloadModelKey: null
+      };
+
+      assert.equal(configWithNullModel.workloadModelKey, null);
     });
   });
 
@@ -87,6 +119,70 @@ describe('AUD-103 API contract alignment & drift prevention', () => {
       assert.equal(families[0].displayName, 'Gemini 3.8 Flash');
       assert.equal(families[0].percent, 60);
       assert.equal(families[0].modelCount, 1);
+    });
+  });
+
+  describe('SwitchStatusDto & JournalRecoveryState contract', () => {
+    it('accurately models quarantineActive and journalRecoveryState without inferring from File.Exists', () => {
+      const validRecoveryStates: JournalRecoveryState[] = [
+        'NONE',
+        'ACTION_REQUIRED',
+        'RESTART_REQUIRED',
+        'NOT_RESOLVABLE',
+        'UNKNOWN'
+      ];
+
+      for (const state of validRecoveryStates) {
+        const dto: SwitchStatusDto = {
+          currentState: 'IDLE',
+          quarantineActive: state !== 'NONE',
+          journalRecoveryState: state
+        };
+
+        assert.equal(typeof dto.currentState, 'string');
+        assert.equal(typeof dto.quarantineActive, 'boolean');
+        assert.equal(dto.journalRecoveryState, state);
+      }
+    });
+
+    it('allows non-journal quarantine where quarantineActive is true but journalRecoveryState is NONE', () => {
+      const dto: SwitchStatusDto = {
+        currentState: 'IDLE',
+        quarantineActive: true,
+        journalRecoveryState: 'NONE'
+      };
+
+      assert.equal(dto.quarantineActive, true);
+      assert.equal(dto.journalRecoveryState, 'NONE');
+    });
+  });
+
+  describe('JournalResolutionResult contract', () => {
+    it('adheres to loopback POST /api/switching/resolve-quarantine structured response shape', () => {
+      const validStatuses: JournalResolutionStatus[] = [
+        'NoJournal',
+        'CleanCleanupCompleted',
+        'ResolvedRestartRequired',
+        'NotResolvable',
+        'ProofFailed',
+        'PersistenceFailure'
+      ];
+
+      for (const status of validStatuses) {
+        const res: JournalResolutionResult = {
+          status,
+          message: `Resolution status ${status}`,
+          coherentAccountId: status === 'ResolvedRestartRequired' ? 'acc-123' : null,
+          restartRequired: status === 'ResolvedRestartRequired',
+          reasonCode: status === 'ProofFailed' ? 'LIVE_IDENTITY_UNAVAILABLE' : null
+        };
+
+        assert.equal(res.status, status);
+        assert.equal(typeof res.message, 'string');
+        if (res.coherentAccountId) assert.equal(typeof res.coherentAccountId, 'string');
+        if (res.restartRequired !== undefined) assert.equal(typeof res.restartRequired, 'boolean');
+        if (res.reasonCode) assert.equal(typeof res.reasonCode, 'string');
+      }
     });
   });
 });

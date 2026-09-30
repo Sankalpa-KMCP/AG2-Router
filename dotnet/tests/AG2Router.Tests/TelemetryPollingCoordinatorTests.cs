@@ -13,6 +13,8 @@ public class MockAG2Adapter : IAG2Adapter
     public Func<CancellationToken, Task<AccountIdentityDto?>>? GetCurrentAccountFunc { get; set; }
     public Func<CancellationToken, Task<QuotaSnapshotDto?>>? GetQuotaFunc { get; set; }
     public Func<CancellationToken, Task<AccountQuotaObservation>>? GetAccountQuotaObservationFunc { get; set; }
+    public Func<CancellationToken, Task<RequestedModelObservation>>? GetRequestedModelFunc { get; set; }
+    public string? RequestedModelOrTier { get; set; }
     public Func<CancellationToken, Task<ActivityStatusDto>>? GetActivityStateFunc { get; set; }
     public int GetCurrentAccountCallCount { get; private set; }
     public int GetQuotaCallCount { get; private set; }
@@ -55,6 +57,16 @@ public class MockAG2Adapter : IAG2Adapter
         return new AccountQuotaObservation(
             await GetCurrentAccountAsync(cancellationToken),
             await GetQuotaAsync(cancellationToken));
+    }
+
+    public async Task<RequestedModelObservation> GetRequestedModelAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (GetRequestedModelFunc != null)
+            return await GetRequestedModelFunc(cancellationToken);
+        return new RequestedModelObservation(
+            GetCurrentAccountFunc == null ? null : await GetCurrentAccountFunc(cancellationToken),
+            RequestedModelOrTier);
     }
 
     public Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default)

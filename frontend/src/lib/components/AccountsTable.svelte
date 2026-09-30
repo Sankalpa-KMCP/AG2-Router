@@ -11,6 +11,8 @@
     onUpdateAlias: (id: string, newAlias: string) => Promise<void>;
     isSavingCurrent?: boolean;
     isSwitching?: boolean;
+    isQuarantined?: boolean;
+    lifecycleMutationsAllowed?: boolean;
   }
 
   let {
@@ -21,8 +23,12 @@
     onDeleteAccount,
     onUpdateAlias,
     isSavingCurrent = false,
-    isSwitching = false
+    isSwitching = false,
+    isQuarantined = false,
+    lifecycleMutationsAllowed = false
   }: Props = $props();
+
+  const canMutate = $derived(lifecycleMutationsAllowed && !isQuarantined);
 
   // Inline alias editing state
   let editingId = $state<string | null>(null);
@@ -83,8 +89,8 @@
         type="button"
         class="btn btn-secondary btn-sm"
         onclick={onSaveCurrent}
-        disabled={isSavingCurrent}
-        title="Capture active session from Antigravity 2 into local encrypted vault"
+        disabled={isSavingCurrent || !canMutate}
+        title={!canMutate ? "Account operations are disabled while safety status is unresolved or quarantine is active" : "Capture active session from Antigravity 2 into local encrypted vault"}
       >
         <span>🔒</span>
         <span>{isSavingCurrent ? 'Saving...' : 'Save Current AG2 Account'}</span>
@@ -112,7 +118,8 @@
           type="button"
           class="btn btn-primary"
           onclick={onSaveCurrent}
-          disabled={isSavingCurrent}
+          disabled={isSavingCurrent || isQuarantined}
+          title={isQuarantined ? "Account enrollment is disabled while safety quarantine is active" : "Capture active session from Antigravity 2 into local encrypted vault"}
         >
           <span>🔒 Save Current AG2 Account</span>
         </button>
@@ -231,8 +238,8 @@
                         type="button"
                         class="btn btn-primary btn-sm"
                         onclick={() => onExecuteSwitch(acc)}
-                        disabled={isSwitching}
-                        title="Switch active session to this account"
+                        disabled={isSwitching || !canMutate}
+                        title={!canMutate ? "Account switching is disabled while safety status is unresolved or quarantine is active" : "Switch active session to this account"}
                       >
                         Switch
                       </button>
@@ -242,7 +249,8 @@
                     type="button"
                     class="btn btn-danger btn-sm"
                     onclick={() => onDeleteAccount(acc)}
-                    title="Remove account"
+                    disabled={!canMutate}
+                    title={!canMutate ? "Account deletion is disabled while safety status is unresolved or quarantine is active" : "Remove account"}
                   >
                     Delete
                   </button>

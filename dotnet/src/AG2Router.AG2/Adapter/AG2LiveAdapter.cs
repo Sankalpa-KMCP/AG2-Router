@@ -1,5 +1,6 @@
 using AG2Router.AG2.Discovery;
 using AG2Router.AG2.Normalization;
+using AG2Router.AG2.Routing;
 using AG2Router.AG2.Rpc;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
@@ -14,13 +15,20 @@ public class AG2LiveAdapter : IAG2Adapter
 {
     private readonly AG2ProcessDetector _detector;
     private readonly IAG2RpcClient _rpcClient;
+    private Func<string?>? _configuredModelProvider;
     private string? _lastTelemetryTimestamp;
 
-    public AG2LiveAdapter(AG2ProcessDetector? detector = null, IAG2RpcClient? rpcClient = null)
+    public AG2LiveAdapter(
+        AG2ProcessDetector? detector = null,
+        IAG2RpcClient? rpcClient = null,
+        Func<string?>? configuredModelProvider = null)
     {
         _detector = detector ?? new AG2ProcessDetector();
         _rpcClient = rpcClient ?? new AG2RpcClient();
+        _configuredModelProvider = configuredModelProvider;
     }
+
+    public void SetConfiguredModelProvider(Func<string?>? provider) => _configuredModelProvider = provider;
 
     public AG2ProcessDetector Detector => _detector;
     public string? LastTelemetryTimestamp => _lastTelemetryTimestamp;
@@ -124,6 +132,35 @@ public class AG2LiveAdapter : IAG2Adapter
             _detector.RecordRpcFailure(ex);
             return new AccountQuotaObservation(null, null);
         }
+    }
+
+    public async Task<RequestedModelObservation> GetRequestedModelAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (_configuredModelProvider == null)
+        {
+            return new RequestedModelObservation(null, null);
+        }
+
+        var raw = _configuredModelProvider();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return new RequestedModelObservation(null, null);
+        }
+
+        var canonical = CandidateSelector.CanonicalizeModelKey(raw);
+        if (canonical == null)
+        {
+            return new RequestedModelObservation(null, null);
+        }
+
+        var activeAccount = await GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
+        if (activeAccount == null || string.IsNullOrWhiteSpace(activeAccount.Email))
+        {
+            return new RequestedModelObservation(null, null);
+        }
+
+        return new RequestedModelObservation(activeAccount, canonical);
     }
 
     public async Task<ActivityStatusDto> GetActivityStateAsync(CancellationToken cancellationToken = default)

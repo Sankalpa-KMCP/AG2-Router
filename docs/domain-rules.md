@@ -26,13 +26,27 @@ CURRENT IMPLEMENTATION:
 
 - AG2TelemetryNormalizer clamps observed numeric fractions and preserves prompt and Flow credit records separately.
 - AG2TelemetryNormalizer and the TypeScript reference normalizer retain missing and non-finite model fractions as unknown. CanonicalizeModelQuotas preserves each source row because model/tier, presentation labels, and even equal reset instants do not prove shared capacity. No proximity tolerance or prefix match is used.
-- NativeAutoRouter derives account-level switching pressure from the weakest observed model. Any observed exhausted model makes that account-level value zero; unknown models never become 100% by default. Unknown current-account quota does not authorize automatic mutation.
+- NativeAutoRouter evaluates live active quota and candidate eligibility only for the explicitly configured workload model, tied to the verified active identity. Another exhausted model does not create routing pressure. Missing, unknown, or changed requested-model evidence cancels the automatic plan.
+- Candidate observations originate from coherent live account quota telemetry and persist per account and canonical model. Production selection and execution admission use the same durable observation, not the legacy short-lived in-memory fallback. Newly enrolled accounts without an observation remain ineligible.
 - Activity telemetry is IDLE only when an explicitly observed keyed trajectory collection is empty or every observed status is a known inactive status. Missing payloads, malformed collections, and unrecognized statuses remain UNKNOWN; RUNNING evidence remains BUSY.
 - CandidateSelector requires known capacity for every pool matching a relevant model key; one healthy row cannot hide another matching unknown or exhausted row.
 - The dashboard renders missing quota as UNKNOWN, distinct from an observed zero/exhausted quota.
 - The Overview shows Gemini and Claude provider summaries derived from, but never written back to, individual model rows. Each summary uses the lowest observed fraction; unknown rows prevent a healthy percentage unless exhaustion is observed. Differing or incomplete reset evidence does not become one shared reset time. The detailed model rows remain visible in Telemetry & Quotas, and routing keeps its model-specific inputs.
 
 Primary evidence: AG2TelemetryNormalizer, NativeAutoRouter, AG2TelemetryNormalizerTests, and NativeAutoRouterTests.
+
+## Workload model and candidate evidence
+
+CURRENT IMPLEMENTATION:
+
+- WorkloadModelKey is explicit user-configured routing intent, exposed by dashboard Settings and persisted with routing configuration. AG2LiveAdapter associates that intent with the live active identity; it does not observe the currently selected IDE model dropdown.
+- Model keys are trimmed and lowercased invariantly, then matched exactly against raw telemetry ModelOrTier keys. Friendly labels, provider summaries, prefixes, and unrelated low quota do not substitute for the configured model. Unset intent or an absent/unknown requested-model quota fails closed.
+- Inactive observations may qualify only when their local observation time is not in the future and their age is strictly less than two hours. At two hours or later they are stale. Missing, unknown, invalid, exhausted, or below-minimum evidence is ineligible. resetTime is descriptive evidence and never creates replenished quota.
+- Newer telemetry supersedes older evidence even when its fraction is unknown. Older healthy evidence cannot revive it. Relevant duplicate rows use weakest-link evidence: any unknown row prevents a healthy fraction, otherwise the lowest known fraction applies. Differently timed duplicate records remain unknown; incompatible reset windows do not become a shared reset. This conservative eligibility projection does not fabricate aggregate quota or assert that distinct pools are one pool.
+- An automatic plan binds the exact durable account/model observation used for selection. Admission rereads it and requires the same record, current routing intent/configuration, and the same freshness/eligibility rules, including immediately before stopping the source process.
+- When live target verification disproves cached evidence, conditional durable invalidation makes that unchanged record unknown before rollback. A newer independently recorded observation is preserved. Cooldown alone cannot later make the disproven record eligible; fresh qualifying live evidence is required.
+
+Storage versions, malformed-document handling, and conditional writes belong in [persistence-and-concurrency.md](persistence-and-concurrency.md). Evidence: CandidateSelector, QuotaObservationEvidence, DurableQuotaObservationStore, DurableRoutingEvidenceTests, and TargetQuotaVerificationSwitchTests.
 
 ## Account identity
 
@@ -55,10 +69,22 @@ CURRENT IMPLEMENTATION candidate policy is evidenced by CandidateSelector:
 
 1. Do not select the current account as its own replacement.
 2. Reject expired or failed accounts.
-3. Reject candidates below the configured minimum quota.
+3. Reject candidates below the configured minimum quota for the explicit requested model; aggregate quota or another healthy model cannot replace it.
 4. Require a vaulted session.
-5. Reject candidates in cooldown.
+5. Reject candidates in cooldown or with absent or expired quota observations.
 6. Prefer non-reserve accounts, then higher remaining quota, then lower numeric priority, then account ID for deterministic tie-breaking.
+
+The production automatic path is:
+
+1. Read configured workload intent and verify the active identity against metadata.
+2. Obtain live active quota for that exact model and evaluate low-quota pressure.
+3. Read durable candidate observations and apply model, freshness, vault, cooldown, minimum-quota, and ranking rules.
+4. Revalidate the selected observation and obtain recovery, quarantine, activity, identity, and process admission through the real switch coordinator.
+5. Apply the target credential, restart the verified process generation, and verify target identity.
+6. Obtain fresh live target quota, require the configured model and every relevant row to be valid, known, non-exhausted, and at least MinimumCandidateQuotaPercent **before metadata finalization**.
+7. Commit guarded metadata on success; on failed live quota verification, invalidate unchanged disproven candidate evidence and attempt conditional rollback with source identity verification. Other post-mutation failures also require rollback; unproved rollback remains recovery-blocking.
+
+Manual switching uses the same coordinator and safety gates without requiring workload-model configuration or automatic target-quota thresholds.
 
 INTENDED INVARIANT:
 
@@ -66,6 +92,7 @@ INTENDED INVARIANT:
 - Automatic switching requires both a routing decision and a successful safety assessment.
 - BUSY, active trajectories, unavailable telemetry, unsafe process provenance, or ambiguous identity block mutation.
 - Manual recovery state disables automatic switching until an operator explicitly clears it after recovery.
+- Any non-`NONE` journal recovery state blocks backend manual and automatic switch admission, even without a quarantine marker; independent quarantine blocks admission as well.
 - Threshold equality and rounding behavior must be defined by tests, not UI formatting.
 
 ## State machines
@@ -73,6 +100,8 @@ INTENDED INVARIANT:
 RoutingSafetyGate owns router progression such as IDLE, low-quota detection, pending, waiting for idle, switching, verification, cooldown, and manual recovery.
 
 NativeAccountSwitchCoordinator owns transaction states such as preflight, snapshotting, credential application, process stop/restart, verification, finalization, rollback, and failure.
+
+A definitively completed success or verified rollback can return the same coordinator instance to idle only after ownership cleanup and proof that no unresolved journal, recovery state, or quarantine remains. Terminal results remain available as last-result history. Recovery-requiring states remain blocking; see the persistence owner for lifecycle details.
 
 The two state machines must not be collapsed in prose or UI: the router decides whether and when to request a switch; the coordinator owns one switch transaction and its recovery result.
 

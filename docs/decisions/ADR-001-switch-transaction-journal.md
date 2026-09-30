@@ -3,6 +3,8 @@
 Status: Proposed
 Date: 2026-09-27
 
+Historical design proposal: the context and proposed API names below describe the pre-journal implementation. The journal and startup reconciliation are now implemented; current behavior is owned by [persistence-and-concurrency.md](../persistence-and-concurrency.md#interrupted-switch-consistency) and [runtime-architecture.md](../runtime-architecture.md). This record preserves original rationale and proposal metadata, not a current operational gap or release-verification claim.
+
 ## Context
 
 In AG2 Router, switching active accounts is a multi-stage transaction coordinating Windows Credential Manager (`gemini:antigravity`), running Antigravity process generations, live identity verification, and persistent account metadata (`accounts.json`).

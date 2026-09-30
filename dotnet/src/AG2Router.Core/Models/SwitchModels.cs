@@ -76,10 +76,21 @@ public sealed record ResolveQuarantineRequest(
     [property: JsonPropertyName("confirm")] bool Confirm
 );
 
+public static class JournalRecoveryStates
+{
+    public const string None = "NONE";
+    public const string ActionRequired = "ACTION_REQUIRED";
+    public const string RestartRequired = "RESTART_REQUIRED";
+    public const string NotResolvable = "NOT_RESOLVABLE";
+    public const string Unknown = "UNKNOWN";
+}
+
 public record NativeSwitchStatus(
     [property: JsonPropertyName("activeTransactionId")] string? ActiveTransactionId,
     [property: JsonPropertyName("currentState")] string CurrentState,
-    [property: JsonPropertyName("lastResult")] NativeSwitchResult? LastResult
+    [property: JsonPropertyName("lastResult")] NativeSwitchResult? LastResult,
+    [property: JsonPropertyName("quarantineActive")] bool QuarantineActive = false,
+    [property: JsonPropertyName("journalRecoveryState")] string JournalRecoveryState = JournalRecoveryStates.None
 );
 
 public interface INativeAccountSwitchCoordinator
@@ -88,7 +99,19 @@ public interface INativeAccountSwitchCoordinator
     Task<NativeSwitchResult> SwitchAutomaticallyAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
         CancellationToken cancellationToken = default) => SwitchAsync(targetAccountId, cancellationToken);
+    Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+        string targetAccountId,
+        string? expectedActiveAccountId,
+        Func<bool> planIsCurrent,
+        string? requiredWorkloadModelKey,
+        double? minimumCandidateQuotaPercent,
+        CancellationToken cancellationToken = default) => SwitchAutomaticallyAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, cancellationToken);
     Task<JournalResolutionResult> ResolveQuarantinedJournalAsync(CancellationToken cancellationToken = default);
     NativeSwitchStatus GetStatus();
     Task CoordinateShutdownAsync(TimeSpan timeout, CancellationToken cancellationToken = default);
+    bool CanAdmitSwitch(out string? blockingReason)
+    {
+        blockingReason = null;
+        return true;
+    }
 }

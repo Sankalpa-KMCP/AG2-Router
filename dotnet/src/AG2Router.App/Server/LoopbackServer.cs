@@ -664,6 +664,18 @@ public class LoopbackServer : IAsyncDisposable
             }
         });
 
+        // Read-only durable candidate quota evidence, with backend-owned freshness classification.
+        _app.MapGet("/api/router/candidate-evidence", async (HttpContext context) =>
+        {
+            if (autoRouter == null) return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+            try
+            {
+                return Results.Ok(await autoRouter.GetCandidateEvidenceStatusAsync(context.RequestAborted));
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { throw; }
+            catch { return Results.StatusCode(StatusCodes.Status503ServiceUnavailable); }
+        });
+
         // GET /api/router/status
         _app.MapGet("/api/router/status", () =>
         {

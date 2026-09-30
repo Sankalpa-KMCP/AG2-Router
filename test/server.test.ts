@@ -173,7 +173,11 @@ describe('AppServer (Loopback HTTP & API)', () => {
       { lowQuotaThresholdPercent: 4 },
       { lowQuotaThresholdPercent: 55 },
       { minimumCandidateQuotaPercent: 9 },
-      { minimumCandidateQuotaPercent: 95 }
+      { minimumCandidateQuotaPercent: 95 },
+      { workloadModelKey: '   ' },
+      { workloadModelKey: 'a'.repeat(129) },
+      { workloadModelKey: 'gemini\npro' },
+      { workloadModelKey: 'gemini pro' }
     ];
 
     for (const payload of invalidPayloads) {
@@ -191,6 +195,37 @@ describe('AppServer (Loopback HTTP & API)', () => {
       const checkRes = await request('/api/config');
       assert.deepEqual(JSON.parse(checkRes.body).config, baselineCfg);
     }
+  });
+
+  it('should accept valid workloadModelKey and null via POST /api/config', async () => {
+    const postRes1 = await request('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workloadModelKey: 'gemini-2.5-pro' })
+    } as http.RequestOptions & { body: string });
+
+    assert.equal(postRes1.status, 200);
+    const updated1 = JSON.parse(postRes1.body).config;
+    assert.equal(updated1.workloadModelKey, 'gemini-2.5-pro');
+
+    const checkRes1 = await request('/api/config');
+    assert.equal(checkRes1.status, 200);
+    assert.equal(JSON.parse(checkRes1.body).config.workloadModelKey, 'gemini-2.5-pro');
+
+    // Setting back to null
+    const postRes2 = await request('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workloadModelKey: null })
+    } as http.RequestOptions & { body: string });
+
+    assert.equal(postRes2.status, 200);
+    const updated2 = JSON.parse(postRes2.body).config;
+    assert.equal(updated2.workloadModelKey, null);
+
+    const checkRes2 = await request('/api/config');
+    assert.equal(checkRes2.status, 200);
+    assert.equal(JSON.parse(checkRes2.body).config.workloadModelKey, null);
   });
 
   it('should accept 1 ms polling interval via POST /api/config proving 1 ms is valid and 2000 ms is not backend minimum', async () => {

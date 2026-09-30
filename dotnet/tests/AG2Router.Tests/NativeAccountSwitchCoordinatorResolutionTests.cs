@@ -154,6 +154,7 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
         Assert.False(result.RestartRequired);
         Assert.True(File.Exists(_journal.JournalFilePath));
         Assert.Equal(corruptBytes, await File.ReadAllTextAsync(_journal.JournalFilePath, Encoding.UTF8));
+        Assert.Equal(JournalRecoveryStates.NotResolvable, coordinator.GetStatus().JournalRecoveryState);
     }
 
     // 3. ResolveQuarantinedJournal_WhenJournalUnsupportedVersion_ReturnsNotResolvable_AndPreservesFile
@@ -177,6 +178,7 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
         Assert.False(result.RestartRequired);
         Assert.True(File.Exists(_journal.JournalFilePath));
         Assert.Equal(badVersionJson, await File.ReadAllTextAsync(_journal.JournalFilePath, Encoding.UTF8));
+        Assert.Equal(JournalRecoveryStates.NotResolvable, coordinator.GetStatus().JournalRecoveryState);
     }
 
     // 4. ResolveQuarantinedJournal_WhenJournalReadIoError_ReturnsPersistenceFailure
@@ -867,6 +869,438 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
         Assert.True(File.Exists(_journal.JournalFilePath));
         Assert.Equal(0, _accounts.FinalizeCalls);
         Assert.Equal(0, _credentials.WriteCount);
+    }
+
+    // 35. ReconcileStartupJournal_SetsJournalRecoveryStateToActionRequired_WhenJournalRetained
+    [Fact]
+    public async Task ReconcileStartupJournal_SetsJournalRecoveryStateToActionRequired_WhenJournalRetained()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.ActionRequired, status.JournalRecoveryState);
+    }
+
+    // 36. ReconcileStartupJournal_SetsJournalRecoveryStateToNone_WhenClean
+    [Fact]
+    public async Task ReconcileStartupJournal_SetsJournalRecoveryStateToNone_WhenClean()
+    {
+        await SeedAccountsAsync();
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, reconciliation.Status);
+        var status = coordinator.GetStatus();
+        Assert.False(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.None, status.JournalRecoveryState);
+    }
+
+    [Fact]
+    public async Task CleanCleanupRetry_AfterDeletionFailure_ReportsRestartAndPreservesQuarantine()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+        var coordinator = CreateCoordinator();
+        _journal.FailOnDelete = true;
+        var failed = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.PersistenceFailure, failed.Status);
+        Assert.Equal(JournalRecoveryStates.ActionRequired, coordinator.GetStatus().JournalRecoveryState);
+        Assert.True(coordinator.GetStatus().QuarantineActive);
+        _journal.FailOnDelete = false;
+        var retry = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.CleanCleanupCompleted, retry.Status);
+        Assert.True(retry.RestartRequired);
+        Assert.False(File.Exists(_journal.JournalFilePath));
+        Assert.Equal(JournalRecoveryStates.None, coordinator.GetStatus().JournalRecoveryState);
+        Assert.True(coordinator.GetStatus().QuarantineActive);
+        Assert.False(coordinator.CanAdmitSwitch(out _));
+        Assert.True((await coordinator.SwitchAsync(_source.Id)).ManualRecoveryRequired);
+        Assert.True((await coordinator.SwitchAutomaticallyAsync(_source.Id, _target.Id, () => true, "model-a", 30)).ManualRecoveryRequired);
+        var absent = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.NoJournal, absent.Status);
+        Assert.True(absent.RestartRequired);
+        Assert.False(coordinator.CanAdmitSwitch(out _));
+    }
+
+    [Theory]
+    [InlineData(SwitchJournalState.RECORDED, false)]
+    [InlineData(SwitchJournalState.RECORDED, true)]
+    [InlineData(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, false)]
+    [InlineData(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, true)]
+    public async Task RetainedCleanJournal_BlocksSwitchWithoutQuarantine(
+        SwitchJournalState journalState, bool automatic)
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(journalState, _source!.Id, _target!.Id);
+        _journal.FailOnDelete = true;
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(StartupJournalReconciliationStatus.Degraded, reconciliation.Status);
+        Assert.False(coordinator.GetStatus().QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.ActionRequired, coordinator.GetStatus().JournalRecoveryState);
+
+        var result = automatic
+            ? await coordinator.SwitchAutomaticallyAsync(_source.Id, _target.Id, () => true)
+            : await coordinator.SwitchAsync(_source.Id);
+
+        Assert.False(result.Success);
+        Assert.True(result.ManualRecoveryRequired);
+        Assert.Equal(SwitchResultCodes.SwitchFailedRollbackFailed, result.Code);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _accounts.FinalizeCalls);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+    }
+
+    [Theory]
+    [InlineData(JournalRecoveryStates.NotResolvable)]
+    [InlineData(JournalRecoveryStates.Unknown)]
+    [InlineData(JournalRecoveryStates.RestartRequired)]
+    public async Task NonNoneJournalRecovery_BlocksManualAndAutomaticSwitches(string recoveryState)
+    {
+        await SeedAccountsAsync();
+        if (recoveryState == JournalRecoveryStates.NotResolvable)
+        {
+            await File.WriteAllTextAsync(_journal.JournalFilePath, "corrupt journal", Encoding.UTF8);
+        }
+        else if (recoveryState == JournalRecoveryStates.Unknown)
+        {
+            _journal.ReadBehavior = _ => Task.FromResult(
+                SwitchJournalReadResult.IoError(new IOException("Synthetic journal read failure.")));
+        }
+        else
+        {
+            await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+        }
+
+        var coordinator = CreateCoordinator();
+        await coordinator.ReconcileStartupJournalAsync();
+        if (recoveryState == JournalRecoveryStates.RestartRequired)
+            await coordinator.ResolveQuarantinedJournalAsync();
+
+        Assert.Equal(recoveryState, coordinator.GetStatus().JournalRecoveryState);
+        var manual = await coordinator.SwitchAsync(_source!.Id);
+        var automatic = await coordinator.SwitchAutomaticallyAsync(_source.Id, _target!.Id, () => true);
+
+        Assert.False(manual.Success);
+        Assert.True(manual.ManualRecoveryRequired);
+        Assert.False(automatic.Success);
+        Assert.True(automatic.ManualRecoveryRequired);
+        Assert.Equal(0, _credentials.WriteCount);
+        Assert.Equal(0, _process.StopCount);
+        Assert.Equal(0, _accounts.FinalizeCalls);
+    }
+
+    // 37. ResolveQuarantinedJournal_TransitionsRecoveryStateToRestartRequired
+    [Fact]
+    public async Task ResolveQuarantinedJournal_TransitionsRecoveryStateToRestartRequired()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+        Assert.Equal(JournalRecoveryStates.ActionRequired, coordinator.GetStatus().JournalRecoveryState);
+
+        var result = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.ResolvedRestartRequired, result.Status);
+
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.RestartRequired, status.JournalRecoveryState);
+    }
+
+    // 38. NonJournalQuarantine_KeepsJournalRecoveryStateAsNone_WhileQuarantineActive
+    [Fact]
+    public async Task NonJournalQuarantine_KeepsJournalRecoveryStateAsNone_WhileQuarantineActive()
+    {
+        await SeedAccountsAsync();
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, reconciliation.Status);
+        Assert.False(coordinator.GetStatus().QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.None, coordinator.GetStatus().JournalRecoveryState);
+
+        // Simulate non-journal quarantine (e.g. SessionVault mutation error)
+        _vault.QuarantineUnresolvedMutation();
+
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        // Non-journal quarantine MUST remain NONE and NOT collapse into RESTART_REQUIRED or ACTION_REQUIRED
+        Assert.Equal(JournalRecoveryStates.None, status.JournalRecoveryState);
+    }
+
+    // 39. ReconcileStartupJournal_SetsJournalRecoveryStateToUnknown_WhenLockTimesOut
+    [Fact]
+    public async Task ReconcileStartupJournal_SetsJournalRecoveryStateToUnknown_WhenLockTimesOut()
+    {
+        await SeedAccountsAsync();
+        string switchResource = _vault.GetVaultPath() + ".switch";
+        var pathLock = PathLockRegistry.Get(switchResource);
+        await pathLock.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var coordinator = CreateCoordinator(transactionTimeout: TimeSpan.FromMilliseconds(50));
+            var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+
+            Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+            var status = coordinator.GetStatus();
+            Assert.True(status.QuarantineActive);
+            Assert.Equal(JournalRecoveryStates.Unknown, status.JournalRecoveryState);
+        }
+        finally
+        {
+            pathLock.Release();
+        }
+    }
+
+    // 40. StartupJournalReconciliation_SetsRecoveryStateToNotResolvable_WhenJournalIsCorrupt
+    [Fact]
+    public async Task StartupJournalReconciliation_SetsRecoveryStateToNotResolvable_WhenJournalIsCorrupt()
+    {
+        const string corruptBytes = "{\"magic\":\"AG2_SWJ1\",\"schemaVersion\":1,BROKEN_JSON";
+        await File.WriteAllTextAsync(_journal.JournalFilePath, corruptBytes, Encoding.UTF8);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.NotResolvable, status.JournalRecoveryState);
+    }
+
+    // 41. StartupJournalReconciliation_SetsRecoveryStateToNotResolvable_WhenJournalIsUnsupportedVersion
+    [Fact]
+    public async Task StartupJournalReconciliation_SetsRecoveryStateToNotResolvable_WhenJournalIsUnsupportedVersion()
+    {
+        string badVersionJson = JsonSerializer.Serialize(new
+        {
+            magic = SwitchJournalConstants.Magic,
+            schemaVersion = 999,
+            transactionId = "tx_future",
+            state = "RECORDED"
+        });
+        await File.WriteAllTextAsync(_journal.JournalFilePath, badVersionJson, Encoding.UTF8);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.NotResolvable, status.JournalRecoveryState);
+    }
+
+    // 42. ResolveQuarantinedJournal_RepeatedResolutionAfterRestartRequired_PreservesRestartRequired
+    [Fact]
+    public async Task ResolveQuarantinedJournal_RepeatedResolutionAfterRestartRequired_PreservesRestartRequired()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+
+        var result1 = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.ResolvedRestartRequired, result1.Status);
+        Assert.Equal(JournalRecoveryStates.RestartRequired, coordinator.GetStatus().JournalRecoveryState);
+
+        // Repeated resolve attempt when journal file is now absent
+        var result2 = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.NoJournal, result2.Status);
+
+        // Process-lifetime monotonicity: RESTART_REQUIRED must not revert to NONE
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.RestartRequired, status.JournalRecoveryState);
+    }
+
+    // 43. ObserveSwitchAsync_WhenRecoveryStateIsRestartRequired_PreservesRestartRequired
+    [Fact]
+    public async Task ObserveSwitchAsync_WhenRecoveryStateIsRestartRequired_PreservesRestartRequired()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+
+        var resolveResult = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.ResolvedRestartRequired, resolveResult.Status);
+        Assert.Equal(JournalRecoveryStates.RestartRequired, coordinator.GetStatus().JournalRecoveryState);
+
+        // Subsequent switch attempt must fail fast with RecoveryUncertain and preserve RESTART_REQUIRED
+        var switchResult = await coordinator.SwitchAsync(_source.Id);
+        Assert.False(switchResult.Success);
+        Assert.True(switchResult.ManualRecoveryRequired);
+
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.RestartRequired, status.JournalRecoveryState);
+    }
+
+    // 44. ResolveQuarantinedJournal_WhenLockTimesOut_PreservesRestartRequired
+    [Fact]
+    public async Task ResolveQuarantinedJournal_WhenLockTimesOut_PreservesRestartRequired()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator(transactionTimeout: TimeSpan.FromMilliseconds(50));
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+
+        var resolveResult = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.ResolvedRestartRequired, resolveResult.Status);
+        Assert.Equal(JournalRecoveryStates.RestartRequired, coordinator.GetStatus().JournalRecoveryState);
+
+        // Hold switch lock to induce timeout on second resolve
+        string switchResource = _vault.GetVaultPath() + ".switch";
+        var pathLock = PathLockRegistry.Get(switchResource);
+        await pathLock.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var timeoutResult = await coordinator.ResolveQuarantinedJournalAsync();
+            Assert.Equal(JournalResolutionStatus.PersistenceFailure, timeoutResult.Status);
+            Assert.Equal("LOCK_TIMEOUT", timeoutResult.ReasonCode);
+
+            var status = coordinator.GetStatus();
+            Assert.True(status.QuarantineActive);
+            // Must preserve RestartRequired across lock timeout
+            Assert.Equal(JournalRecoveryStates.RestartRequired, status.JournalRecoveryState);
+        }
+        finally
+        {
+            pathLock.Release();
+        }
+    }
+
+    // 45. ResolveQuarantinedJournal_WhenStateIsUnknown_LockTimeoutDoesNotRewriteToActionRequired
+    [Fact]
+    public async Task ResolveQuarantinedJournal_WhenStateIsUnknown_LockTimeoutDoesNotRewriteToActionRequired()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        string switchResource = _vault.GetVaultPath() + ".switch";
+        var pathLock = PathLockRegistry.Get(switchResource);
+        await pathLock.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var coordinator = CreateCoordinator(transactionTimeout: TimeSpan.FromMilliseconds(50));
+            var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+            Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+            Assert.Equal(JournalRecoveryStates.Unknown, coordinator.GetStatus().JournalRecoveryState);
+
+            var timeoutResult = await coordinator.ResolveQuarantinedJournalAsync();
+            Assert.Equal(JournalResolutionStatus.PersistenceFailure, timeoutResult.Status);
+            Assert.Equal("LOCK_TIMEOUT", timeoutResult.ReasonCode);
+
+            var status = coordinator.GetStatus();
+            Assert.True(status.QuarantineActive);
+            // Must preserve Unknown, NOT rewrite to ActionRequired
+            Assert.Equal(JournalRecoveryStates.Unknown, status.JournalRecoveryState);
+        }
+        finally
+        {
+            pathLock.Release();
+        }
+    }
+
+    // 46. ResolveQuarantinedJournal_WhenActionRequired_FreshIoError_TransitionsToUnknown (F-286-2)
+    [Fact]
+    public async Task ResolveQuarantinedJournal_WhenActionRequired_FreshIoError_TransitionsToUnknown()
+    {
+        await SeedAccountsAsync();
+        // PRECOMMIT journal where metadata != target establishes ACTION_REQUIRED at startup
+        await _accounts.SetActiveAccountIdAsync(_source!.Id);
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+        Assert.Equal(JournalRecoveryStates.ActionRequired, coordinator.GetStatus().JournalRecoveryState);
+
+        // Fresh resolution encounters I/O uncertainty
+        _journal.ReadBehavior = _ => Task.FromResult(SwitchJournalReadResult.IoError(new IOException("Disk read failed.")));
+
+        var result = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.PersistenceFailure, result.Status);
+        Assert.Equal("IO_ERROR", result.ReasonCode);
+
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.Unknown, status.JournalRecoveryState);
+    }
+
+    // 47. ResolveQuarantinedJournal_WhenRestartRequired_FreshIoError_PreservesRestartRequired (F-286-2)
+    [Fact]
+    public async Task ResolveQuarantinedJournal_WhenRestartRequired_FreshIoError_PreservesRestartRequired()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.CREDENTIAL_APPLYING, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+
+        var resolve1 = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.ResolvedRestartRequired, resolve1.Status);
+        Assert.Equal(JournalRecoveryStates.RestartRequired, coordinator.GetStatus().JournalRecoveryState);
+
+        // Fresh resolution encounters I/O uncertainty
+        _journal.ReadBehavior = _ => Task.FromResult(SwitchJournalReadResult.IoError(new IOException("Disk read failed.")));
+
+        var resolve2 = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.PersistenceFailure, resolve2.Status);
+        Assert.Equal("IO_ERROR", resolve2.ReasonCode);
+
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        // RESTART_REQUIRED must supersede fresh IO_ERROR
+        Assert.Equal(JournalRecoveryStates.RestartRequired, status.JournalRecoveryState);
+    }
+
+    // 48. ResolveQuarantinedJournal_WhenNotResolvable_FreshIoError_TransitionsToUnknown (F-286-2)
+    [Fact]
+    public async Task ResolveQuarantinedJournal_WhenNotResolvable_FreshIoError_TransitionsToUnknown()
+    {
+        await SeedAccountsAsync();
+        const string corruptBytes = "{\"magic\":\"AG2_SWJ1\",\"schemaVersion\":1,BROKEN_JSON";
+        await File.WriteAllTextAsync(_journal.JournalFilePath, corruptBytes, Encoding.UTF8);
+
+        var coordinator = CreateCoordinator();
+        var reconciliation = await coordinator.ReconcileStartupJournalAsync();
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, reconciliation.Status);
+        Assert.Equal(JournalRecoveryStates.NotResolvable, coordinator.GetStatus().JournalRecoveryState);
+
+        // Fresh resolution encounters I/O uncertainty
+        _journal.ReadBehavior = _ => Task.FromResult(SwitchJournalReadResult.IoError(new IOException("Disk read failed.")));
+
+        var result = await coordinator.ResolveQuarantinedJournalAsync();
+        Assert.Equal(JournalResolutionStatus.PersistenceFailure, result.Status);
+        Assert.Equal("IO_ERROR", result.ReasonCode);
+
+        var status = coordinator.GetStatus();
+        Assert.True(status.QuarantineActive);
+        Assert.Equal(JournalRecoveryStates.Unknown, status.JournalRecoveryState);
     }
 
     // Test doubles & spies

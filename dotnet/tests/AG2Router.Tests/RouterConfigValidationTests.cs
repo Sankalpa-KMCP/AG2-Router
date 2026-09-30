@@ -121,6 +121,78 @@ public sealed class RouterConfigValidationTests : IAsyncDisposable
         RouterConfigValidator.Validate(config);
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("gemini-2.5-pro")]
+    [InlineData("claude-3-5-sonnet")]
+    [InlineData("openai/gpt-4o")]
+    [InlineData("model_1.0:test@alpha")]
+    public void Validate_WorkloadModelKey_ValidValues_Succeeds(string? modelKey)
+    {
+        var config = new RouterConfigDto(WorkloadModelKey: modelKey);
+        RouterConfigValidator.Validate(config);
+    }
+
+    [Theory]
+    [InlineData(" ")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public void Validate_WorkloadModelKey_WhitespaceOnly_ThrowsArgumentException(string whitespaceKey)
+    {
+        var config = new RouterConfigDto(WorkloadModelKey: whitespaceKey);
+        var ex = Assert.Throws<ArgumentException>(() => RouterConfigValidator.Validate(config));
+        Assert.Equal(nameof(config.WorkloadModelKey), ex.ParamName);
+        Assert.Contains("Workload model key cannot be whitespace-only.", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_WorkloadModelKey_Exceeds128Chars_ThrowsArgumentOutOfRangeException()
+    {
+        var longKey = new string('a', 129);
+        var config = new RouterConfigDto(WorkloadModelKey: longKey);
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => RouterConfigValidator.Validate(config));
+        Assert.Equal(nameof(config.WorkloadModelKey), ex.ParamName);
+        Assert.Equal(129, ex.ActualValue);
+        Assert.Contains("Workload model key must not exceed 128 characters.", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("gemini\npro")]
+    [InlineData("gemini\rpro")]
+    [InlineData("gemini\tpro")]
+    [InlineData("gemini\0pro")]
+    public void Validate_WorkloadModelKey_ContainsControlCharacters_ThrowsArgumentException(string keyWithControl)
+    {
+        var config = new RouterConfigDto(WorkloadModelKey: keyWithControl);
+        var ex = Assert.Throws<ArgumentException>(() => RouterConfigValidator.Validate(config));
+        Assert.Equal(nameof(config.WorkloadModelKey), ex.ParamName);
+        Assert.Contains("Workload model key must not contain control characters.", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("gemini pro")]
+    [InlineData("gemini*pro")]
+    [InlineData("gemini$pro")]
+    [InlineData("gemini#pro")]
+    [InlineData("gemini pro 2")]
+    public void Validate_WorkloadModelKey_ContainsInvalidCharacters_ThrowsArgumentException(string keyWithInvalidChar)
+    {
+        var config = new RouterConfigDto(WorkloadModelKey: keyWithInvalidChar);
+        var ex = Assert.Throws<ArgumentException>(() => RouterConfigValidator.Validate(config));
+        Assert.Equal(nameof(config.WorkloadModelKey), ex.ParamName);
+        Assert.Contains("contains invalid characters.", ex.Message);
+    }
+
+    [Fact]
+    public void RouterConfigDto_MissingWorkloadModelKeyInJson_DeserializesAsNull()
+    {
+        var json = "{\"AutoSwitchEnabled\":true,\"LowQuotaThresholdPercent\":15,\"MinimumCandidateQuotaPercent\":30,\"PollingIntervalMs\":10000}";
+        var deserialized = JsonSerializer.Deserialize<RouterConfigDto>(json);
+        Assert.NotNull(deserialized);
+        Assert.Null(deserialized.WorkloadModelKey);
+    }
+
     // =========================================================================
     // 2. NativeAutoRouter validation tests
     // =========================================================================
@@ -223,6 +295,47 @@ public sealed class RouterConfigValidationTests : IAsyncDisposable
         }
     }
 
+    [Fact]
+    public async Task NativeAutoRouter_Constructor_LoadsAndPreservesWorkloadModelKeyFromConfig()
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"ag2_test_cfg_model_{Guid.NewGuid():N}.json");
+        try
+        {
+            var initialJson = "{\"AutoSwitchEnabled\":true,\"LowQuotaThresholdPercent\":15,\"MinimumCandidateQuotaPercent\":30,\"PollingIntervalMs\":10000,\"WorkloadModelKey\":\"gemini-2.5-pro\"}";
+            await File.WriteAllTextAsync(configPath, initialJson);
+
+            await using var router = new NativeAutoRouter(
+                _accountStore, _sessionVault, _adapter, _switchCoordinator,
+                configFilePath: configPath);
+
+            Assert.Equal("gemini-2.5-pro", router.GetConfig().WorkloadModelKey);
+        }
+        finally
+        {
+            if (File.Exists(configPath)) File.Delete(configPath);
+        }
+    }
+
+    [Fact]
+    public async Task NativeAutoRouter_UpdateConfig_PersistsWorkloadModelKey()
+    {
+        var initial = new RouterConfigDto(AutoSwitchEnabled: true, LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30, PollingIntervalMs: 10000);
+        await using var router = CreateRouter(initialConfig: initial, configFilePath: @"C:\fake\config.json");
+
+        var validUpdate = new RouterConfigDto(
+            AutoSwitchEnabled: true,
+            LowQuotaThresholdPercent: 20,
+            MinimumCandidateQuotaPercent: 30,
+            PollingIntervalMs: 10000,
+            WorkloadModelKey: "claude-3-5-sonnet");
+
+        var result = router.UpdateConfig(validUpdate);
+        Assert.Equal("claude-3-5-sonnet", result.WorkloadModelKey);
+        Assert.Equal(validUpdate, router.GetConfig());
+        Assert.NotNull(_fileWriter.LastWrittenContent);
+        Assert.Contains("\"WorkloadModelKey\": \"claude-3-5-sonnet\"", _fileWriter.LastWrittenContent);
+    }
+
     // =========================================================================
     // 3. TelemetryPollingCoordinator startup safety tests
     // =========================================================================
@@ -320,6 +433,88 @@ public sealed class RouterConfigValidationTests : IAsyncDisposable
             Assert.Equal(20, doc.RootElement.GetProperty("config").GetProperty("lowQuotaThresholdPercent").GetInt32());
 
             Assert.Equal(validPayload, router.GetConfig());
+        }
+        finally
+        {
+            await server.StopAsync();
+            await server.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task LoopbackServer_PostConfig_ValidWorkloadModelKey_Returns200AndRoundtripsViaGet()
+    {
+        var initial = new RouterConfigDto(AutoSwitchEnabled: true, LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30, PollingIntervalMs: 10000);
+        await using var router = CreateRouter(initialConfig: initial);
+
+        var server = new LoopbackServer();
+        try
+        {
+            await server.StartAsync(requestedPort: 0, autoRouter: router);
+            using var client = new HttpClient { BaseAddress = new Uri(server.BoundUrl) };
+
+            var validPayload = new RouterConfigDto(
+                AutoSwitchEnabled: true,
+                LowQuotaThresholdPercent: 20,
+                MinimumCandidateQuotaPercent: 35,
+                PollingIntervalMs: 5000,
+                WorkloadModelKey: "gemini-2.5-pro");
+
+            using var postResponse = await client.PostAsJsonAsync("/api/config", validPayload);
+            Assert.Equal(HttpStatusCode.OK, postResponse.StatusCode);
+
+            string postBody = await postResponse.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postBody);
+            Assert.True(postDoc.RootElement.GetProperty("success").GetBoolean());
+            Assert.Equal("gemini-2.5-pro", postDoc.RootElement.GetProperty("config").GetProperty("workloadModelKey").GetString());
+
+            using var getResponse = await client.GetAsync("/api/config");
+            Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
+
+            string getBody = await getResponse.Content.ReadAsStringAsync();
+            using var getDoc = JsonDocument.Parse(getBody);
+            Assert.Equal("gemini-2.5-pro", getDoc.RootElement.GetProperty("config").GetProperty("workloadModelKey").GetString());
+            Assert.Equal("gemini-2.5-pro", router.GetConfig().WorkloadModelKey);
+        }
+        finally
+        {
+            await server.StopAsync();
+            await server.DisposeAsync();
+        }
+    }
+
+    [Theory]
+    [InlineData("   ")]
+    [InlineData("gemini\npro")]
+    [InlineData("gemini pro")]
+    public async Task LoopbackServer_PostConfig_InvalidWorkloadModelKey_Returns400BadRequest(string invalidKey)
+    {
+        var initial = new RouterConfigDto(AutoSwitchEnabled: true, LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30, PollingIntervalMs: 10000);
+        await using var router = CreateRouter(initialConfig: initial);
+
+        var server = new LoopbackServer();
+        try
+        {
+            await server.StartAsync(requestedPort: 0, autoRouter: router);
+            using var client = new HttpClient { BaseAddress = new Uri(server.BoundUrl) };
+
+            var invalidPayload = new RouterConfigDto(
+                AutoSwitchEnabled: true,
+                LowQuotaThresholdPercent: 15,
+                MinimumCandidateQuotaPercent: 30,
+                PollingIntervalMs: 10000,
+                WorkloadModelKey: invalidKey);
+
+            using var response = await client.PostAsJsonAsync("/api/config", invalidPayload);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+            string body = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(body);
+            Assert.True(doc.RootElement.TryGetProperty("error", out var errorProp));
+            Assert.False(string.IsNullOrWhiteSpace(errorProp.GetString()));
+
+            // Verify configuration was not mutated
+            Assert.Equal(initial, router.GetConfig());
         }
         finally
         {

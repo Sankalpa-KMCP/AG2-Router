@@ -49,6 +49,25 @@ export function validateRouterConfig(config: RouterConfig): void {
   ) {
     throw new RangeError('Minimum candidate quota must be between 10% and 90%.');
   }
+  if (config.workloadModelKey !== undefined && config.workloadModelKey !== null) {
+    if (typeof config.workloadModelKey !== 'string') {
+      throw new TypeError('Workload model key must be a string.');
+    }
+    if (config.workloadModelKey.length > 0) {
+      if (config.workloadModelKey.trim().length === 0) {
+        throw new RangeError('Workload model key cannot be whitespace-only.');
+      }
+      if (config.workloadModelKey.length > 128) {
+        throw new RangeError('Workload model key must not exceed 128 characters.');
+      }
+      if (/[\x00-\x1F\x7F]/.test(config.workloadModelKey)) {
+        throw new RangeError('Workload model key must not contain control characters.');
+      }
+      if (!/^[a-zA-Z0-9_\-.:/@]+$/.test(config.workloadModelKey)) {
+        throw new RangeError(`Workload model key '${config.workloadModelKey}' contains invalid characters.`);
+      }
+    }
+  }
 }
 
 export class QuotaRouter {

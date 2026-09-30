@@ -3,6 +3,7 @@ using System.Windows;
 using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Adapter;
 using AG2Router.AG2.Discovery;
+using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Routing;
 using AG2Router.AG2.Security;
 using AG2Router.AG2.Switching;
@@ -35,6 +36,7 @@ public partial class App : System.Windows.Application
     private AccountEnrollmentService? _enrollmentService;
     private NativeAccountSwitchCoordinator? _switchCoordinator;
     private NativeAutoRouter? _autoRouter;
+    private DurableQuotaObservationStore? _quotaObservationStore;
     private IAutostartService? _autostartService;
     private bool _isShuttingDown;
 
@@ -126,7 +128,7 @@ public partial class App : System.Windows.Application
         {
             Log("Initializing native vault and account services...");
             var processDetector = new AG2ProcessDetector();
-            _ag2Adapter = new AG2LiveAdapter(processDetector);
+            _ag2Adapter = new AG2LiveAdapter(processDetector, configuredModelProvider: () => _autoRouter?.GetConfig().WorkloadModelKey);
             _dpapiProvider = new WindowsDpapiProvider();
             _sessionVault = new SessionVault(dpapiProvider: _dpapiProvider);
             _accountStore = new LocalMetadataAccountStore();
@@ -136,6 +138,8 @@ public partial class App : System.Windows.Application
             var processLifecycle = new WindowsAG2ProcessLifecycle(processDetector);
             string journalPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "switch-journal.json");
             var switchJournalStore = new SwitchJournalStore(journalPath);
+            string observationsPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "quota-observations.json");
+            _quotaObservationStore = new DurableQuotaObservationStore(observationsPath);
             _switchCoordinator = new NativeAccountSwitchCoordinator(
                 _accountStore,
                 _sessionVault,
@@ -143,7 +147,8 @@ public partial class App : System.Windows.Application
                 _wincredWriter,
                 _ag2Adapter,
                 processLifecycle,
-                switchJournalStore);
+                switchJournalStore,
+                quotaObservationStore: _quotaObservationStore);
 
             Log("Reconciling startup switch journal...");
             var reconciliationResult = await _switchCoordinator.ReconcileStartupJournalAsync();
@@ -151,7 +156,7 @@ public partial class App : System.Windows.Application
 
             Log("Initializing NativeAutoRouter and AutostartService...");
             string configPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "config.json");
-            _autoRouter = new NativeAutoRouter(_accountStore, _sessionVault, _ag2Adapter, _switchCoordinator, configFilePath: configPath);
+            _autoRouter = new NativeAutoRouter(_accountStore, _sessionVault, _ag2Adapter, _switchCoordinator, configFilePath: configPath, quotaObservationStore: _quotaObservationStore);
             _autostartService = new WindowsRegistryAutostartService(new WindowsRegistryAccessor());
 
             Log("Initializing TelemetryPollingCoordinator...");

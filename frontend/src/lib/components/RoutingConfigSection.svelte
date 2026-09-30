@@ -1,27 +1,36 @@
 <script lang="ts">
-  import type { RouterConfigDto } from '../api/types.js';
+  import { untrack } from 'svelte';
+  import type { RouterConfigDto, RouterConfigUpdate, QuotaSnapshotDto, CandidateEvidenceStatusDto, AccountMetadata } from '../api/types.js';
+  import { workloadModelKey, observedWorkloadModels, candidateEvidenceCopy } from '../utils/routing.js';
+  import { resolveAccountDisplayName } from '../utils/helpers.js';
 
   interface Props {
     config: RouterConfigDto | null;
     autoSwitchEnabled: boolean;
-    onSaveConfig: (updated: {
-      autoSwitchEnabled: boolean;
-      lowQuotaThresholdPercent: number;
-      minimumCandidateQuotaPercent: number;
-      pollingIntervalMs: number;
-    }) => Promise<void>;
+    quota?: QuotaSnapshotDto | null;
+    candidateEvidence?: CandidateEvidenceStatusDto | null;
+    accounts?: AccountMetadata[];
+    routingReason?: string | null;
+    onSaveConfig: (updated: RouterConfigUpdate) => Promise<void>;
   }
 
   let {
     config = null,
     autoSwitchEnabled = false,
+    quota = null,
+    candidateEvidence = null,
+    accounts = [],
+    routingReason = null,
     onSaveConfig
   }: Props = $props();
 
-  let localAutoSwitch = $state<boolean>(false);
-  let localLowThreshold = $state<number>(15);
-  let localMinCandidate = $state<number>(30);
-  let localPollingSeconds = $state<number>(10);
+  const initialConfig = untrack(() => config);
+  let localAutoSwitch = $state<boolean>(initialConfig?.autoSwitchEnabled ?? untrack(() => autoSwitchEnabled));
+  let localWorkloadModel = $state<string>(initialConfig?.workloadModelKey ?? '');
+  let localLowThreshold = $state<number>(initialConfig?.lowQuotaThresholdPercent ?? 15);
+  let localMinCandidate = $state<number>(initialConfig?.minimumCandidateQuotaPercent ?? 30);
+  let localPollingSeconds = $state<number>((initialConfig?.pollingIntervalMs ?? 10000) / 1000);
+  const modelOptions = $derived(observedWorkloadModels(quota));
 
   let isDirty = $state<boolean>(false);
   let editGeneration = 0;
@@ -37,15 +46,16 @@
   // Sync with prop updates if changed externally and user has not made unsubmitted changes
   $effect(() => {
     if (!isDirty) {
-      localAutoSwitch = autoSwitchEnabled;
+      localAutoSwitch = config?.autoSwitchEnabled ?? autoSwitchEnabled;
     }
   });
 
   $effect(() => {
     if (config && !isDirty) {
       localLowThreshold = config.lowQuotaThresholdPercent;
+      localWorkloadModel = config.workloadModelKey ?? '';
       localMinCandidate = config.minimumCandidateQuotaPercent;
-      localPollingSeconds = Math.round(config.pollingIntervalMs / 1000);
+      localPollingSeconds = config.pollingIntervalMs / 1000;
     }
   });
 
@@ -59,10 +69,11 @@
 
     try {
       await onSaveConfig({
+        workloadModelKey: workloadModelKey(localWorkloadModel),
         autoSwitchEnabled: localAutoSwitch,
         lowQuotaThresholdPercent: localLowThreshold,
         minimumCandidateQuotaPercent: localMinCandidate,
-        pollingIntervalMs: localPollingSeconds * 1000
+        pollingIntervalMs: Math.round(localPollingSeconds * 1000)
       });
       if (editGeneration === capturedGeneration) {
         isDirty = false;
@@ -86,6 +97,7 @@
   </div>
 
   <form onsubmit={handleSubmit} class="settings-form">
+    <fieldset disabled={!config}>
     <!-- Auto Switch Toggle -->
     <div class="form-toggle-row">
       <div class="toggle-label-wrap">
@@ -104,6 +116,25 @@
         <span class="toggle-slider"></span>
       </label>
     </div>
+
+    <div class="form-group">
+      <label for="cfg-workload-model" class="form-label">Workload Model</label>
+      <input id="cfg-workload-model" class="input-text" type="text"
+        list="workload-model-options" maxlength="128" autocomplete="off"
+        bind:value={localWorkloadModel} oninput={markDirty}
+        placeholder="Select an observed model or enter its exact key"
+        aria-describedby="workload-model-help" />
+      <datalist id="workload-model-options">
+        {#each modelOptions as key}<option value={key}></option>{/each}
+      </datalist>
+      <span id="workload-model-help" class="form-hint">
+        {modelOptions.length ? 'Suggestions are model keys from the latest account telemetry.' : 'No model keys are available from current telemetry. Enter the exact model key, or wait for telemetry.'}
+        Automatic routing protects only this model. Display labels are not model keys.
+      </span>
+    </div>
+    {#if localAutoSwitch && !localWorkloadModel.trim()}
+      <p class="routing-warning" role="status">Auto Switch cannot operate until a workload model is configured.</p>
+    {/if}
 
     <!-- Thresholds row -->
     <div class="form-row">
@@ -145,9 +176,8 @@
           id="cfg-polling-interval"
           type="number"
           class="input-number"
-          min="2"
-          max="60"
-          step="1"
+          min="0.001"
+          step="0.001"
           bind:value={localPollingSeconds}
           oninput={markDirty}
           required
@@ -160,7 +190,7 @@
       <button
         type="submit"
         class="btn btn-primary"
-        disabled={isSaving}
+        disabled={isSaving || !config}
       >
         {isSaving ? 'Saving...' : 'Save Settings'}
       </button>
@@ -172,10 +202,46 @@
         <span class="save-feedback error" role="alert">✕ {errorMessage}</span>
       {/if}
     </div>
+    </fieldset>
   </form>
+  <section class="candidate-evidence" aria-label="Candidate quota evidence">
+    <h3>Candidate quota evidence</h3>
+    {#if routingReason}<p class="form-hint">Router: {routingReason}</p>{/if}
+    {#if !candidateEvidence?.available}
+      <p class="form-hint">Candidate evidence unavailable. Automatic routing requires verified recent evidence.</p>
+    {:else if !candidateEvidence.modelKey}
+      <p class="form-hint">Configure a workload model to inspect its candidate quota.</p>
+    {:else}
+      <p class="form-hint">Saved model: {candidateEvidence.modelKey} · Minimum: {candidateEvidence.minimumCandidateQuotaPercent}%. Observations expire after two hours. Manual switching is independent of this evidence.</p>
+      {#if isDirty}<p class="form-hint">Evidence below reflects saved settings. Save to evaluate the new settings.</p>{/if}
+      {#if candidateEvidence.candidates.length === 0}<p class="form-hint">No inactive candidate accounts.</p>{/if}
+      <ul class="evidence-list">
+        {#each candidateEvidence.candidates as row (row.accountId)}
+          {@const account = accounts.find(a => a.id === row.accountId)}
+          <li>
+            <strong>{account ? resolveAccountDisplayName(account) : 'Candidate account'}</strong>
+            <span>{candidateEvidenceCopy(row)}</span>
+            {#if ['USABLE', 'BELOW_MINIMUM', 'EXHAUSTED'].includes(row.state) && row.remainingFraction !== null && Number.isFinite(row.remainingFraction) && row.remainingFraction >= 0 && row.remainingFraction <= 1}
+              <span>{Math.floor(row.remainingFraction * 100)}% observed remaining</span>
+            {/if}
+            {#if row.observedAtUtc}
+              <small>Observed: {row.observedAtUtc}{row.ageSeconds !== null && Number.isFinite(row.ageSeconds) && row.ageSeconds >= 0 ? ` · ${Math.floor(row.ageSeconds / 60)} min old at last refresh` : ''}</small>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </section>
 </div>
 
 <style>
+  fieldset { border: 0; padding: 0; margin: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--space-4); }
+  .routing-warning { padding: 12px; border: 1px solid var(--color-warning-border); border-radius: var(--radius-sm); background: var(--color-warning-subtle); color: var(--color-warning-text); font-size: 13px; }
+  .candidate-evidence { margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--color-divider); }
+  .candidate-evidence h3 { font-size: 14px; margin-bottom: var(--space-2); }
+  .evidence-list { list-style: none; padding: 0; margin-top: var(--space-3); }
+  .evidence-list li { display: flex; flex-direction: column; gap: 4px; padding: 12px 0; border-bottom: 1px solid var(--color-divider); font-size: 12px; }
+  .evidence-list small { color: var(--color-text-muted); }
   .settings-card {
     padding: var(--space-5);
     margin-bottom: var(--space-5);

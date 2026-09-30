@@ -77,6 +77,24 @@ export interface RouterConfigDto {
   lowQuotaThresholdPercent: number;
   minimumCandidateQuotaPercent: number;
   pollingIntervalMs: number;
+  workloadModelKey?: string | null;
+}
+
+export type RouterConfigUpdate = RouterConfigDto & { workloadModelKey: string | null };
+
+export interface CandidateQuotaStatusDto {
+  accountId: string;
+  state: string;
+  remainingFraction: number | null;
+  observedAtUtc: string | null;
+  ageSeconds: number | null;
+}
+
+export interface CandidateEvidenceStatusDto {
+  modelKey: string | null;
+  minimumCandidateQuotaPercent: number;
+  available: boolean;
+  candidates: CandidateQuotaStatusDto[];
 }
 
 export interface RouterStatusDto {
@@ -104,6 +122,8 @@ export interface SystemStatusDto {
   telemetry?: TelemetrySnapshotDto | null;
 }
 
+export type JournalRecoveryState = 'NONE' | 'ACTION_REQUIRED' | 'RESTART_REQUIRED' | 'NOT_RESOLVABLE' | 'UNKNOWN';
+
 export interface SwitchStatusDto {
   activeTransactionId?: string | null;
   currentState: string;
@@ -111,4 +131,26 @@ export interface SwitchStatusDto {
     code: string;
     message: string;
   } | null;
+  quarantineActive?: boolean;
+  journalRecoveryState?: JournalRecoveryState;
+}
+
+export type JournalResolutionStatus =
+  | 'NoJournal'
+  | 'CleanCleanupCompleted'
+  | 'ResolvedRestartRequired'
+  | 'NotResolvable'
+  | 'ProofFailed'
+  | 'PersistenceFailure';
+
+export interface JournalResolutionResult {
+  status: JournalResolutionStatus;
+  message: string;
+  coherentAccountId?: string | null;
+  restartRequired?: boolean;
+  reasonCode?: string | null;
+}
+
+export interface ResolveQuarantineRequest {
+  confirm: boolean;
 }

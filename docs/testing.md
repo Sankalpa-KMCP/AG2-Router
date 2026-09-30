@@ -45,8 +45,10 @@ These variables are explicit authorization gates. Do not set them automatically 
 
 - Normalization and canonical quota behavior: AG2TelemetryNormalizerTests and test/ag2-normalizer.test.ts.
 - Candidate selection and safety: CandidateSelectorTests, RoutingSafetyGateTests, NativeAutoRouterTests, selector/safety TypeScript tests.
+- Durable model-specific evidence and schema compatibility: DurableQuotaObservationStoreTests, DurableRoutingEvidenceTests, CandidateFreshnessRoutingTests, and CandidateEvidenceStatusTests. Synthetic restart and coordinator-path cases use deterministic clocks and redirected stores, not live accounts.
 - Enrollment and persistence: AccountEnrollmentServiceTests, AccountRemovalServiceTests, AccountStoreTests, SessionVaultTests, and matching TypeScript tests.
 - Switching and process integrity: NativeAccountSwitchCoordinatorTests, WindowsAG2ProcessLifecycleTests, ProcessProvenanceValidatorTests, and TypeScript switch tests.
+- Journal/recovery and sequential coordinator reuse: SwitchJournalStoreTests, NativeAccountSwitchCoordinatorJournalTests, NativeAccountSwitchCoordinatorResolutionTests, SwitchAdmissionGatingTests, and SwitchCoordinatorLifecycleTests. TargetQuotaVerificationSwitchTests prove live target quota precedes commit, failed verification invalidates unchanged evidence and rolls back, and manual switches remain independent of automatic quota requirements.
 - Loopback/API: LoopbackServerTests, LoopbackServerAccountApiTests, LoopbackSwitchApiTests, and LoopbackRouterApiTests.
 - Polling/WebView lifecycle: TelemetryPollingCoordinatorTests, DashboardLifecycleTests, WebView2EnvironmentCoordinatorTests, and WebViewRecoveryPolicyTests.
 - Packaging and upgrades: ReleasePackagingTests and UpgradePreservationTests, including disposable staged replacement/interruption checks. These do not execute the production installer.
@@ -69,6 +71,8 @@ Frontend types are checked internally but not generated from backend serializati
 ## Frontend interaction fidelity
 
 CURRENT IMPLEMENTATION has Svelte/TypeScript static checks and a Vite build. The dashboard helper implementation is owned by the authored frontend at frontend/src/lib/utils/helpers.ts, and authored frontend code must not import from src/dashboard; test/frontend-boundary.test.ts enforces that boundary. test/frontend-dashboard.test.ts exercises those helpers through the src/dashboard/helpers.ts compatibility re-export. test/frontend-provider-quota.test.ts exercises the authored frontend provider-summary helper with synthetic canonical and raw model telemetry. test/frontend-provider-render.test.ts server-renders the authored quota components with synthetic telemetry.
+
+test/frontend-routing.test.ts covers complete config save/load payloads, workload-model preservation, telemetry-key suggestions, server-rendered routing settings, unconfigured-model warnings, and candidate evidence states. test/frontend-quarantine.test.ts covers strict recovery HTTP/result parsing and safety revocation using synthetic API/status data. These helper/client/server-render checks do not mount an interactive dashboard.
 
 There is no committed browser or end-to-end suite. Server rendering proves quota markup for supplied props, but does not prove form editing, modal behavior, component reactivity, periodic refresh interaction, WebView2 rendering, or a full dashboard-to-loopback workflow.
 

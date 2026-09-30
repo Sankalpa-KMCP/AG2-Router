@@ -16,10 +16,13 @@ public class NativeAutoRouter : INativeAutoRouter
     private readonly RoutingSafetyGate _safetyGate;
     private readonly string? _configFilePath;
     private readonly IDurableFileWriter? _fileWriter;
+    private readonly IQuotaObservationStore? _quotaObservationStore;
+    private readonly TimeProvider _timeProvider;
     private readonly SemaphoreSlim _evaluatingGate = new(1, 1);
     private readonly Dictionary<string, DateTime> _candidateCooldowns = new(StringComparer.Ordinal);
     private readonly Dictionary<string, double> _observedQuotas = new(StringComparer.Ordinal);
     private readonly Dictionary<string, IReadOnlyList<ModelQuotaDto>> _observedModelQuotas = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, CandidateQuotaEvidence> _quotaEvidence = new(StringComparer.Ordinal);
     private readonly Dictionary<long, string> _activeManualSwitches = new();
     private readonly object _stateLock = new();
     internal Func<Task>? BeforeGatePublicationAsync { get; set; }
@@ -36,6 +39,17 @@ public class NativeAutoRouter : INativeAutoRouter
     private bool _manualSwitchPending;
     private bool _disposed;
 
+    private sealed record CandidateQuotaEvidence(DateTimeOffset ObservedAtUtc, string Provenance);
+
+    // Two polling periods tolerate one delayed cycle, while the 30-second cap
+    // prevents a slow polling configuration from making old quota actionable.
+    internal static TimeSpan CandidateEvidenceLifetime(int pollingIntervalMs) =>
+        TimeSpan.FromMilliseconds(Math.Min(2L * pollingIntervalMs, 30_000L));
+
+    internal static bool IsCandidateEvidenceFresh(DateTimeOffset observedAtUtc,
+        DateTimeOffset nowUtc, TimeSpan lifetime) =>
+        observedAtUtc <= nowUtc && nowUtc - observedAtUtc < lifetime;
+
     public NativeAutoRouter(
         IAccountStore accountStore,
         ISessionVault sessionVault,
@@ -43,8 +57,10 @@ public class NativeAutoRouter : INativeAutoRouter
         INativeAccountSwitchCoordinator switchCoordinator,
         RouterConfigDto? initialConfig = null,
         RoutingSafetyGate? safetyGate = null,
-        string? configFilePath = null)
-        : this(accountStore, sessionVault, adapter, switchCoordinator, initialConfig, safetyGate, configFilePath, (!string.IsNullOrEmpty(configFilePath) ? new DurableFileWriter() : null))
+        string? configFilePath = null,
+        IQuotaObservationStore? quotaObservationStore = null,
+        TimeProvider? timeProvider = null)
+        : this(accountStore, sessionVault, adapter, switchCoordinator, initialConfig, safetyGate, configFilePath, (!string.IsNullOrEmpty(configFilePath) ? new DurableFileWriter() : null), quotaObservationStore, timeProvider)
     {
     }
 
@@ -56,7 +72,9 @@ public class NativeAutoRouter : INativeAutoRouter
         RouterConfigDto? initialConfig,
         RoutingSafetyGate? safetyGate,
         string? configFilePath,
-        IDurableFileWriter? fileWriter)
+        IDurableFileWriter? fileWriter,
+        IQuotaObservationStore? quotaObservationStore = null,
+        TimeProvider? timeProvider = null)
     {
         _accountStore = accountStore ?? throw new ArgumentNullException(nameof(accountStore));
         _sessionVault = sessionVault ?? throw new ArgumentNullException(nameof(sessionVault));
@@ -64,6 +82,8 @@ public class NativeAutoRouter : INativeAutoRouter
         _switchCoordinator = switchCoordinator ?? throw new ArgumentNullException(nameof(switchCoordinator));
         _configFilePath = configFilePath;
         _fileWriter = fileWriter ?? (!string.IsNullOrEmpty(configFilePath) ? new DurableFileWriter() : null);
+        _quotaObservationStore = quotaObservationStore;
+        _timeProvider = timeProvider ?? TimeProvider.System;
 
         if (initialConfig != null)
         {
@@ -237,6 +257,7 @@ public class NativeAutoRouter : INativeAutoRouter
             _lastActiveAccountEmail = result.TargetEmail;
             _observedQuotas.Remove(result.TargetAccountId);
             _observedModelQuotas.Remove(result.TargetAccountId);
+            _quotaEvidence.Remove(result.TargetAccountId);
             if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
             {
                 if (_safetyGate.State != RoutingSafetyGateState.Cooldown)
@@ -247,7 +268,7 @@ public class NativeAutoRouter : INativeAutoRouter
                     }
                     _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after manual switch");
                 }
-                _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
+                _cooldownUntil = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(30);
                 _lastDecisionReason = $"Manual switch succeeded to {result.TargetEmail}. In cooldown.";
             }
         }
@@ -270,7 +291,7 @@ public class NativeAutoRouter : INativeAutoRouter
         {
             _safetyGate.Reset("Manual request ended after contending with automatic switch.");
             _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after switch contention");
-            _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
+            _cooldownUntil = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(30);
         }
     }
 
@@ -291,6 +312,36 @@ public class NativeAutoRouter : INativeAutoRouter
         }
     }
 
+    public async Task<CandidateEvidenceStatusDto> GetCandidateEvidenceStatusAsync(CancellationToken cancellationToken = default)
+    {
+        var config = GetConfig();
+        var model = CandidateSelector.CanonicalizeModelKey(config.WorkloadModelKey);
+        if (_quotaObservationStore == null)
+            return new(model, config.MinimumCandidateQuotaPercent, false, []);
+
+        // Do not populate the routing cache or probe inactive accounts for a dashboard read.
+        var observations = QuotaObservationEvidence.Consolidate(
+            await _quotaObservationStore.GetAllObservationsAsync(cancellationToken).ConfigureAwait(false));
+        var accounts = await _accountStore.ListAccountsAsync(cancellationToken).ConfigureAwait(false);
+        var activeId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
+        var now = _timeProvider.GetUtcNow();
+        var candidates = accounts.Where(a => a.Id != activeId).Select(account =>
+        {
+            var observation = observations.SingleOrDefault(o => o.AccountId == account.Id && o.ModelKey == model);
+            string state = model == null ? "UNCONFIGURED" : observation == null ? "NOT_OBSERVED" :
+                observation.ObservedAtUtc > now ? "INVALID" :
+                now - observation.ObservedAtUtc >= CandidateSelector.InactiveCandidateEvidenceLifetime ? "STALE" :
+                observation.RemainingFraction == null ? "UNKNOWN" :
+                observation.RemainingFraction <= 0 ? "EXHAUSTED" :
+                QuotaObservationEvidence.IsUsable(observation, now, config.MinimumCandidateQuotaPercent) ? "USABLE" : "BELOW_MINIMUM";
+            // Old percentages are not current capacity. Reset timestamps never change this state.
+            double? remaining = state is "USABLE" or "BELOW_MINIMUM" or "EXHAUSTED" ? observation?.RemainingFraction : null;
+            return new CandidateQuotaStatusDto(account.Id, state, remaining, observation?.ObservedAtUtc,
+                observation == null ? null : (now - observation.ObservedAtUtc).TotalSeconds);
+        }).OrderBy(c => c.AccountId, StringComparer.Ordinal).ToArray();
+        return new(model, config.MinimumCandidateQuotaPercent, true, candidates);
+    }
+
     public void ResetManualRecovery()
     {
         lock (_stateLock)
@@ -303,12 +354,17 @@ public class NativeAutoRouter : INativeAutoRouter
         }
     }
 
-    internal void SetObservedQuota(string accountId, double remainingFraction, IReadOnlyList<ModelQuotaDto>? modelQuotas = null)
+    // Synthetic injection for tests. Production evidence only comes from the
+    // coherent active-account GetUserStatus observation in EvaluateCycleAsync.
+    internal void SetObservedQuota(string accountId, double remainingFraction,
+        IReadOnlyList<ModelQuotaDto>? modelQuotas = null, DateTimeOffset? observedAtUtc = null)
     {
         ArgumentNullException.ThrowIfNull(accountId);
         lock (_stateLock)
         {
             _observedQuotas[accountId] = remainingFraction;
+            _quotaEvidence[accountId] = new CandidateQuotaEvidence(
+                observedAtUtc ?? _timeProvider.GetUtcNow(), "SyntheticTestObservation");
             if (modelQuotas != null)
             {
                 _observedModelQuotas[accountId] = modelQuotas;
@@ -343,7 +399,31 @@ public class NativeAutoRouter : INativeAutoRouter
                     return new SelectionResult(false, "Manual switch in progress.", _lastActiveAccountId,
                         null, null, Array.Empty<CandidateEvaluation>());
             }
-            string nowIso = DateTime.UtcNow.ToString("o");
+            string nowIso = _timeProvider.GetUtcNow().UtcDateTime.ToString("o");
+
+            if (!_switchCoordinator.CanAdmitSwitch(out var admissionBlockReason))
+            {
+                var status = _switchCoordinator.GetStatus();
+                bool isQuarantinedOrRecovery = status.QuarantineActive ||
+                    !string.Equals(status.JournalRecoveryState, JournalRecoveryStates.None, StringComparison.Ordinal) ||
+                    RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch").IsMarked ||
+                    RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked;
+
+                string reason = admissionBlockReason ?? "Account lifecycle recovery is unresolved; automatic switching is halted.";
+                lock (_stateLock)
+                {
+                    _lastEvaluatedAt = nowIso;
+                    if (isQuarantinedOrRecovery)
+                    {
+                        RequireManualRecovery(reason);
+                    }
+                    else
+                    {
+                        _lastDecisionReason = reason;
+                    }
+                }
+                return new SelectionResult(false, reason, _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+            }
 
             // Check circuit breaker
             if (_safetyGate.State == RoutingSafetyGateState.ManualRecoveryRequired)
@@ -363,7 +443,7 @@ public class NativeAutoRouter : INativeAutoRouter
             {
                 probedCooldownUntil = _cooldownUntil;
                 if (_safetyGate.State == RoutingSafetyGateState.Cooldown &&
-                    _cooldownUntil.HasValue && DateTime.UtcNow < _cooldownUntil.Value)
+                    _cooldownUntil.HasValue && _timeProvider.GetUtcNow().UtcDateTime < _cooldownUntil.Value)
                 {
                     _lastEvaluatedAt = nowIso;
                     _lastDecisionReason = $"In cooldown until {_cooldownUntil.Value:O}.";
@@ -459,7 +539,7 @@ public class NativeAutoRouter : INativeAutoRouter
             }
 
             // Clean expired candidate cooldowns
-            var nowUtc = DateTime.UtcNow;
+            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
             var expiredKeys = _candidateCooldowns.Where(kvp => kvp.Value <= nowUtc).Select(kvp => kvp.Key).ToList();
             foreach (var key in expiredKeys)
             {
@@ -478,28 +558,36 @@ public class NativeAutoRouter : INativeAutoRouter
             if (!IdentityMatches(activeAccount, liveBeforeQuota))
                 return RejectUnprovenActiveIdentity(nowIso, planEpoch);
             var observation = await _adapter.GetAccountQuotaObservationAsync(cancellationToken).ConfigureAwait(false);
+            var quotaObservedAtUtc = _timeProvider.GetUtcNow();
             if (!IdentityMatches(activeAccount, observation.Account))
                 return RejectUnprovenActiveIdentity(nowIso, planEpoch);
             var quotaSnapshot = observation.Quota;
 
-            // Calculate current account usable quota fraction (weakest-link across models)
+            var requestedModel = await _adapter.GetRequestedModelAsync(cancellationToken).ConfigureAwait(false);
+            if (!IdentityMatches(activeAccount, requestedModel.Account) ||
+                string.IsNullOrWhiteSpace(requestedModel.ModelOrTier))
+                return RejectRequestedModel(nowIso, planEpoch, activeAccountId,
+                    "Requested workload model is unknown; automatic switching requires live model evidence.");
+            string requestedModelKey = requestedModel.ModelOrTier.Trim().ToLowerInvariant();
+
+            // Only the proven requested model can create routing pressure. A low
+            // quota on another model is not evidence about the current workload.
             double? currentQuotaFraction = null;
             if (quotaSnapshot?.Models != null && quotaSnapshot.Models.Count > 0)
             {
-                if (quotaSnapshot.Models.Any(m => m.IsExhausted || (m.RemainingFraction.HasValue && m.RemainingFraction.Value <= 0.0)))
+                var matchingModels = quotaSnapshot.Models
+                    .Where(m => string.Equals(CandidateSelector.GetModelKey(m), requestedModelKey,
+                        StringComparison.Ordinal))
+                    .ToList();
+                if (matchingModels.Count > 0 && matchingModels.Any(m => m.IsExhausted ||
+                    (m.RemainingFraction.HasValue && m.RemainingFraction.Value <= 0.0)))
                 {
                     currentQuotaFraction = 0.0;
                 }
-                else
+                else if (matchingModels.Count > 0 && matchingModels.All(m =>
+                    m.RemainingFraction.HasValue && double.IsFinite(m.RemainingFraction.Value)))
                 {
-                    var validFractions = quotaSnapshot.Models
-                        .Where(m => m.RemainingFraction.HasValue && double.IsFinite(m.RemainingFraction.Value))
-                        .Select(m => m.RemainingFraction!.Value)
-                        .ToList();
-
-                    currentQuotaFraction = validFractions.Count > 0
-                        ? validFractions.Min()
-                        : null;
+                    currentQuotaFraction = matchingModels.Min(m => m.RemainingFraction!.Value);
                 }
             }
 
@@ -544,6 +632,7 @@ public class NativeAutoRouter : INativeAutoRouter
                 var activeMetadataAfterQuota = activeAfterQuota == null ? null :
                     await _accountStore.GetAccountAsync(activeAfterQuota, cancellationToken).ConfigureAwait(false);
                 var liveAfterQuota = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
+                List<AccountModelQuotaObservation>? observationsToRecord = null;
                 lock (_stateLock)
                 {
                     if (_manualSwitchEpoch != planEpoch || _manualSwitchPending ||
@@ -558,18 +647,66 @@ public class NativeAutoRouter : INativeAutoRouter
                     if (activeAccountId != null)
                     {
                         if (currentQuotaFraction.HasValue && double.IsFinite(currentQuotaFraction.Value))
+                        {
                             _observedQuotas[activeAccountId] = currentQuotaFraction.Value;
+                            _quotaEvidence[activeAccountId] = new CandidateQuotaEvidence(
+                                quotaObservedAtUtc, "ActiveGetUserStatus");
+                        }
                         else
+                        {
                             _observedQuotas.Remove(activeAccountId);
+                            _quotaEvidence.Remove(activeAccountId);
+                        }
 
                         if (quotaSnapshot?.Models != null)
+                        {
                             _observedModelQuotas[activeAccountId] = quotaSnapshot.Models;
+                            if (_quotaObservationStore != null)
+                            {
+                                observationsToRecord = QuotaObservationEvidence.Capture(activeAccountId,
+                                    quotaSnapshot.Models, quotaObservedAtUtc, "ActiveGetUserStatus").ToList();
+                            }
+                        }
                         else
+                        {
                             _observedModelQuotas.Remove(activeAccountId);
+                            if (_quotaObservationStore != null)
+                                observationsToRecord = [];
+                        }
                     }
-                    observedSnapshot = new Dictionary<string, double>(_observedQuotas, StringComparer.Ordinal);
-                    observedModelSnapshot = new Dictionary<string, IReadOnlyList<ModelQuotaDto>>(_observedModelQuotas, StringComparer.Ordinal);
                     configSnapshot = _config;
+                    var nowForCandidates = _timeProvider.GetUtcNow();
+                    var lifetime = CandidateEvidenceLifetime(configSnapshot.PollingIntervalMs);
+                    var freshIds = _quotaEvidence
+                        .Where(kvp => IsCandidateEvidenceFresh(kvp.Value.ObservedAtUtc,
+                            nowForCandidates, lifetime))
+                        .Select(kvp => kvp.Key)
+                        .ToHashSet(StringComparer.Ordinal);
+                    observedSnapshot = _observedQuotas
+                        .Where(kvp => freshIds.Contains(kvp.Key))
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.Ordinal);
+                    observedModelSnapshot = _observedModelQuotas
+                        .Where(kvp => freshIds.Contains(kvp.Key))
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.Ordinal);
+                }
+
+                if (_quotaObservationStore != null && activeAccountId != null && observationsToRecord != null)
+                {
+                    try
+                    {
+                        await _quotaObservationStore.RecordCompleteSnapshotAsync(
+                            activeAccountId, observationsToRecord, quotaObservedAtUtc, "ActiveGetUserStatus", cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        lock (_stateLock)
+                        {
+                            _lastEvaluatedAt = nowIso;
+                            _lastDecisionReason = $"Quota observation store failed closed: {ex.Message}";
+                        }
+                        return new SelectionResult(false, $"Quota observation store failed closed: {ex.Message}",
+                            activeAccountId, currentQuotaFraction, null, Array.Empty<CandidateEvaluation>());
+                    }
                 }
             }
             finally
@@ -589,12 +726,27 @@ public class NativeAutoRouter : INativeAutoRouter
                         null, null, Array.Empty<CandidateEvaluation>());
             }
 
-            var lowThresholdFraction = configSnapshot.LowQuotaThresholdPercent / 100.0;
-            var relevantModelKeys = quotaSnapshot?.Models?
-                .Where(m => m.IsExhausted || (m.RemainingFraction.HasValue && m.RemainingFraction.Value <= lowThresholdFraction))
-                .Select(CandidateSelector.GetModelKey)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            IReadOnlyDictionary<string, AccountModelQuotaObservation>? candidateModelObservations = null;
+            if (_quotaObservationStore != null)
+            {
+                try
+                {
+                    var durableObservations = QuotaObservationEvidence.Consolidate(await _quotaObservationStore.GetAllObservationsAsync(cancellationToken).ConfigureAwait(false));
+                    candidateModelObservations = durableObservations
+                        .Where(o => string.Equals(o.ModelKey, requestedModelKey, StringComparison.OrdinalIgnoreCase))
+                        .ToDictionary(o => o.AccountId, StringComparer.Ordinal);
+                }
+                catch (Exception ex)
+                {
+                    lock (_stateLock)
+                    {
+                        _lastEvaluatedAt = nowIso;
+                        _lastDecisionReason = $"Quota observation store failed closed: {ex.Message}";
+                    }
+                    return new SelectionResult(false, $"Quota observation store failed closed: {ex.Message}",
+                        activeAccountId, currentQuotaFraction, null, Array.Empty<CandidateEvaluation>());
+                }
+            }
 
             var selection = CandidateSelector.SelectBestCandidate(
                 activeAccountId,
@@ -605,7 +757,9 @@ public class NativeAutoRouter : INativeAutoRouter
                 vaultedAccountIds,
                 activeCooldownIds,
                 observedModelSnapshot,
-                relevantModelKeys
+                [requestedModelKey],
+                candidateModelObservations,
+                _timeProvider.GetUtcNow()
             );
 
             if (BeforeGatePublicationAsync is { } beforeGatePublication)
@@ -620,6 +774,34 @@ public class NativeAutoRouter : INativeAutoRouter
                     return new SelectionResult(false, "Manual switch superseded evaluation.", _lastActiveAccountId,
                         null, null, Array.Empty<CandidateEvaluation>());
                 autoSwitchEnabled = _config.AutoSwitchEnabled;
+                if (selection.ShouldSwitch && selection.BestCandidate != null)
+                {
+                    if (!_switchCoordinator.CanAdmitSwitch(out var switchAdmissionReason))
+                    {
+                        var status = _switchCoordinator.GetStatus();
+                        bool isQuarantinedOrRecovery = status.QuarantineActive ||
+                            !string.Equals(status.JournalRecoveryState, JournalRecoveryStates.None, StringComparison.Ordinal) ||
+                            RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch").IsMarked ||
+                            RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked;
+
+                        string reason = switchAdmissionReason ?? "Account lifecycle recovery is unresolved; automatic switching is halted.";
+                        selection = new SelectionResult(false, reason, selection.CurrentAccountId, null, null, selection.Candidates);
+                        _lastEvaluatedAt = nowIso;
+                        _lastDecisionReason = reason;
+
+                        if (isQuarantinedOrRecovery)
+                        {
+                            RequireManualRecovery(reason);
+                        }
+                        else if (_safetyGate.State is RoutingSafetyGateState.WaitingForIdle or
+                                 RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.LowQuotaDetected)
+                        {
+                            _safetyGate.Reset(reason);
+                        }
+
+                        return selection;
+                    }
+                }
                 _lastEvaluatedAt = nowIso;
                 _lastDecisionReason = selection.Reason;
                 if (selection.ShouldSwitch && selection.BestCandidate != null)
@@ -640,6 +822,13 @@ public class NativeAutoRouter : INativeAutoRouter
             if (selection.ShouldSwitch && selection.BestCandidate != null && autoSwitchEnabled)
             {
                 var activity = await _adapter.GetActivityStateAsync(cancellationToken).ConfigureAwait(false);
+                var latestRequestedModel = await _adapter.GetRequestedModelAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                if (!IdentityMatches(activeAccount, latestRequestedModel.Account) ||
+                    !string.Equals(latestRequestedModel.ModelOrTier?.Trim(), requestedModelKey,
+                        StringComparison.OrdinalIgnoreCase))
+                    return RejectRequestedModel(nowIso, planEpoch, activeAccountId,
+                        "Requested workload model changed or became unknown; pending switch was cancelled.");
                 var assessment = _safetyGate.AssessActivity(activity);
                 bool execute = false;
                 lock (_stateLock)
@@ -671,6 +860,8 @@ public class NativeAutoRouter : INativeAutoRouter
                 if (execute)
                 {
                     await ExecuteSwitchAsync(selection.BestCandidate.Account.Id, activeAccountId, planEpoch,
+                        requestedModelKey, configSnapshot.MinimumCandidateQuotaPercent,
+                        candidateModelObservations?.GetValueOrDefault(selection.BestCandidate.Account.Id),
                         cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -683,10 +874,41 @@ public class NativeAutoRouter : INativeAutoRouter
         }
     }
 
-    private bool IsAutomaticPlanCurrent(long epoch)
+    private bool IsAutomaticPlanCurrent(long epoch, string candidateAccountId,
+        string? requestedModelKey, double? minimumPercent, AccountModelQuotaObservation? selectedEvidence)
     {
         lock (_stateLock)
-            return IsAutomaticPlanCurrentLocked(epoch);
+        {
+            if (!IsAutomaticPlanCurrentLocked(epoch)) return false;
+            if (_quotaObservationStore == null)
+                return _quotaEvidence.TryGetValue(candidateAccountId, out var memoryEvidence) &&
+                    IsCandidateEvidenceFresh(memoryEvidence.ObservedAtUtc, _timeProvider.GetUtcNow(),
+                        CandidateEvidenceLifetime(_config.PollingIntervalMs));
+            if (selectedEvidence == null || selectedEvidence.AccountId != candidateAccountId ||
+                selectedEvidence.ModelKey != requestedModelKey || minimumPercent != _config.MinimumCandidateQuotaPercent ||
+                !string.Equals(CandidateSelector.CanonicalizeModelKey(_config.WorkloadModelKey), requestedModelKey, StringComparison.Ordinal))
+                return false;
+        }
+        try
+        {
+            // The coordinator's synchronous admission callback runs outside the router
+            // state lock. Read the authoritative file again at every admission boundary.
+            var current = _quotaObservationStore.GetObservationAsync(candidateAccountId, requestedModelKey!)
+                .GetAwaiter().GetResult();
+            if (current != selectedEvidence || !QuotaObservationEvidence.IsUsable(selectedEvidence,
+                _timeProvider.GetUtcNow(), minimumPercent!.Value)) return false;
+            lock (_stateLock) return IsAutomaticPlanCurrentLocked(epoch) &&
+                minimumPercent == _config.MinimumCandidateQuotaPercent &&
+                string.Equals(CandidateSelector.CanonicalizeModelKey(_config.WorkloadModelKey), requestedModelKey, StringComparison.Ordinal);
+        }
+        catch { return false; }
+    }
+
+    private bool IsBackendRecoveryBlocked()
+    {
+        return !_switchCoordinator.CanAdmitSwitch(out _) ||
+            RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch").IsMarked ||
+            RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked;
     }
 
     private bool IsEvaluationCurrentLocked(long epoch) =>
@@ -701,6 +923,24 @@ public class NativeAutoRouter : INativeAutoRouter
         account != null && !string.IsNullOrWhiteSpace(account.Email) &&
         !string.IsNullOrWhiteSpace(live?.Email) &&
         string.Equals(account.Email.Trim(), live.Email.Trim(), StringComparison.OrdinalIgnoreCase);
+
+    private SelectionResult RejectRequestedModel(
+        string nowIso, long planEpoch, string? activeAccountId, string reason)
+    {
+        lock (_stateLock)
+        {
+            if (!IsEvaluationCurrentLocked(planEpoch))
+                return new SelectionResult(false, "Manual switch superseded model observation.",
+                    activeAccountId, null, null, Array.Empty<CandidateEvaluation>());
+            _lastEvaluatedAt = nowIso;
+            _lastDecisionReason = reason;
+            if (_safetyGate.State is RoutingSafetyGateState.SwitchPending or
+                RoutingSafetyGateState.WaitingForIdle or RoutingSafetyGateState.LowQuotaDetected)
+                _safetyGate.Reset(reason);
+        }
+        return new SelectionResult(false, reason, activeAccountId, null, null,
+            Array.Empty<CandidateEvaluation>());
+    }
 
     private SelectionResult RejectUnprovenActiveIdentity(string nowIso, long planEpoch)
     {
@@ -732,9 +972,10 @@ public class NativeAutoRouter : INativeAutoRouter
 
     private async Task ExecuteSwitchAsync(
         string targetAccountId, string? expectedActiveAccountId, long planEpoch,
-        CancellationToken cancellationToken)
+        string? requestedModelKey, double? minimumCandidateQuotaPercent,
+        AccountModelQuotaObservation? selectedEvidence, CancellationToken cancellationToken)
     {
-        if (!IsAutomaticPlanCurrent(planEpoch))
+        if (!IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, minimumCandidateQuotaPercent, selectedEvidence))
         {
             lock (_stateLock)
             {
@@ -745,11 +986,37 @@ public class NativeAutoRouter : INativeAutoRouter
             }
             return;
         }
+        if (!_switchCoordinator.CanAdmitSwitch(out var executeAdmissionReason))
+        {
+            var status = _switchCoordinator.GetStatus();
+            bool isQuarantinedOrRecovery = status.QuarantineActive ||
+                !string.Equals(status.JournalRecoveryState, JournalRecoveryStates.None, StringComparison.Ordinal) ||
+                RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath() + ".switch").IsMarked ||
+                RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked;
+
+            string reason = executeAdmissionReason ?? "Account lifecycle recovery is unresolved; automatic switching is halted.";
+            lock (_stateLock)
+            {
+                if (isQuarantinedOrRecovery)
+                {
+                    RequireManualRecovery(reason);
+                }
+                else if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress &&
+                         _switchCoordinator.GetStatus().ActiveTransactionId == null)
+                {
+                    _safetyGate.Reset(reason);
+                }
+            }
+            return;
+        }
+
         NativeSwitchResult switchResult;
         try
         {
             switchResult = await _switchCoordinator.SwitchAutomaticallyAsync(
-                targetAccountId, expectedActiveAccountId, () => IsAutomaticPlanCurrent(planEpoch),
+                targetAccountId, expectedActiveAccountId,
+                () => IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, minimumCandidateQuotaPercent, selectedEvidence),
+                requestedModelKey, minimumCandidateQuotaPercent,
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -805,6 +1072,7 @@ public class NativeAutoRouter : INativeAutoRouter
                 _lastActiveAccountEmail = switchResult.TargetEmail;
                 _observedQuotas.Remove(switchResult.TargetAccountId);
                 _observedModelQuotas.Remove(switchResult.TargetAccountId);
+                _quotaEvidence.Remove(switchResult.TargetAccountId);
                 if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
                 {
                     _safetyGate.Transition(RoutingSafetyGateState.Verifying,
@@ -818,14 +1086,14 @@ public class NativeAutoRouter : INativeAutoRouter
                 if (_safetyGate.State != RoutingSafetyGateState.Cooldown)
                     _safetyGate.Transition(RoutingSafetyGateState.Cooldown,
                         "Stabilizing after successful automatic switch");
-                _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
+                _cooldownUntil = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(30);
                 _lastDecisionReason = $"Switch succeeded to {switchResult.TargetEmail}.";
                 return;
             }
 
             if (switchResult.Code == SwitchResultCodes.SwitchFailedRolledBack)
             {
-                _candidateCooldowns[targetAccountId] = DateTime.UtcNow.AddSeconds(60);
+                _candidateCooldowns[targetAccountId] = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(60);
                 if (!_manualSwitchPending)
                 {
                     if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
@@ -837,7 +1105,7 @@ public class NativeAutoRouter : INativeAutoRouter
                     if (_safetyGate.State != RoutingSafetyGateState.Cooldown)
                         _safetyGate.Transition(RoutingSafetyGateState.Cooldown,
                             "Stabilizing after rolled back switch");
-                    _cooldownUntil = DateTime.UtcNow.AddSeconds(30);
+                    _cooldownUntil = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(30);
                 }
                 _lastDecisionReason = $"Switch failed and was rolled back to {switchResult.PreviousEmail}.";
                 return;

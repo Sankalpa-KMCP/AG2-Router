@@ -510,6 +510,9 @@ export class AppServer {
         if (typeof body.pollingIntervalMs === 'number') {
           updates.pollingIntervalMs = body.pollingIntervalMs;
         }
+        if (body.workloadModelKey !== undefined) {
+          updates.workloadModelKey = body.workloadModelKey as string | null;
+        }
 
         const updated = this.router.updateConfig(updates);
         this.sendJson(res, 200, { config: updated });

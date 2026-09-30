@@ -3,10 +3,71 @@ import type {
   AccountMetadata,
   SystemStatusDto,
   SwitchStatusDto,
-  RouterConfigDto
+  RouterConfigDto,
+  RouterConfigUpdate,
+  CandidateEvidenceStatusDto,
+  JournalResolutionResult,
+  JournalResolutionStatus
 } from './types.js';
 
-class ApiClient {
+export const VALID_RESOLUTION_STATUSES = new Set<JournalResolutionStatus>([
+  'CleanCleanupCompleted',
+  'ResolvedRestartRequired',
+  'NoJournal',
+  'NotResolvable',
+  'ProofFailed',
+  'PersistenceFailure'
+]);
+
+export const VALID_RESOLUTION_REASON_CODES = new Set<string>([
+  'CORRUPT_JOURNAL',
+  'UNSUPPORTED_VERSION',
+  'IO_ERROR',
+  'LOCK_TIMEOUT',
+  'LEASE_ACQUISITION_FAILED',
+  'NO_ACTIVE_ACCOUNT',
+  'ACTIVE_ACCOUNT_NOT_FOUND',
+  'ACCOUNT_NOT_ENROLLED',
+  'LIVE_IDENTITY_UNAVAILABLE',
+  'LIVE_IDENTITY_MISMATCH',
+  'CREDENTIAL_MISSING',
+  'VAULT_SESSION_MISSING',
+  'CREDENTIAL_MISMATCH',
+  'CONCURRENT_MUTATION',
+  'CLEAN_RECORDED_REMOVED',
+  'CLEAN_COMMITTED_PRECOMMIT_REMOVED',
+  'UNSUPPORTED_PLATFORM',
+  'DELETE_FAILED',
+  'NO_JOURNAL'
+]);
+
+export const FAIL_CLOSED_RESOLUTION_RESULT: JournalResolutionResult = {
+  status: 'PersistenceFailure',
+  message: 'A persistence failure occurred during journal resolution.',
+  restartRequired: false,
+  reasonCode: 'UNKNOWN'
+};
+
+function getFixedResolutionMessage(status: JournalResolutionStatus, _reasonCode?: string | null): string {
+  switch (status) {
+    case 'CleanCleanupCompleted':
+      return 'Switch journal cleaned up successfully.';
+    case 'ResolvedRestartRequired':
+      return 'Switch journal successfully resolved and removed. Application restart is required before normal routing resumes.';
+    case 'NoJournal':
+      return 'No switch journal present.';
+    case 'NotResolvable':
+      return 'The switch journal cannot be resolved automatically.';
+    case 'ProofFailed':
+      return 'Account state coherence could not be verified.';
+    case 'PersistenceFailure':
+      return 'A persistence failure occurred during journal resolution.';
+    default:
+      return 'An unexpected resolution state occurred.';
+  }
+}
+
+export class ApiClient {
   private switchIntentToken: string | null = null;
 
   private async request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -32,8 +93,8 @@ class ApiClient {
     if (!res.ok) {
       let errorMsg = `HTTP ${res.status}`;
       try {
-        const errorJson = await res.json();
-        if (errorJson && errorJson.error) {
+        const errorJson = (await res.json()) as Record<string, unknown> | null;
+        if (errorJson && typeof errorJson.error === 'string') {
           errorMsg = errorJson.error;
         }
       } catch {
@@ -116,16 +177,104 @@ class ApiClient {
     });
   }
 
+  public async resolveQuarantine(): Promise<JournalResolutionResult> {
+    if (!this.switchIntentToken) {
+      try {
+        await this.getSwitchIntent();
+      } catch {
+        return FAIL_CLOSED_RESOLUTION_RESULT;
+      }
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+    if (this.switchIntentToken) {
+      headers['X-AG2-Switch-Token'] = this.switchIntentToken;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch('/api/switching/resolve-quarantine', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ confirm: true })
+      });
+    } catch {
+      return FAIL_CLOSED_RESOLUTION_RESULT;
+    }
+
+    const switchHeader = res.headers.get('x-ag2-switch-token');
+    if (switchHeader) {
+      this.switchIntentToken = switchHeader;
+    }
+
+    let data: unknown = null;
+    try {
+      data = await res.json();
+    } catch {
+      return FAIL_CLOSED_RESOLUTION_RESULT;
+    }
+
+    if (!data || typeof data !== 'object') {
+      return FAIL_CLOSED_RESOLUTION_RESULT;
+    }
+
+    const raw = data as Record<string, unknown>;
+    const rawStatus = typeof raw.status === 'string' ? raw.status : '';
+
+    if (!VALID_RESOLUTION_STATUSES.has(rawStatus as JournalResolutionStatus)) {
+      return FAIL_CLOSED_RESOLUTION_RESULT;
+    }
+
+    const status = rawStatus as JournalResolutionStatus;
+
+    // F-286-1 Success Acceptance and Result Consistency Rules:
+    // 1. ResolvedRestartRequired requires res.ok AND raw.restartRequired === true.
+    // 2. CleanCleanupCompleted and NoJournal may require restart when quarantine remains.
+    // 3. Failure states (NotResolvable, ProofFailed, PersistenceFailure) must never assert restartRequired: true.
+    // Any violation or contradiction maps fail-closed to FAIL_CLOSED_RESOLUTION_RESULT.
+    if (status === 'ResolvedRestartRequired') {
+      if (!res.ok || raw.restartRequired !== true) {
+        return FAIL_CLOSED_RESOLUTION_RESULT;
+      }
+    } else if (status === 'CleanCleanupCompleted' || status === 'NoJournal') {
+      if (!res.ok || (raw.restartRequired !== undefined && typeof raw.restartRequired !== 'boolean')) {
+        return FAIL_CLOSED_RESOLUTION_RESULT;
+      }
+    } else {
+      if (raw.restartRequired === true) {
+        return FAIL_CLOSED_RESOLUTION_RESULT;
+      }
+    }
+
+    let reasonCode: string | null = null;
+    if (typeof raw.reasonCode === 'string') {
+      reasonCode = VALID_RESOLUTION_REASON_CODES.has(raw.reasonCode) ? raw.reasonCode : 'UNKNOWN';
+    }
+
+    const coherentAccountId = typeof raw.coherentAccountId === 'string' ? raw.coherentAccountId : null;
+    const restartRequired = status === 'ResolvedRestartRequired' ||
+      ((status === 'CleanCleanupCompleted' || status === 'NoJournal') && raw.restartRequired === true);
+
+    return {
+      status,
+      message: getFixedResolutionMessage(status, reasonCode),
+      coherentAccountId,
+      restartRequired,
+      reasonCode
+    };
+  }
+
   public async getConfig(): Promise<{ config: RouterConfigDto }> {
     return this.request<{ config: RouterConfigDto }>('/api/config');
   }
 
-  public async saveConfig(config: {
-    autoSwitchEnabled: boolean;
-    lowQuotaThresholdPercent: number;
-    minimumCandidateQuotaPercent: number;
-    pollingIntervalMs: number;
-  }): Promise<{ success: boolean; config: RouterConfigDto }> {
+  public async getCandidateEvidence(): Promise<CandidateEvidenceStatusDto> {
+    return this.request<CandidateEvidenceStatusDto>('/api/router/candidate-evidence');
+  }
+
+  public async saveConfig(config: RouterConfigUpdate): Promise<{ success: boolean; config: RouterConfigDto }> {
     return this.request<{ success: boolean; config: RouterConfigDto }>('/api/config', {
       method: 'POST',
       body: JSON.stringify(config)

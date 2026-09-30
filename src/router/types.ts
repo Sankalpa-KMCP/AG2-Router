@@ -31,6 +31,12 @@ export interface RouterConfig {
    * Default: 10000 (10s)
    */
   readonly pollingIntervalMs: number;
+
+  /**
+   * Target model identifier for workload-directed routing.
+   * When null or omitted, automatic model-specific routing remains fail-closed.
+   */
+  readonly workloadModelKey?: string | null;
 }
 
 /**
@@ -40,7 +46,8 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   autoSwitchEnabled: false,
   lowQuotaThresholdPercent: 15,
   minimumCandidateQuotaPercent: 30,
-  pollingIntervalMs: 10000
+  pollingIntervalMs: 10000,
+  workloadModelKey: null
 };
 
 /**
