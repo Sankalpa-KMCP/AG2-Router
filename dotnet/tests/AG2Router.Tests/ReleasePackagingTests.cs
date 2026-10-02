@@ -349,11 +349,12 @@ public class ReleasePackagingTests
         var versionMatch = Regex.Match(propsContent, @"<Version>(?<ver>[^<]+)</Version>");
         Assert.True(versionMatch.Success, "Directory.Build.props must specify <Version>");
         string canonicalVersion = versionMatch.Groups["ver"].Value.Trim();
-        Assert.Equal("0.4.0", canonicalVersion);
+        Assert.Matches(@"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$", canonicalVersion);
+        string numericVersion = canonicalVersion.Split('-')[0];
 
-        // Assembly, File, and Informational versions must match canonical version
-        Assert.Contains($"<AssemblyVersion>{canonicalVersion}</AssemblyVersion>", propsContent);
-        Assert.Contains($"<FileVersion>{canonicalVersion}</FileVersion>", propsContent);
+        // Assembly/File versions are numeric; informational version retains prerelease identity.
+        Assert.Contains($"<AssemblyVersion>{numericVersion}</AssemblyVersion>", propsContent);
+        Assert.Contains($"<FileVersion>{numericVersion}</FileVersion>", propsContent);
         Assert.Contains($"<InformationalVersion>{canonicalVersion}</InformationalVersion>", propsContent);
 
         // 2. package.json and package-lock.json

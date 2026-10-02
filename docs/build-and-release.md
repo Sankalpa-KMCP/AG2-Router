@@ -27,6 +27,8 @@ CURRENT LIMITATION: CI builds the UI but does not explicitly fail when committed
 
 dotnet/Directory.Build.props is the canonical release-version input for .NET assemblies and scripts/package-release.ps1 when no explicit override is supplied. The release workflow reads the same property.
 
+Prerelease versions retain their suffix in Version and InformationalVersion and in package/installer names. AssemblyVersion and FileVersion use the numeric major.minor.patch portion required by their version formats.
+
 Other version-bearing files and release names must agree at release time, but copied literals are not independent authorities. A tag identifies a release snapshot; it is not a living documentation value.
 
 ## Validation pipelines
