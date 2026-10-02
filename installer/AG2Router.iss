@@ -2,7 +2,7 @@
 ; Per-user non-admin installation matching scripts/install.ps1 and scripts/uninstall.ps1 contracts
 
 #ifndef AppVersion
-#define AppVersion "0.4.0"
+#define AppVersion "0.4.1-rc.1"
 #endif
 
 #ifndef SourceDir
