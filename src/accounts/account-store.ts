@@ -6,7 +6,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { withCoordinatedFileAccess, writeFileAtomically } from '../persistence/file-coordination.js';
-import { AccountMetadata, CreateAccountInput, IAccountStore, UpdateAccountInput } from './types.js';
+import { AccountMetadata, CreateAccountInput, EnrollmentAccountCommit, EnrollmentCommitUncertainError, IAccountStore, UpdateAccountInput } from './types.js';
 
 interface StoredData {
   version: 1;
@@ -59,6 +59,21 @@ function accountsEqual(left: AccountMetadata, right: AccountMetadata): boolean {
     left.lastActiveAt === right.lastActiveAt &&
     left.notes === right.notes &&
     left.alias === right.alias;
+}
+
+function enrollmentMetadata(expected: AccountMetadata, updates: UpdateAccountInput): AccountMetadata {
+  return {
+    ...expected,
+    name: updates.name !== undefined ? updates.name.trim() : expected.name,
+    alias: updates.alias !== undefined ? (updates.alias.trim() || undefined) : expected.alias,
+    priority: updates.priority ?? expected.priority,
+    isReserve: updates.isReserve ?? expected.isReserve,
+    validationStatus: updates.validationStatus ?? expected.validationStatus,
+    hasVaultedSession: updates.hasVaultedSession ?? expected.hasVaultedSession,
+    lastActiveAt: updates.lastActiveAt !== undefined ? updates.lastActiveAt : expected.lastActiveAt,
+    notes: updates.notes !== undefined ? updates.notes : expected.notes,
+    updatedAt: new Date().toISOString()
+  };
 }
 
 function parseStoredData(raw: string, filePath: string): StoredData {
@@ -124,6 +139,21 @@ function parseStoredData(raw: string, filePath: string): StoredData {
 export class InMemoryAccountStore implements IAccountStore {
   private accounts = new Map<string, AccountMetadata>();
   private activeAccountId: string | null = null;
+
+  public async finalizeEnrollment(
+    expected: AccountMetadata, updates: UpdateAccountInput, expectedActiveId: string | null,
+    verifyCoherence: () => Promise<void>
+  ): Promise<EnrollmentAccountCommit> {
+    await verifyCoherence();
+    const current = this.accounts.get(expected.id);
+    if (!current || !accountsEqual(current, expected)) throw new Error('Enrollment metadata changed before commit.');
+    const account = enrollmentMetadata(current, updates);
+    const activeUpdated = this.activeAccountId === expectedActiveId;
+    // No await separates the proof/CAS from this in-memory publication.
+    this.accounts.set(account.id, account);
+    if (activeUpdated) this.activeAccountId = account.id;
+    return { account, activeUpdated };
+  }
 
   public async listAccounts(): Promise<AccountMetadata[]> {
     return Array.from(this.accounts.values()).sort((a, b) => a.priority - b.priority);
@@ -239,6 +269,64 @@ export class LocalMetadataAccountStore implements IAccountStore {
   }
 
   public getFilePath(): string { return this.filePath; }
+
+  /**
+   * Finalizes account metadata commit following vault write with compare-and-swap (CAS) validation.
+   *
+   * INVARIANTS:
+   * 1. CAS Pre-condition: Ensures current account record on disk exactly matches expected.
+   * 2. verifyCoherence Interleaving: Checked before commit and re-checked after disk write.
+   * 3. Drift Detection: Authoritatively reads disk post-write to verify exactly 'next' was stored.
+   * 4. Conditional Restoration: On error, rolls back only if disk still equals 'next'.
+   *    If disk differs from both 'next' and 'previous', throws EnrollmentCommitUncertainError.
+   */
+  public async finalizeEnrollment(
+    expected: AccountMetadata, updates: UpdateAccountInput, expectedActiveId: string | null,
+    verifyCoherence: () => Promise<void>
+  ): Promise<EnrollmentAccountCommit> {
+    return withCoordinatedFileAccess(this.filePath, async () => {
+      const previous = await this.readState();
+      const index = previous.accounts.findIndex((account) => account.id === expected.id);
+      if (index < 0 || !accountsEqual(previous.accounts[index], expected))
+        throw new Error('Enrollment metadata changed before commit.');
+      await verifyCoherence();
+      const account = enrollmentMetadata(expected, updates);
+      const activeUpdated = previous.activeAccountId === expectedActiveId;
+      const accounts = [...previous.accounts];
+      accounts[index] = account;
+      const next: StoredData = {
+        ...previous, accounts, activeAccountId: activeUpdated ? account.id : previous.activeAccountId
+      };
+      const serialized = JSON.stringify(next, null, 2);
+      try {
+        await this.atomicWriter(this.filePath, serialized);
+        // External Antigravity state does not honor our file lease. Detect drift
+        // during persistence before releasing storage ownership or reporting success.
+        const actual = await this.readState();
+        if (JSON.stringify(actual) !== JSON.stringify(next))
+          throw new EnrollmentCommitUncertainError('Enrollment metadata changed outside storage ownership; manual recovery is required.');
+        await verifyCoherence();
+        this.state = actual;
+        this.hasObservedExistingFile = true;
+        return { account, activeUpdated };
+      } catch (error) {
+        try {
+          const actual = await this.readState();
+          if (JSON.stringify(actual) === JSON.stringify(next)) {
+            await this.atomicWriter(this.filePath, JSON.stringify(previous, null, 2));
+            if (JSON.stringify(await this.readState()) !== JSON.stringify(previous))
+              throw new Error('Enrollment restoration did not match the prior snapshot.');
+          } else if (JSON.stringify(actual) !== JSON.stringify(previous)) {
+            throw new Error('Enrollment metadata no longer belongs to this operation.');
+          }
+          this.state = previous;
+        } catch {
+          throw new EnrollmentCommitUncertainError('Enrollment metadata could not be restored conditionally; manual recovery is required.');
+        }
+        throw error;
+      }
+    });
+  }
 
   private async readState(): Promise<StoredData> {
     try {

@@ -92,6 +92,11 @@ function getFixedResolutionMessage(status: JournalResolutionStatus, _reasonCode?
   }
 }
 
+/**
+ * Typed client for AG2 Router loopback HTTP server.
+ * Communicates strictly with loopback endpoints, captures switch intent tokens (`X-AG2-Switch-Token`),
+ * and validates domain responses before passing them to Svelte state runes.
+ */
 export class ApiClient {
   private switchIntentToken: string | null = null;
 

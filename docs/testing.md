@@ -9,7 +9,7 @@ This document owns test layers, fidelity boundaries, fixtures, live opt-ins, and
 | Node/TypeScript | test/ | Reference implementation behavior, cross-platform server/domain cases, selected Windows adapters | That the shipped .NET composition has identical behavior |
 | .NET unit/integration | dotnet/tests/AG2Router.Tests | Native DTOs, normalization, routing, stores, vault, switching, loopback host, lifecycle, Windows abstractions | Full behavior against a user's installed/live environment |
 | Frontend static checks | svelte-check, TypeScript, and Vite build | Svelte/type/build correctness against declared frontend types | Mounted component behavior, browser interaction, or runtime agreement with backend JSON |
-| Build/package tests | ReleasePackagingTests and UpgradePreservationTests | Script/installer text contracts, staged layout, synthetic upgrade preservation | Execution of every installer path on a clean production-like Windows image |
+| Build/package tests | ReleasePackagingTests and UpgradePreservationTests | Script/installer text contracts, PowerShell orchestration against synthetic resources, staged layout and upgrade preservation | Execution of every installer path on a clean production-like Windows image |
 | Opt-in live integration | AG2LiveParityTests and selected WinCred tests | Narrow compatibility checks against a deliberately supplied live environment | Safe default CI coverage or broad production certification |
 
 CI definitions under .github/workflows/ show which layers are actually enforced. A test existing in the tree is not proof that every workflow runs it under every platform.
@@ -34,6 +34,10 @@ WindowsDpapiProvider round-trip tests may use synthetic bytes in an isolated tem
 
 UpgradePreservationTests explicitly redirect data and use synthetic/fake inputs. Preserve that isolation when adding lanes.
 
+PowerShell install/uninstall execution in ReleasePackagingTests must use SyntheticInstallationTestEnvironment and Fixtures/SyntheticInstallationEnvironment.ps1. The fixture explicitly supplies InstallationEnvironment: registry reads/writes/removals use an in-memory map; known folders resolve beneath one disposable root; shortcuts are synthetic files and target records; process, shutdown, and mutex state are simulated. All filesystem operations and version queries require absolute filesystem paths, validate root containment, and reject provider paths and reparse points before access. Filesystem cmdlets receive the validated canonical paths. Missing registry entries mean absence, and missing environment operations fail without production fallback. Boundary errors remain fatal even when installer error handling catches them. Redirecting LOCALAPPDATA or supplying a partial RegistryOverride alone is insufficient isolation.
+
+Before executing a temporary script copy, the fixture replaces only the production environment adapter with a throwing sentinel, then checks the PowerShell AST against an allowlist of orchestration commands, types, and method calls. Direct registry, known-folder, process, mutex, filesystem, dynamic invocation, or file-redirection bypasses fail before execution. This guard supplements behavioral assertions; it is not a general sandbox for arbitrary PowerShell. New host dependencies must be added to the explicit environment and synthetic fixture, rather than widening the allowlist to permit native access. Only the fixture's PowerShell interpreter is launched; application binaries and Inno installers are never executed. Ordinary installation commands omit InstallationEnvironment and retain the production adapters.
+
 Normal repository .NET tests use synthetic in-memory sinks or task-owned temporary paths for JS runtime diagnostics, avoiding writes to %LOCALAPPDATA%/AG2-Router. When adding or expanding tests, ensure diagnostic logging continues to inject isolated destinations rather than resolving the production per-user path.
 
 ## Live opt-ins
@@ -53,7 +57,7 @@ These variables are explicit authorization gates. Do not set them automatically 
 - Journal/recovery and sequential coordinator reuse: SwitchJournalStoreTests, NativeAccountSwitchCoordinatorJournalTests, NativeAccountSwitchCoordinatorResolutionTests, SwitchAdmissionGatingTests, and SwitchCoordinatorLifecycleTests. TargetQuotaVerificationSwitchTests prove live target quota precedes commit, failed verification invalidates unchanged evidence and rolls back, and manual switches remain independent of automatic quota requirements.
 - Loopback/API: LoopbackServerTests, LoopbackServerAccountApiTests, LoopbackSwitchApiTests, and LoopbackRouterApiTests.
 - Polling/WebView lifecycle: TelemetryPollingCoordinatorTests, DashboardLifecycleTests, WebView2EnvironmentCoordinatorTests, and WebViewRecoveryPolicyTests.
-- Packaging and upgrades: ReleasePackagingTests and UpgradePreservationTests, including disposable staged replacement/interruption checks. These do not execute the production installer.
+- Packaging and upgrades: ReleasePackagingTests executes authored PowerShell orchestration with the closed synthetic environment above. UpgradePreservationTests simulates disposable staged replacement/interruption with fake persistent state. Neither executes an Inno Setup binary or accesses a host installation.
 
 Tests should reference the subject contract rather than duplicate prose explanations in their names or setup comments.
 

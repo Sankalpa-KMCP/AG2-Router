@@ -970,13 +970,15 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
             TimeSpan timeout,
             CancellationToken cancellationToken = default,
             Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
-            Action? onStopAttempted = null)
+            Action? onStopAttempted = null,
+            Action? onStopIssued = null)
         {
             if (BeforeKillBehavior != null) await BeforeKillBehavior(cancellationToken);
             if (verifyBeforeKillAsync != null) await verifyBeforeKillAsync(cancellationToken);
             onStopAttempted?.Invoke();
             StopCount++;
             OnStop?.Invoke();
+            onStopIssued?.Invoke();
             if (StopBehavior != null) await StopBehavior(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             if (StopError != null) throw StopError;

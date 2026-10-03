@@ -73,9 +73,11 @@ export interface ModelQuotaInfo {
 export interface CanonicalModelQuotaInfo {
   readonly key: string;
   readonly label: string;
-  readonly modelOrTier?: string;
+  readonly canonicalKey: string;
+  readonly displayLabel: string;
+  readonly modelOrTier?: string | null;
   readonly remainingFraction: number | null;
-  readonly resetTime?: string;
+  readonly resetTime?: string | null;
   readonly isExhausted: boolean;
   readonly modes: readonly string[];
 }

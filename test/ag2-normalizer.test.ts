@@ -218,12 +218,16 @@ describe('AG2 Normalizer', () => {
       const canonical = quota.canonicalModels[0];
       assert.equal(canonical.key, 'tier:gemini-2.5-pro');
       assert.equal(canonical.label, 'Gemini 2.5 Pro');
+      assert.equal(canonical.canonicalKey, 'tier:gemini-2.5-pro');
+      assert.equal(canonical.displayLabel, 'Gemini 2.5 Pro');
       assert.equal(canonical.modelOrTier, 'gemini-2.5-pro');
       assert.equal(canonical.remainingFraction, 0.85);
       assert.equal(canonical.resetTime, '2026-09-21T21:00:00Z');
       assert.equal(canonical.isExhausted, false);
       assert.deepEqual(canonical.modes, ['Standard']);
       assert.equal(quota.canonicalModels[1].key, 'tier:gemini-2.5-pro:row:1');
+      assert.equal(quota.canonicalModels[1].canonicalKey, 'tier:gemini-2.5-pro:row:1');
+      assert.equal(quota.canonicalModels[1].displayLabel, 'Gemini 2.5 Pro');
       assert.deepEqual(quota.canonicalModels[1].modes, ['Thinking']);
     });
 

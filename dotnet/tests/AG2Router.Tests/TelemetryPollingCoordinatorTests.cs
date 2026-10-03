@@ -84,8 +84,14 @@ public class MockAutoRouter : INativeAutoRouter
         RoutingSafetyGateState.Idle, false, null, null, null, null, "Mock reason",
         new RouterConfigDto(AutoSwitchEnabled: false, LowQuotaThresholdPercent: 15, MinimumCandidateQuotaPercent: 30));
 
+    public long ConfigGeneration { get; set; } = 1;
     public RouterConfigDto GetConfig() => Status.Config;
-    public RouterConfigDto UpdateConfig(RouterConfigDto updates) => updates;
+    public RouterConfigDto UpdateConfig(RouterConfigDto updates) => UpdateConfigWithGeneration(updates).Config;
+    public (RouterConfigDto Config, long Generation) UpdateConfigWithGeneration(RouterConfigDto updates)
+    {
+        Status = Status with { Config = updates };
+        return (updates, ++ConfigGeneration);
+    }
     public RouterStatusDto GetStatus() => Status;
     public void ResetManualRecovery() { }
     public ManualSwitchToken NotifyManualSwitchStarted(string targetAccountId) => new(1);
@@ -530,5 +536,77 @@ public class TelemetryPollingCoordinatorTests
         Assert.StartsWith("StatusUpdated subscriber threw an exception: InvalidOperationException:", logs[0]);
         Assert.Contains("[REDACTED]", logs[0]);
         Assert.DoesNotContain("secretBearerToken", logs[0]);
+    }
+
+    [Fact]
+    public void Constructor_InitializesIntervalAndGenerationFromAutoRouter()
+    {
+        var adapter = new MockAG2Adapter();
+        var autoRouter = new MockAutoRouter { ConfigGeneration = 7 };
+
+        var coordinator = new TelemetryPollingCoordinator(adapter, TimeSpan.FromSeconds(15), autoRouter);
+
+        Assert.Equal(TimeSpan.FromSeconds(15), coordinator.Interval);
+        Assert.Equal(7, coordinator.LastAppliedConfigGeneration);
+    }
+
+    [Fact]
+    public void UpdateInterval_WithValidGeneration_UpdatesIntervalAndGeneration()
+    {
+        var adapter = new MockAG2Adapter();
+        var autoRouter = new MockAutoRouter { ConfigGeneration = 1 };
+        var coordinator = new TelemetryPollingCoordinator(adapter, TimeSpan.FromSeconds(10), autoRouter);
+
+        bool result = coordinator.UpdateInterval(TimeSpan.FromSeconds(25), 2);
+
+        Assert.True(result);
+        Assert.Equal(TimeSpan.FromSeconds(25), coordinator.Interval);
+        Assert.Equal(2, coordinator.LastAppliedConfigGeneration);
+    }
+
+    [Fact]
+    public void UpdateInterval_WithOlderGeneration_RejectsAndLogs()
+    {
+        var logs = new List<string>();
+        var adapter = new MockAG2Adapter();
+        var autoRouter = new MockAutoRouter { ConfigGeneration = 5 };
+        var coordinator = new TelemetryPollingCoordinator(adapter, TimeSpan.FromSeconds(30), autoRouter, log: logs.Add);
+
+        bool result = coordinator.UpdateInterval(TimeSpan.FromSeconds(5), 4);
+
+        Assert.False(result);
+        Assert.Equal(TimeSpan.FromSeconds(30), coordinator.Interval);
+        Assert.Equal(5, coordinator.LastAppliedConfigGeneration);
+        Assert.Single(logs);
+        Assert.Contains("generation 4 is older than last applied generation 5", logs[0]);
+    }
+
+    [Fact]
+    public void UpdateInterval_WithZeroOrNegativeInterval_ReturnsFalse()
+    {
+        var adapter = new MockAG2Adapter();
+        var coordinator = new TelemetryPollingCoordinator(adapter, TimeSpan.FromSeconds(10));
+
+        Assert.False(coordinator.UpdateInterval(TimeSpan.Zero, 1));
+        Assert.False(coordinator.UpdateInterval(TimeSpan.FromSeconds(-5), 1));
+        Assert.Equal(TimeSpan.FromSeconds(10), coordinator.Interval);
+        Assert.Equal(0, coordinator.LastAppliedConfigGeneration);
+    }
+
+    [Fact]
+    public void UpdateInterval_WithGenerationZero_UpdatesIntervalWithoutChangingGeneration()
+    {
+        var adapter = new MockAG2Adapter();
+        var autoRouter = new MockAutoRouter { ConfigGeneration = 3 };
+        var coordinator = new TelemetryPollingCoordinator(adapter, TimeSpan.FromSeconds(10), autoRouter);
+
+        coordinator.UpdateInterval(TimeSpan.FromSeconds(20));
+        Assert.Equal(TimeSpan.FromSeconds(20), coordinator.Interval);
+        Assert.Equal(3, coordinator.LastAppliedConfigGeneration);
+
+        bool result = coordinator.UpdateInterval(TimeSpan.FromSeconds(25), 0);
+        Assert.True(result);
+        Assert.Equal(TimeSpan.FromSeconds(25), coordinator.Interval);
+        Assert.Equal(3, coordinator.LastAppliedConfigGeneration);
     }
 }

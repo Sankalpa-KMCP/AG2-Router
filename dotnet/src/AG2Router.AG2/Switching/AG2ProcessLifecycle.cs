@@ -28,10 +28,16 @@ public interface IAG2ProcessLifecycle
 {
     Task<AG2ProcessSnapshot> CaptureVerifiedAsync(CancellationToken cancellationToken = default);
     Task RevalidateAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Invokes the final proof before process-handle refresh. onStopAttempted precedes
+    /// Kill; onStopIssued follows a successful Kill call and precedes waiting for exit.
+    /// A failure may omit onStopIssued, so callers must also release ownership in finally.
+    /// </summary>
     Task StopVerifiedAsync(AG2ProcessSnapshot snapshot, TimeSpan timeout,
         CancellationToken cancellationToken = default,
         Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
-        Action? onStopAttempted = null);
+        Action? onStopAttempted = null,
+        Action? onStopIssued = null);
     Task<AG2ProcessGeneration> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default);
     Task<AG2ProcessGeneration> WaitForHealthyReplacementAsync(
         AG2ProcessSnapshot original,
@@ -139,15 +145,25 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         }
     }
 
+    /// <summary>
+    /// Safely terminates the verified Antigravity process instance (R02).
+    /// </summary>
+    /// <param name="snapshot">Cryptographically and provenance-verified process snapshot.</param>
+    /// <param name="timeout">Maximum time to wait for the process to exit after kill signal.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="verifyBeforeKillAsync">Final verification callback executed under process-handle validation before kill.</param>
+    /// <param name="onStopAttempted">Notification callback invoked immediately prior to issuing the Kill command.</param>
+    /// <param name="onStopIssued">Notification callback invoked immediately after issuing the Kill command (releases interruption admission).</param>
     public async Task StopVerifiedAsync(
         AG2ProcessSnapshot snapshot,
         TimeSpan timeout,
         CancellationToken cancellationToken = default,
         Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
-        Action? onStopAttempted = null)
+        Action? onStopAttempted = null,
+        Action? onStopIssued = null)
     {
         await StopExactAsync(snapshot, timeout, requireTelemetryBinding: true, cancellationToken,
-                verifyBeforeKillAsync, onStopAttempted)
+                verifyBeforeKillAsync, onStopAttempted, onStopIssued)
             .ConfigureAwait(false);
     }
 
@@ -157,7 +173,8 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
         bool requireTelemetryBinding,
         CancellationToken cancellationToken,
         Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
-        Action? onStopAttempted = null)
+        Action? onStopAttempted = null,
+        Action? onStopIssued = null)
     {
         try
         {
@@ -189,6 +206,8 @@ public sealed class WindowsAG2ProcessLifecycle : IAG2ProcessLifecycle
             // process-handle revalidation have both finished before notifying the caller.
             onStopAttempted?.Invoke();
             process.Kill(entireProcessTree: false);
+            // Admission protects proof-to-interruption, not the potentially slow exit wait.
+            onStopIssued?.Invoke();
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeoutCts.CancelAfter(timeout);
             await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);

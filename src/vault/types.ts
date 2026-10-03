@@ -60,3 +60,5 @@ export class VaultError extends Error {
     this.name = 'VaultError';
   }
 }
+
+export class VaultMutationUncertainError extends VaultError {}

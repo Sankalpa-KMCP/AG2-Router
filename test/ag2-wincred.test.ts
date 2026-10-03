@@ -27,11 +27,19 @@ describe('AG2WinCredReader (Read-Only Windows Credential Manager)', () => {
     );
   });
 
-  it('should return null when reading a non-existent target', { skip: process.platform !== 'win32' ? 'Windows Credential Manager is only supported on Windows' : false }, async () => {
-    const reader = new AG2WinCredReader();
+  it('should return null when reading a synthetic non-existent target', async () => {
+    class AbsentWinCredReader extends AG2WinCredReader {
+      public requestedTarget: string | null = null;
+      protected override async runPowerShellWithStdin(_script: string, target: string): Promise<string> {
+        this.requestedTarget = target;
+        return '{"exists":false}';
+      }
+    }
+    const reader = new AbsentWinCredReader();
     const nonExistentTarget = 'ag2_test_non_existent_target_xyz_12345';
     const result = await reader.readCredential(nonExistentTarget);
     assert.strictEqual(result, null);
+    assert.strictEqual(reader.requestedTarget, nonExistentTarget);
   });
 
   it('should read live gemini:antigravity if explicitly authorized', {

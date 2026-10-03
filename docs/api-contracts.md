@@ -11,6 +11,7 @@ Source and tests remain authoritative. The intended contract below is separated 
 - JSON uses ASP.NET web defaults: public C# record properties serialize as camelCase unless JsonPropertyName specifies otherwise.
 - API responses are not cacheable. Common response headers include X-Content-Type-Options: nosniff, X-Frame-Options: DENY, and Cache-Control: no-store.
 - Error bodies generally use { "error": "safe message" }. Callers must also use the HTTP status; error text is not a stable machine code.
+- API browser mutation endpoints reject foreign Origin and Sec-Fetch-Site: cross-site before body parsing or state mutation. A missing Origin remains accepted for same-user native clients.
 - DTO additions may be tolerated by JavaScript, but renames, type changes, nullability changes, and enum/result-code changes are wire-contract changes.
 - Non-finite quota fractions are emitted as null (unknown) at the status boundary, never as invalid JSON or an endpoint error; observed zero remains zero.
 - Numeric integer wire representation: Clients should transmit `PollingIntervalMs` as a JSON numeric integer. The .NET JSON binding path strictly requires integer numeric JSON representation and rejects fractional numeric tokens, including lexical forms such as `1.0`. The JavaScript reference operates after JSON parsing, where `1` and `1.0` collapse to the identical value. Although the ASP.NET Core web-default binder tolerates quoted integer strings such as `"1"`, that coercion is non-normative and not accepted by the TypeScript reference.
@@ -54,7 +55,7 @@ The following C# records define the backend serialization surface:
 
 Account objects must not expose credential blobs, DPAPI ciphertext, WinCred payloads, RPC tokens, or raw process command lines.
 
-AccountMetadata uses lastActiveAt on both backend wire and frontend type. Canonical quota rows expose canonicalKey and displayLabel aliases alongside key and label; frontend consumption accepts those wire fields. NativeSwitchResult.code is a string.
+AccountMetadata uses lastActiveAt on both backend wire and frontend type. Both .NET and Node backends serialize canonicalKey and displayLabel aliases alongside key and label on canonicalModels; frontend consumption accepts those wire fields. NativeSwitchResult.code is a string.
 
 ### Routing configuration and candidate status
 

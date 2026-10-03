@@ -26,6 +26,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
     private Task? _pollTask;
     private long _pollSequence;
     private long _lastAppliedSequence;
+    private long _lastAppliedConfigGeneration;
     private SystemStatusDto _currentStatus;
 
     public event Action<SystemStatusDto>? StatusUpdated;
@@ -47,6 +48,10 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         _interval = interval ?? TimeSpan.FromSeconds(10);
         _autoRouter = autoRouter;
         _log = log;
+        if (_autoRouter != null)
+        {
+            _lastAppliedConfigGeneration = _autoRouter.ConfigGeneration;
+        }
 
         _currentStatus = new SystemStatusDto(
             Status: "ok",
@@ -70,11 +75,57 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         );
     }
 
-    public void UpdateInterval(TimeSpan newInterval)
+    public TimeSpan Interval
     {
-        if (newInterval <= TimeSpan.Zero) return;
+        get
+        {
+            lock (_stateLock)
+            {
+                return _interval;
+            }
+        }
+    }
+
+    public long LastAppliedConfigGeneration
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _lastAppliedConfigGeneration;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Updates the polling interval with monotonic configuration generation tracking (R05).
+    /// </summary>
+    /// <param name="newInterval">The new periodic polling interval.</param>
+    /// <param name="generation">The configuration generation associated with this interval update (0 for generation-less calls).</param>
+    /// <returns><c>true</c> if the interval was applied; <c>false</c> if rejected as stale or invalid.</returns>
+    /// <remarks>
+    /// <para>
+    /// <b>Stale Update Suppression:</b>
+    /// When <paramref name="generation"/> &gt; 0, any update with a generation strictly less than
+    /// <see cref="_lastAppliedConfigGeneration"/> is rejected. This prevents race conditions where
+    /// an older slow configuration write overwrites a newer configuration update's polling interval.
+    /// </para>
+    /// </remarks>
+    public bool UpdateInterval(TimeSpan newInterval, long generation = 0)
+    {
         lock (_stateLock)
         {
+            if (newInterval <= TimeSpan.Zero) return false;
+            if (generation > 0)
+            {
+                if (generation < _lastAppliedConfigGeneration)
+                {
+                    _log?.Invoke($"Rejected stale polling interval update: generation {generation} is older than last applied generation {_lastAppliedConfigGeneration}.");
+                    return false;
+                }
+                _lastAppliedConfigGeneration = generation;
+            }
+
             _interval = newInterval;
             if (_timer != null)
             {
@@ -84,8 +135,11 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 }
                 catch { }
             }
+            return true;
         }
     }
+
+    public void UpdateInterval(TimeSpan newInterval) => UpdateInterval(newInterval, 0);
 
     public SystemStatusDto CurrentStatus => Volatile.Read(ref _currentStatus);
 

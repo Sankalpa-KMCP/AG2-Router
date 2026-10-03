@@ -6,11 +6,15 @@ import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as http from 'node:http';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
 import { InMemoryAccountStore } from '../src/accounts/account-store.js';
+import { AccountEnrollmentService } from '../src/accounts/enrollment.js';
 import { AG2AdapterFoundation } from '../src/ag2/adapter.js';
 import { normalizeQuotaSnapshot, type RawUserStatusResponse } from '../src/ag2/normalizer.js';
 import { AppConfig } from '../src/config/config.js';
 import { QuotaRouter } from '../src/router/router.js';
+import { SessionVault } from '../src/vault/session-vault.js';
 import { AppServer } from '../src/server/server.js';
 
 describe('AppServer (Loopback HTTP & API)', () => {
@@ -780,6 +784,8 @@ describe('AppServer (Loopback HTTP & API)', () => {
       assert.equal(quota.canonicalModels.length, 1);
       assert.equal(quota.canonicalModels[0].key, 'tier:gemini-2.5-pro');
       assert.equal(quota.canonicalModels[0].label, 'Gemini 2.5 Pro');
+      assert.equal(quota.canonicalModels[0].canonicalKey, 'tier:gemini-2.5-pro');
+      assert.equal(quota.canonicalModels[0].displayLabel, 'Gemini 2.5 Pro');
       assert.deepEqual(quota.canonicalModels[0].modes, ['Standard', 'Thinking']);
       assert.equal(quota.promptCredits.availableCredits, 1000);
       assert.equal(quota.flowCredits.availableCredits, 200);
@@ -828,5 +834,639 @@ describe('AppServer (Loopback HTTP & API)', () => {
     } finally {
       await quotaServer.stop();
     }
+  });
+});
+
+describe('R04: Central Loopback HTTP Mutation Origin & Fetch-Context Security Boundary', () => {
+  const r04Port = 39330;
+  const enrollPort = 39331;
+
+  function makeRequest(
+    port: number,
+    urlPath: string,
+    options: {
+      method?: string;
+      headers?: http.OutgoingHttpHeaders;
+      body?: string;
+    } = {}
+  ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+    return new Promise((resolve, reject) => {
+      const headers: http.OutgoingHttpHeaders = { ...options.headers };
+      if (!headers['connection'] && !headers['Connection']) {
+        headers['Connection'] = 'close';
+      }
+      if (options.body !== undefined && !headers['content-length'] && !headers['Content-Length']) {
+        headers['Content-Length'] = Buffer.byteLength(options.body);
+      }
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: urlPath,
+          method: options.method || 'GET',
+          headers
+        },
+        (res) => {
+          let body = '';
+          res.on('data', (chunk) => (body += chunk));
+          res.on('end', () => {
+            resolve({
+              status: res.statusCode || 0,
+              headers: res.headers,
+              body
+            });
+          });
+        }
+      );
+      req.on('error', reject);
+      if (options.body !== undefined) {
+        req.write(options.body);
+      }
+      req.end();
+    });
+  }
+
+  describe('Enrollment Mutation Endpoint Security', () => {
+    let enrollServer: AppServer;
+    let tempVaultDir: string;
+    let testStore: InMemoryAccountStore;
+    let testVault: SessionVault;
+    let enrollService: AccountEnrollmentService;
+
+    const mockAdapter = {
+      discover: async () => ({ isRunning: true, status: 'HEALTHY' as const, processInfo: null }),
+      getCurrentAccount: async () => ({ email: 'enroll-sec@example.com', name: 'Enroll Sec User' }),
+      getQuota: async () => null,
+      getActivityState: async () => ({ state: 'IDLE' as const, totalTrajectories: 0, runningTrajectories: 0, timestamp: '' }),
+      verifyAccount: async () => true,
+      switchAccount: async () => { throw new Error('Not implemented'); }
+    };
+
+    const mockWincred = {
+      readCredential: async () => ({
+        target: 'gemini:antigravity',
+        type: 1,
+        userName: 'antigravity',
+        persistence: 2,
+        blob: Buffer.from(JSON.stringify({ token: 'sec-enroll-token' }), 'utf8')
+      })
+    };
+
+    const mockDpapi = {
+      encrypt: async (b: Buffer) => Buffer.concat([Buffer.from('ENC:'), b]),
+      decrypt: async (b: Buffer) => Buffer.from(b.subarray(4))
+    };
+
+    before(async () => {
+      tempVaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag2-r04-vault-'));
+      testVault = new SessionVault({ vaultDir: tempVaultDir, dpapiProvider: mockDpapi });
+      testStore = new InMemoryAccountStore();
+      enrollService = new AccountEnrollmentService({
+        adapter: mockAdapter,
+        wincredReader: mockWincred,
+        sessionVault: testVault,
+        accountStore: testStore
+      });
+      const router = new QuotaRouter(testStore, mockAdapter, {
+        autoSwitchEnabled: false,
+        lowQuotaThresholdPercent: 15,
+        minimumCandidateQuotaPercent: 30,
+        pollingIntervalMs: 10000
+      });
+      enrollServer = new AppServer(
+        {
+          host: '127.0.0.1',
+          port: enrollPort,
+          storageDir: tempVaultDir,
+          uiDir: path.resolve('src', 'ui'),
+          router: {
+            autoSwitchEnabled: false,
+            lowQuotaThresholdPercent: 15,
+            minimumCandidateQuotaPercent: 30,
+            pollingIntervalMs: 10000
+          },
+          isDev: true
+        },
+        testStore,
+        mockAdapter,
+        router,
+        enrollService,
+        testVault
+      );
+      await enrollServer.start();
+    });
+
+    after(async () => {
+      await enrollServer.stop();
+      fs.rmSync(tempVaultDir, { recursive: true, force: true });
+    });
+
+    it('1. allowed local/same-origin browser enrollment request succeeds normally', async () => {
+      const res = await makeRequest(enrollPort, '/api/accounts/enroll-current', {
+        method: 'POST',
+        headers: {
+          Origin: `http://127.0.0.1:${enrollPort}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ priority: 1, notes: 'same-origin browser' })
+      });
+      assert.equal(res.status, 200);
+      const data = JSON.parse(res.body);
+      assert.equal(data.success, true);
+      assert.equal(data.account.email, 'enroll-sec@example.com');
+      assert.equal(data.account.hasVaultedSession, true);
+    });
+
+    it('2. legitimate native enrollment request with no Origin succeeds according to contract', async () => {
+      const res = await makeRequest(enrollPort, '/api/accounts/enroll-current', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ priority: 2, notes: 'native client' })
+      });
+      assert.equal(res.status, 200);
+      const data = JSON.parse(res.body);
+      assert.equal(data.success, true);
+      assert.equal(data.account.email, 'enroll-sec@example.com');
+    });
+
+    it('3. foreign Origin POST enrollment is rejected with 403 Unauthorized origin', async () => {
+      const res = await makeRequest(enrollPort, '/api/accounts/enroll-current', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://malicious-website.com',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ priority: 5, notes: 'attacker payload' })
+      });
+      assert.equal(res.status, 403);
+      const data = JSON.parse(res.body);
+      assert.equal(data.error, 'Unauthorized origin.');
+    });
+
+    it('4. cross-site fetch-context POST enrollment is rejected with 403 Cross-site requests forbidden', async () => {
+      const res = await makeRequest(enrollPort, '/api/accounts/enroll-current', {
+        method: 'POST',
+        headers: {
+          'Sec-Fetch-Site': 'cross-site',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ priority: 5, notes: 'cross site payload' })
+      });
+      assert.equal(res.status, 403);
+      const data = JSON.parse(res.body);
+      assert.equal(data.error, 'Cross-site requests forbidden.');
+    });
+
+    it('5. foreign request produces zero enrollment side effects', async () => {
+      const accountsBefore = await testStore.listAccounts();
+      const countBefore = accountsBefore.length;
+
+      const res = await makeRequest(enrollPort, '/api/accounts/enroll-current', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://evil.com',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ priority: 99, notes: 'side effect probe' })
+      });
+      assert.equal(res.status, 403);
+
+      const accountsAfter = await testStore.listAccounts();
+      assert.equal(accountsAfter.length, countBefore, 'Account store count must not change on rejected foreign request');
+      assert.deepEqual(accountsAfter.map(a => a.id), accountsBefore.map(a => a.id));
+    });
+
+    it('6. empty-body enrollment cannot bypass origin or fetch-context boundary', async () => {
+      // Empty body with foreign origin
+      const resOrigin = await makeRequest(enrollPort, '/api/accounts/enroll-current', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://attacker.example.com'
+        },
+        body: ''
+      });
+      assert.equal(resOrigin.status, 403);
+      assert.equal(JSON.parse(resOrigin.body).error, 'Unauthorized origin.');
+
+      // Empty body with cross-site fetch context
+      const resFetchSite = await makeRequest(enrollPort, '/api/accounts/enroll-current', {
+        method: 'POST',
+        headers: {
+          'Sec-Fetch-Site': 'cross-site'
+        },
+        body: ''
+      });
+      assert.equal(resFetchSite.status, 403);
+      assert.equal(JSON.parse(resFetchSite.body).error, 'Cross-site requests forbidden.');
+    });
+  });
+
+  describe('Central Mutation Security for Configuration, Accounts, and Edge Cases', () => {
+    let mainServer: AppServer;
+    let store: InMemoryAccountStore;
+    let adapter: AG2AdapterFoundation;
+    let router: QuotaRouter;
+
+    before(async () => {
+      store = new InMemoryAccountStore();
+      adapter = new AG2AdapterFoundation();
+      router = new QuotaRouter(store, adapter, {
+        autoSwitchEnabled: false,
+        lowQuotaThresholdPercent: 15,
+        minimumCandidateQuotaPercent: 30,
+        pollingIntervalMs: 10000
+      });
+      mainServer = new AppServer(
+        {
+          host: '127.0.0.1',
+          port: r04Port,
+          storageDir: path.resolve('data'),
+          uiDir: path.resolve('src', 'ui'),
+          router: {
+            autoSwitchEnabled: false,
+            lowQuotaThresholdPercent: 15,
+            minimumCandidateQuotaPercent: 30,
+            pollingIntervalMs: 10000
+          },
+          isDev: true
+        },
+        store,
+        adapter,
+        router
+      );
+      await mainServer.start();
+    });
+
+    after(async () => {
+      await mainServer.stop();
+    });
+
+    // --- Configuration Tests ---
+    it('configuration: allowed mutation works with same-origin header', async () => {
+      const res = await makeRequest(r04Port, '/api/config', {
+        method: 'POST',
+        headers: {
+          Origin: `http://127.0.0.1:${r04Port}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ autoSwitchEnabled: true, lowQuotaThresholdPercent: 25 })
+      });
+      assert.equal(res.status, 200);
+      const data = JSON.parse(res.body);
+      assert.equal(data.config.autoSwitchEnabled, true);
+      assert.equal(data.config.lowQuotaThresholdPercent, 25);
+    });
+
+    it('configuration: foreign Origin JSON request rejected with 403', async () => {
+      const res = await makeRequest(r04Port, '/api/config', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://malicious.org',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ autoSwitchEnabled: false, lowQuotaThresholdPercent: 10 })
+      });
+      assert.equal(res.status, 403);
+      assert.equal(JSON.parse(res.body).error, 'Unauthorized origin.');
+    });
+
+    it('configuration: foreign Origin text/plain simple POST rejected before mutation (403)', async () => {
+      const res = await makeRequest(r04Port, '/api/config', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://malicious.org',
+          'Content-Type': 'text/plain'
+        },
+        body: JSON.stringify({ autoSwitchEnabled: false, lowQuotaThresholdPercent: 10 })
+      });
+      assert.equal(res.status, 403);
+      assert.equal(JSON.parse(res.body).error, 'Unauthorized origin.');
+    });
+
+    it('configuration: cross-site fetch context rejected with 403', async () => {
+      const res = await makeRequest(r04Port, '/api/config', {
+        method: 'POST',
+        headers: {
+          'Sec-Fetch-Site': 'cross-site',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ autoSwitchEnabled: false, lowQuotaThresholdPercent: 10 })
+      });
+      assert.equal(res.status, 403);
+      assert.equal(JSON.parse(res.body).error, 'Cross-site requests forbidden.');
+    });
+
+    it('configuration: durable configuration remains unchanged after rejection', async () => {
+      const res = await makeRequest(r04Port, '/api/config');
+      assert.equal(res.status, 200);
+      const cfg = JSON.parse(res.body).config;
+      assert.equal(cfg.autoSwitchEnabled, true, 'autoSwitchEnabled must remain true');
+      assert.equal(cfg.lowQuotaThresholdPercent, 25, 'lowQuotaThresholdPercent must remain 25');
+    });
+
+    // --- Existing Account Mutation Endpoints ---
+    it('accounts CRUD: POST, PATCH, and DELETE still enforce foreign Origin and Sec-Fetch-Site', async () => {
+      // 1. POST /api/accounts rejects foreign Origin
+      const postForeign = await makeRequest(r04Port, '/api/accounts', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://evil.com',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ email: 'attacker@evil.com' })
+      });
+      assert.equal(postForeign.status, 403);
+      assert.equal(JSON.parse(postForeign.body).error, 'Unauthorized origin.');
+
+      // 2. POST /api/accounts rejects cross-site
+      const postCross = await makeRequest(r04Port, '/api/accounts', {
+        method: 'POST',
+        headers: {
+          'Sec-Fetch-Site': 'cross-site',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ email: 'cross@evil.com' })
+      });
+      assert.equal(postCross.status, 403);
+      assert.equal(JSON.parse(postCross.body).error, 'Cross-site requests forbidden.');
+
+      // Create an account legitimately via native request
+      const created = await store.addAccount({ email: 'sec-target@example.com', name: 'Sec Target' });
+
+      // 3. PATCH /api/accounts/:id rejects foreign Origin
+      const patchForeign = await makeRequest(r04Port, `/api/accounts/${created.id}`, {
+        method: 'PATCH',
+        headers: {
+          Origin: 'http://evil.com',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ alias: 'Hacked Alias' })
+      });
+      assert.equal(patchForeign.status, 403);
+      assert.equal(JSON.parse(patchForeign.body).error, 'Unauthorized origin.');
+
+      // 4. PATCH /api/accounts/:id rejects cross-site
+      const patchCross = await makeRequest(r04Port, `/api/accounts/${created.id}`, {
+        method: 'PATCH',
+        headers: {
+          'Sec-Fetch-Site': 'cross-site',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ alias: 'Cross Alias' })
+      });
+      assert.equal(patchCross.status, 403);
+      assert.equal(JSON.parse(patchCross.body).error, 'Cross-site requests forbidden.');
+
+      // Verify alias untouched
+      const accountCheck = await store.getAccount(created.id);
+      assert.equal(accountCheck?.alias, undefined);
+
+      // 5. DELETE /api/accounts/:id rejects foreign Origin
+      const deleteForeign = await makeRequest(r04Port, `/api/accounts/${created.id}`, {
+        method: 'DELETE',
+        headers: {
+          Origin: 'http://evil.com'
+        }
+      });
+      assert.equal(deleteForeign.status, 403);
+      assert.equal(JSON.parse(deleteForeign.body).error, 'Unauthorized origin.');
+
+      // 6. DELETE /api/accounts/:id rejects cross-site
+      const deleteCross = await makeRequest(r04Port, `/api/accounts/${created.id}`, {
+        method: 'DELETE',
+        headers: {
+          'Sec-Fetch-Site': 'cross-site'
+        }
+      });
+      assert.equal(deleteCross.status, 403);
+      assert.equal(JSON.parse(deleteCross.body).error, 'Cross-site requests forbidden.');
+
+      // Clean up account legitimately
+      const deleteValid = await makeRequest(r04Port, `/api/accounts/${created.id}`, {
+        method: 'DELETE'
+      });
+      assert.equal(deleteValid.status, 200);
+    });
+
+    // --- Bypass / Edge Case Audits ---
+    it('edge cases: missing Origin is accepted for native clients', async () => {
+      const res = await makeRequest(r04Port, '/api/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ lowQuotaThresholdPercent: 18 })
+      });
+      assert.equal(res.status, 200);
+      assert.equal(JSON.parse(res.body).config.lowQuotaThresholdPercent, 18);
+    });
+
+    it('edge cases: Origin: null is rejected as foreign across mutation routes', async () => {
+      const endpoints = [
+        { method: 'POST', path: '/api/config', body: JSON.stringify({ lowQuotaThresholdPercent: 20 }) },
+        { method: 'POST', path: '/api/accounts', body: JSON.stringify({ email: 'null-origin@example.com' }) },
+        { method: 'POST', path: '/api/accounts/enroll-current', body: '{}' },
+        { method: 'PATCH', path: '/api/accounts/dummy_id', body: JSON.stringify({ alias: 'Test' }) },
+        { method: 'DELETE', path: '/api/accounts/dummy_id' }
+      ];
+
+      for (const ep of endpoints) {
+        const res = await makeRequest(r04Port, ep.path, {
+          method: ep.method,
+          headers: {
+            Origin: 'null',
+            'Content-Type': 'application/json'
+          },
+          body: ep.body
+        });
+        assert.equal(res.status, 403, `Expected 403 for ${ep.method} ${ep.path} with Origin: null`);
+        assert.equal(JSON.parse(res.body).error, 'Unauthorized origin.');
+      }
+    });
+
+    it('edge cases: method casing (post, Post, patch, delete) enforces security boundary', async () => {
+      // Lowercase 'post'
+      const resPostLower = await makeRequest(r04Port, '/api/config', {
+        method: 'post',
+        headers: {
+          Origin: 'http://attacker.org',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ lowQuotaThresholdPercent: 30 })
+      });
+      assert.equal(resPostLower.status, 403);
+      assert.equal(JSON.parse(resPostLower.body).error, 'Unauthorized origin.');
+
+      // Mixed case 'Post'
+      const resPostMixed = await makeRequest(r04Port, '/api/config', {
+        method: 'Post',
+        headers: {
+          Origin: 'http://attacker.org',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ lowQuotaThresholdPercent: 30 })
+      });
+      assert.equal(resPostMixed.status, 403);
+      assert.equal(JSON.parse(resPostMixed.body).error, 'Unauthorized origin.');
+
+      // Lowercase 'patch'
+      const resPatchLower = await makeRequest(r04Port, '/api/accounts/test', {
+        method: 'patch',
+        headers: {
+          Origin: 'http://attacker.org',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ alias: 'hack' })
+      });
+      assert.equal(resPatchLower.status, 403);
+      assert.equal(JSON.parse(resPatchLower.body).error, 'Unauthorized origin.');
+
+      // Lowercase 'delete'
+      const resDeleteLower = await makeRequest(r04Port, '/api/accounts/test', {
+        method: 'delete',
+        headers: {
+          Origin: 'http://attacker.org'
+        }
+      });
+      assert.equal(resDeleteLower.status, 403);
+      assert.equal(JSON.parse(resDeleteLower.body).error, 'Unauthorized origin.');
+    });
+
+    it('edge cases: query strings on mutation endpoints cannot bypass security boundary', async () => {
+      const resForeign = await makeRequest(r04Port, '/api/config?test=1&debug=true', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://attacker.org',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ lowQuotaThresholdPercent: 40 })
+      });
+      assert.equal(resForeign.status, 403);
+      assert.equal(JSON.parse(resForeign.body).error, 'Unauthorized origin.');
+
+      const resCross = await makeRequest(r04Port, '/api/config?test=1&debug=true', {
+        method: 'POST',
+        headers: {
+          'Sec-Fetch-Site': 'cross-site',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ lowQuotaThresholdPercent: 40 })
+      });
+      assert.equal(resCross.status, 403);
+      assert.equal(JSON.parse(resCross.body).error, 'Cross-site requests forbidden.');
+
+      // Allowed mutation with query string works
+      const resAllowed = await makeRequest(r04Port, '/api/config?param=ok', {
+        method: 'POST',
+        headers: {
+          Origin: `http://127.0.0.1:${r04Port}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ lowQuotaThresholdPercent: 19 })
+      });
+      assert.equal(resAllowed.status, 200);
+      assert.equal(JSON.parse(resAllowed.body).config.lowQuotaThresholdPercent, 19);
+    });
+
+    it('edge cases: trailing slashes on mutation endpoints reject foreign Origin and cross-site requests', async () => {
+      const slashEndpoints = [
+        { method: 'POST', path: '/api/config/' },
+        { method: 'POST', path: '/api/accounts/' },
+        { method: 'POST', path: '/api/accounts/enroll-current/' },
+        { method: 'PATCH', path: '/api/accounts/dummy/' },
+        { method: 'DELETE', path: '/api/accounts/dummy/' }
+      ];
+
+      for (const ep of slashEndpoints) {
+        const resForeign = await makeRequest(r04Port, ep.path, {
+          method: ep.method,
+          headers: {
+            Origin: 'http://evil.com',
+            'Content-Type': 'application/json'
+          },
+          body: '{}'
+        });
+        assert.equal(resForeign.status, 403, `Expected 403 for ${ep.method} ${ep.path} with foreign Origin`);
+        assert.equal(JSON.parse(resForeign.body).error, 'Unauthorized origin.');
+
+        const resCross = await makeRequest(r04Port, ep.path, {
+          method: ep.method,
+          headers: {
+            'Sec-Fetch-Site': 'cross-site',
+            'Content-Type': 'application/json'
+          },
+          body: '{}'
+        });
+        assert.equal(resCross.status, 403, `Expected 403 for ${ep.method} ${ep.path} with Sec-Fetch-Site: cross-site`);
+        assert.equal(JSON.parse(resCross.body).error, 'Cross-site requests forbidden.');
+      }
+    });
+
+    it('read-only routes: GET endpoints remain accessible regardless of Origin', async () => {
+      const getEndpoints = ['/api/status', '/api/accounts', '/api/switching/status', '/api/config'];
+      for (const ep of getEndpoints) {
+        const res = await makeRequest(r04Port, ep, {
+          method: 'GET',
+          headers: {
+            Origin: 'http://any-site.org'
+          }
+        });
+        assert.equal(res.status, 200, `Expected 200 for GET ${ep}`);
+      }
+    });
+
+    it('behavioral audit: boundary enforces BEFORE reading or parsing request body', async () => {
+      const malformedPayload = '{"malformed_json: true, invalid...';
+
+      // 1. Foreign origin + malformed body returns 403 (NOT 400 Bad Request)
+      const resConfigOrigin = await makeRequest(r04Port, '/api/config', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://evil.com',
+          'Content-Type': 'application/json'
+        },
+        body: malformedPayload
+      });
+      assert.equal(resConfigOrigin.status, 403, 'Must return 403 before reading malformed JSON body');
+      assert.equal(JSON.parse(resConfigOrigin.body).error, 'Unauthorized origin.');
+
+      // 2. Cross-site fetch context + malformed body returns 403 (NOT 400 Bad Request)
+      const resConfigCross = await makeRequest(r04Port, '/api/config', {
+        method: 'POST',
+        headers: {
+          'Sec-Fetch-Site': 'cross-site',
+          'Content-Type': 'application/json'
+        },
+        body: malformedPayload
+      });
+      assert.equal(resConfigCross.status, 403, 'Must return 403 before reading malformed JSON body');
+      assert.equal(JSON.parse(resConfigCross.body).error, 'Cross-site requests forbidden.');
+
+      // 3. POST /api/accounts with malformed body returns 403
+      const resAccountsOrigin = await makeRequest(r04Port, '/api/accounts', {
+        method: 'POST',
+        headers: {
+          Origin: 'http://evil.com',
+          'Content-Type': 'application/json'
+        },
+        body: malformedPayload
+      });
+      assert.equal(resAccountsOrigin.status, 403);
+      assert.equal(JSON.parse(resAccountsOrigin.body).error, 'Unauthorized origin.');
+
+      // 4. PATCH /api/accounts/:id with malformed body returns 403
+      const resPatchOrigin = await makeRequest(r04Port, '/api/accounts/any_id', {
+        method: 'PATCH',
+        headers: {
+          Origin: 'http://evil.com',
+          'Content-Type': 'application/json'
+        },
+        body: malformedPayload
+      });
+      assert.equal(resPatchOrigin.status, 403);
+      assert.equal(JSON.parse(resPatchOrigin.body).error, 'Unauthorized origin.');
+    });
   });
 });

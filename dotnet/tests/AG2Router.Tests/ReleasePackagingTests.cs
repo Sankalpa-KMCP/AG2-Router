@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.IO;
-using System.Text;
 using System.Text.RegularExpressions;
 using AG2Router.Windows.Lifecycle;
 using Xunit;
@@ -678,80 +677,21 @@ public class ReleasePackagingTests
     [InlineData(true)]
     public async Task PowerShellUninstall_ProcessQueryFailureAbortsBeforeDestructiveContinuation(bool failAfterExit)
     {
-        string script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "scripts", "uninstall.ps1"));
-        string stopFunctions = script.Split("# 2. Graceful Process Shutdown via Named Mutex and Process Check")[1]
-            .Split("Assert-AG2RouterStopped -InstalledExe $ExePath")[0];
-        string scenario = failAfterExit ? "post" : "pre";
-        string command = $$"""
-            $ErrorActionPreference = 'Stop'
-            $script:destructiveCalls = 0
-            function Remove-Item { $script:destructiveCalls++ }
-            {{stopFunctions}}
-            $script:queries = 0
-            $script:exitCalls = 0
-            function Get-Process {
-                param([string]$ErrorAction)
-                $script:queries++
-                [Console]::Error.WriteLine('phase: process query ' + $script:queries)
-                if ('{{scenario}}' -eq 'post' -and $script:queries -eq 1) {
-                    return [pscustomobject]@{ ProcessName = 'AG2Router' }
-                }
-                throw 'Synthetic process query failure'
-            }
-            function Get-AG2RouterMutexState { return 'STOPPED' }
-            function Invoke-AG2RouterExitRequest {
-                param([string]$InstalledExe)
-                $script:exitCalls++
-                [Console]::Error.WriteLine('phase: exit request')
-            }
-            $caught = $false
-            try {
-                Assert-AG2RouterStopped -InstalledExe 'X:\synthetic\AG2Router.exe'
-                Remove-Item 'X:\synthetic\programs'
-            } catch {
-                $caught = $true
-                if ($_.Exception.Message -notmatch 'process state.*(could not be verified|became unknown)') { exit 2 }
-            }
-            if (-not $caught -or $script:destructiveCalls -ne 0) { exit 3 }
-            if ('{{scenario}}' -eq 'post') {
-                if ($script:queries -ne 2 -or $script:exitCalls -ne 1) { exit 4 }
-            } elseif ($script:queries -ne 1 -or $script:exitCalls -ne 0) { exit 5 }
-            exit 0
-            """;
-
-        var start = new ProcessStartInfo("powershell.exe")
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        start.ArgumentList.Add("-NoProfile");
-        start.ArgumentList.Add("-NonInteractive");
-        start.ArgumentList.Add("-EncodedCommand");
-        start.ArgumentList.Add(Convert.ToBase64String(Encoding.Unicode.GetBytes(command)));
-        using var child = Process.Start(start) ?? throw new InvalidOperationException("PowerShell test process did not start.");
-        Task<string> standardOutput = child.StandardOutput.ReadToEndAsync();
-        Task<string> standardError = child.StandardError.ReadToEndAsync();
-        try
-        {
-            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
-        }
-        catch (TimeoutException)
-        {
-            if (!child.HasExited)
-            {
-                try { child.Kill(entireProcessTree: true); }
-                catch (InvalidOperationException) { }
-            }
-            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
-            throw new TimeoutException(
-                $"Synthetic uninstall safety check did not complete. stdout: {await standardOutput} stderr: {await standardError}");
-        }
-        string output = await standardOutput;
-        string error = await standardError;
-        Assert.True(child.ExitCode == 0,
-            $"Synthetic {scenario} query failure exited {child.ExitCode}: {output} {error}");
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        string sequence = failAfterExit
+            ? "$global:AG2Synthetic.ProcessStates.Enqueue('RUNNING'); $global:AG2Synthetic.ProcessStates.Enqueue('UNKNOWN')"
+            : "$global:AG2Synthetic.ProcessState = 'UNKNOWN'";
+        using var result = await environment.RunAsync("uninstall",
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + sequence);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(failAfterExit ? "became unknown" : "could not be verified", result.Output);
+        Assert.Equal(failAfterExit ? 1 : 0, result.State.GetProperty("ExitRequests").GetInt32());
+        Assert.Equal(failAfterExit ? 2 : 1, result.Operations.Count(x => x.StartsWith("ProcessState:")));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("RemoveRegistry") || x.StartsWith("FileSystem/Remove-Item"));
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.True(result.State.GetProperty("Registry").TryGetProperty(SyntheticInstallationTestEnvironment.UninstallKey, out _));
+        AssertSyntheticBoundary(environment, result);
     }
 
     #endregion
@@ -884,413 +824,716 @@ public class ReleasePackagingTests
         Assert.Contains("InnoOwned", uninstallScript);
         Assert.Contains("Ambiguous", installScript);
         Assert.Contains("Ambiguous", uninstallScript);
-    }
-
-    private static async Task<(int ExitCode, string StdOut, string StdErr)> RunPowerShellCommandAsync(string scriptText, TimeSpan? timeout = null)
-    {
-        var start = new ProcessStartInfo("powershell.exe")
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        start.ArgumentList.Add("-NoProfile");
-        start.ArgumentList.Add("-NonInteractive");
-        start.ArgumentList.Add("-EncodedCommand");
-        start.ArgumentList.Add(Convert.ToBase64String(Encoding.Unicode.GetBytes(scriptText)));
-
-        using var child = Process.Start(start) ?? throw new InvalidOperationException("PowerShell test process failed to start.");
-        var outTask = child.StandardOutput.ReadToEndAsync();
-        var errTask = child.StandardError.ReadToEndAsync();
-
-        var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(30);
-        try
-        {
-            await child.WaitForExitAsync().WaitAsync(effectiveTimeout);
-        }
-        catch (TimeoutException)
-        {
-            try { child.Kill(entireProcessTree: true); } catch { }
-            throw new TimeoutException($"PowerShell script timed out after {effectiveTimeout}. stdout: {await outTask} stderr: {await errTask}");
-        }
-
-        return (child.ExitCode, await outTask, await errTask);
+        Assert.Contains("ForeignConflict", installScript);
+        Assert.Contains("ForeignConflict", uninstallScript);
     }
 
     [Fact]
     public async Task InstallationOwnership_PowerShellUninstall_SucceedsForPowerShellOwned()
     {
-        string repoRoot = FindRepositoryRoot();
-        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
-        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_PsUninst_{Guid.NewGuid():N}");
-        string localApp = Path.Combine(tempDir, "LocalApp");
-        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
-
-        Directory.CreateDirectory(targetDir);
-        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "dummy-exe");
-        File.Copy(uninstallScriptPath, Path.Combine(targetDir, "uninstall.ps1"));
-
-        try
-        {
-            string command = $$"""
-                $ErrorActionPreference = 'Stop'
-                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
-                $target = '{{targetDir.Replace("'", "''")}}'
-                $regOverride = @{
-                    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router' = @{
-                        DisplayName = 'AG2 Router'
-                        Publisher = 'AG2'
-                        InstallLocation = $target
-                        UninstallString = "powershell.exe -File `"$target\uninstall.ps1`""
-                    }
-                }
-                function Get-AG2RouterProcessState { return 'STOPPED' }
-                function Get-AG2RouterMutexState { return 'STOPPED' }
-
-                & '{{uninstallScriptPath.Replace("'", "''")}}' -RegistryOverride $regOverride
-                """;
-
-            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
-            Assert.True(exitCode == 0, $"PowerShell uninstall failed ({exitCode}): stdout: {stdout} stderr: {stderr}");
-            Assert.False(Directory.Exists(targetDir), "Target program directory must be removed for PowerShellOwned installation.");
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-            {
-                try { Directory.Delete(tempDir, recursive: true); } catch { }
-            }
-        }
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        using var result = await environment.RunAsync("uninstall", SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry);
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.False(Directory.Exists(environment.Target));
+        Assert.False(result.State.GetProperty("Registry").TryGetProperty(SyntheticInstallationTestEnvironment.UninstallKey, out _));
+        AssertSyntheticBoundary(environment, result);
     }
 
     [Fact]
     public async Task InstallationOwnership_PowerShellUninstall_RefusesInnoOwned_WithoutDeletingFiles()
     {
-        string repoRoot = FindRepositoryRoot();
-        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
-        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_InnoUninst_{Guid.NewGuid():N}");
-        string localApp = Path.Combine(tempDir, "LocalApp");
-        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
-
-        Directory.CreateDirectory(targetDir);
-        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "inno-app");
-        File.WriteAllText(Path.Combine(targetDir, "unins000.exe"), "inno-uninstaller");
-        File.WriteAllText(Path.Combine(targetDir, "unins000.dat"), "inno-data");
-        File.Copy(uninstallScriptPath, Path.Combine(targetDir, "uninstall.ps1"));
-
-        try
-        {
-            string command = $$"""
-                $ErrorActionPreference = 'Stop'
-                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
-                $target = '{{targetDir.Replace("'", "''")}}'
-                $innoKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{{CanonicalInnoKeyName}}"
-                $regOverride = @{
-                    $innoKey = @{
-                        DisplayName = 'AG2 Router'
-                        Publisher = 'AG2'
-                        InstallLocation = $target
-                        UninstallString = "`"$target\unins000.exe`""
-                    }
-                }
-                function Get-AG2RouterProcessState { return 'STOPPED' }
-                function Get-AG2RouterMutexState { return 'STOPPED' }
-
-                & '{{uninstallScriptPath.Replace("'", "''")}}' -RegistryOverride $regOverride
-                """;
-
-            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
-            Assert.NotEqual(0, exitCode);
-            Assert.Contains("Installation Channel Conflict", stderr + stdout);
-            Assert.True(Directory.Exists(targetDir), "Target program directory must NOT be deleted for InnoOwned installation.");
-            Assert.True(File.Exists(Path.Combine(targetDir, "unins000.exe")), "Inno uninstaller must NOT be deleted.");
-            Assert.True(File.Exists(Path.Combine(targetDir, "unins000.dat")), "Inno data must NOT be deleted.");
-            Assert.True(File.Exists(Path.Combine(targetDir, "AG2Router.exe")), "Application binary must NOT be deleted.");
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-            {
-                try { Directory.Delete(tempDir, recursive: true); } catch { }
-            }
-        }
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation(inno: true);
+        using var result = await environment.RunAsync("uninstall", SyntheticInstallationTestEnvironment.OwnedInnoRegistry);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Installation Channel Conflict", result.Output);
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.True(File.Exists(Path.Combine(environment.Target, "unins000.exe")));
+        Assert.True(File.Exists(Path.Combine(environment.Target, "unins000.dat")));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("RemoveRegistry") || x.StartsWith("FileSystem/Remove-Item"));
+        Assert.True(result.State.GetProperty("Registry").TryGetProperty(SyntheticInstallationTestEnvironment.InnoKey, out _));
+        AssertSyntheticBoundary(environment, result);
     }
 
     [Fact]
     public async Task InstallationOwnership_PowerShellInstall_RefusesInnoOwned_WithoutReplacingFiles()
     {
-        string repoRoot = FindRepositoryRoot();
-        string installScriptPath = Path.Combine(repoRoot, "scripts", "install.ps1");
-        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
-        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_InnoInstall_{Guid.NewGuid():N}");
-        string localApp = Path.Combine(tempDir, "LocalApp");
-        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
-        string sourceDir = Path.Combine(tempDir, "SourcePayload");
-
-        Directory.CreateDirectory(sourceDir);
-        File.WriteAllText(Path.Combine(sourceDir, "AG2Router.exe"), "new-powershell-payload");
-        File.Copy(uninstallScriptPath, Path.Combine(sourceDir, "uninstall.ps1"));
-
-        Directory.CreateDirectory(targetDir);
-        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "existing-inno-payload");
-        File.WriteAllText(Path.Combine(targetDir, "unins000.exe"), "inno-uninstaller");
-
-        try
-        {
-            string command = $$"""
-                $ErrorActionPreference = 'Stop'
-                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
-                $target = '{{targetDir.Replace("'", "''")}}'
-                $innoKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{{CanonicalInnoKeyName}}"
-                $regOverride = @{
-                    $innoKey = @{
-                        DisplayName = 'AG2 Router'
-                        Publisher = 'AG2'
-                        InstallLocation = $target
-                        UninstallString = "`"$target\unins000.exe`""
-                    }
-                }
-                function Get-AG2RouterProcessState { return 'STOPPED' }
-                function Get-AG2RouterMutexState { return 'STOPPED' }
-
-                & '{{installScriptPath.Replace("'", "''")}}' -SourceDir '{{sourceDir.Replace("'", "''")}}' -RegistryOverride $regOverride
-                """;
-
-            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
-            Assert.NotEqual(0, exitCode);
-            Assert.Contains("Installation Channel Conflict", stderr + stdout);
-            Assert.Equal("existing-inno-payload", File.ReadAllText(Path.Combine(targetDir, "AG2Router.exe")));
-            Assert.True(File.Exists(Path.Combine(targetDir, "unins000.exe")));
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-            {
-                try { Directory.Delete(tempDir, recursive: true); } catch { }
-            }
-        }
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation(inno: true);
+        using var result = await environment.RunAsync("install", SyntheticInstallationTestEnvironment.OwnedInnoRegistry);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Installation Channel Conflict", result.Output);
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.True(File.Exists(Path.Combine(environment.Target, "unins000.exe")));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("SetRegistry") || x.StartsWith("FileSystem/Move-Item"));
+        AssertSyntheticBoundary(environment, result);
     }
 
     [Fact]
     public async Task InstallationOwnership_PowerShellInstall_SucceedsForFreshInstall()
     {
-        string repoRoot = FindRepositoryRoot();
-        string installScriptPath = Path.Combine(repoRoot, "scripts", "install.ps1");
-        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
-        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_FreshInstall_{Guid.NewGuid():N}");
-        string localApp = Path.Combine(tempDir, "LocalApp");
-        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
-        string sourceDir = Path.Combine(tempDir, "SourcePayload");
-
-        Directory.CreateDirectory(sourceDir);
-        File.WriteAllText(Path.Combine(sourceDir, "AG2Router.exe"), "fresh-payload");
-        File.Copy(uninstallScriptPath, Path.Combine(sourceDir, "uninstall.ps1"));
-
-        try
-        {
-            string command = $$"""
-                $ErrorActionPreference = 'Stop'
-                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
-                $regOverride = @{}
-                function Get-AG2RouterProcessState { return 'STOPPED' }
-                function Get-AG2RouterMutexState { return 'STOPPED' }
-
-                & '{{installScriptPath.Replace("'", "''")}}' -SourceDir '{{sourceDir.Replace("'", "''")}}' -RegistryOverride $regOverride
-                """;
-
-            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
-            Assert.True(exitCode == 0, $"Fresh install failed ({exitCode}): stdout: {stdout} stderr: {stderr}");
-            Assert.True(File.Exists(Path.Combine(targetDir, "AG2Router.exe")));
-            Assert.Equal("fresh-payload", File.ReadAllText(Path.Combine(targetDir, "AG2Router.exe")));
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-            {
-                try { Directory.Delete(tempDir, recursive: true); } catch { }
-            }
-        }
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        using var result = await environment.RunAsync("install");
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Equal("fresh-payload", File.ReadAllText(environment.Exe));
+        var registration = result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.UninstallKey);
+        Assert.Equal("AG2 Router", registration.GetProperty("DisplayName").GetString());
+        Assert.Equal("AG2", registration.GetProperty("Publisher").GetString());
+        Assert.Equal(environment.Target, registration.GetProperty("InstallLocation").GetString());
+        Assert.Equal("0.4.0", registration.GetProperty("DisplayVersion").GetString());
+        Assert.Equal(1, registration.GetProperty("NoModify").GetInt32());
+        Assert.Equal(1, registration.GetProperty("NoRepair").GetInt32());
+        Assert.True(File.Exists(environment.StartMenuShortcut));
+        Assert.Equal(environment.Exe, result.State.GetProperty("Shortcuts").GetProperty(environment.StartMenuShortcut).GetString());
+        Assert.Contains("KnownFolder/Programs:", result.Operations);
+        Assert.Contains("ProcessState:", result.Operations);
+        Assert.Contains("MutexState:", result.Operations);
+        AssertSyntheticBoundary(environment, result);
     }
 
     [Fact]
     public async Task InstallationOwnership_PowerShellUninstall_OnAbsentDirectory_CompletesCleanly()
     {
-        string repoRoot = FindRepositoryRoot();
-        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
-        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_AbsentUninst_{Guid.NewGuid():N}");
-        string localApp = Path.Combine(tempDir, "LocalApp");
-
-        try
-        {
-            string command = $$"""
-                $ErrorActionPreference = 'Stop'
-                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
-                $regOverride = @{}
-
-                & '{{uninstallScriptPath.Replace("'", "''")}}' -RegistryOverride $regOverride
-                """;
-
-            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
-            Assert.True(exitCode == 0, $"Uninstall on absent directory failed ({exitCode}): stdout: {stdout} stderr: {stderr}");
-            Assert.Contains("No AG2 Router installation detected", stdout);
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-            {
-                try { Directory.Delete(tempDir, recursive: true); } catch { }
-            }
-        }
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        using var result = await environment.RunAsync("uninstall");
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Contains("No AG2 Router installation detected", result.Output);
+        Assert.Empty(result.State.GetProperty("Registry").EnumerateObject());
+        Assert.Empty(result.State.GetProperty("Shortcuts").EnumerateObject());
+        AssertSyntheticBoundary(environment, result);
     }
 
-    [Fact]
-    public async Task InstallationOwnership_AmbiguousRegistrations_FailsClosedWithoutMutation()
+    [Theory]
+    [InlineData("install")]
+    [InlineData("uninstall")]
+    public async Task InstallationOwnership_AmbiguousRegistrations_FailsClosedWithoutMutation(string kind)
     {
-        string repoRoot = FindRepositoryRoot();
-        string installScriptPath = Path.Combine(repoRoot, "scripts", "install.ps1");
-        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
-        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_Ambiguous_{Guid.NewGuid():N}");
-        string localApp = Path.Combine(tempDir, "LocalApp");
-        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
-        string sourceDir = Path.Combine(tempDir, "SourcePayload");
-
-        Directory.CreateDirectory(sourceDir);
-        File.WriteAllText(Path.Combine(sourceDir, "AG2Router.exe"), "source-exe");
-        File.Copy(uninstallScriptPath, Path.Combine(sourceDir, "uninstall.ps1"));
-
-        Directory.CreateDirectory(targetDir);
-        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "target-exe");
-        File.Copy(uninstallScriptPath, Path.Combine(targetDir, "uninstall.ps1"));
-
-        try
-        {
-            string innoKey = $"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{CanonicalInnoKeyName}";
-            string psKey = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AG2Router";
-
-            // Test 1: install.ps1 fails closed when both registrations exist
-            string installCommand = $$"""
-                $ErrorActionPreference = 'Stop'
-                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
-                $target = '{{targetDir.Replace("'", "''")}}'
-                $regOverride = @{
-                    '{{innoKey.Replace("'", "''")}}' = @{
-                        DisplayName = 'AG2 Router'
-                        Publisher = 'AG2'
-                        InstallLocation = $target
-                    }
-                    '{{psKey.Replace("'", "''")}}' = @{
-                        DisplayName = 'AG2 Router'
-                        Publisher = 'AG2'
-                        InstallLocation = $target
-                        UninstallString = "powershell.exe -File `"$target\uninstall.ps1`""
-                    }
-                }
-                function Get-AG2RouterProcessState { return 'STOPPED' }
-                function Get-AG2RouterMutexState { return 'STOPPED' }
-
-                & '{{installScriptPath.Replace("'", "''")}}' -SourceDir '{{sourceDir.Replace("'", "''")}}' -RegistryOverride $regOverride
-                """;
-
-            var (installExit, installOut, installErr) = await RunPowerShellCommandAsync(installCommand);
-            Assert.NotEqual(0, installExit);
-            Assert.Contains("Ambiguous", installOut + installErr);
-            Assert.Equal("target-exe", File.ReadAllText(Path.Combine(targetDir, "AG2Router.exe")));
-
-            // Test 2: uninstall.ps1 fails closed when both registrations exist
-            string uninstallCommand = $$"""
-                $ErrorActionPreference = 'Stop'
-                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
-                $target = '{{targetDir.Replace("'", "''")}}'
-                $regOverride = @{
-                    '{{innoKey.Replace("'", "''")}}' = @{
-                        DisplayName = 'AG2 Router'
-                        Publisher = 'AG2'
-                        InstallLocation = $target
-                    }
-                    '{{psKey.Replace("'", "''")}}' = @{
-                        DisplayName = 'AG2 Router'
-                        Publisher = 'AG2'
-                        InstallLocation = $target
-                        UninstallString = "powershell.exe -File `"$target\uninstall.ps1`""
-                    }
-                }
-                function Get-AG2RouterProcessState { return 'STOPPED' }
-                function Get-AG2RouterMutexState { return 'STOPPED' }
-
-                & '{{uninstallScriptPath.Replace("'", "''")}}' -RegistryOverride $regOverride
-                """;
-
-            var (uninstExit, uninstOut, uninstErr) = await RunPowerShellCommandAsync(uninstallCommand);
-            Assert.NotEqual(0, uninstExit);
-            Assert.Contains("Ambiguous", uninstOut + uninstErr);
-            Assert.True(Directory.Exists(targetDir));
-            Assert.Equal("target-exe", File.ReadAllText(Path.Combine(targetDir, "AG2Router.exe")));
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-            {
-                try { Directory.Delete(tempDir, recursive: true); } catch { }
-            }
-        }
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        using var result = await environment.RunAsync(kind,
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + SyntheticInstallationTestEnvironment.OwnedInnoRegistry);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Ambiguous", result.Output);
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.Equal(2, result.State.GetProperty("Registry").EnumerateObject().Count());
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("SetRegistry") || x.StartsWith("RemoveRegistry") || x.StartsWith("FileSystem/Move-Item"));
+        AssertSyntheticBoundary(environment, result);
     }
 
     [Fact]
     public async Task InstallationOwnership_RegistryIdentity_IgnoresForeignRegistrations()
     {
-        string repoRoot = FindRepositoryRoot();
-        string installScriptPath = Path.Combine(repoRoot, "scripts", "install.ps1");
-        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_ForeignReg_{Guid.NewGuid():N}");
-        string localApp = Path.Combine(tempDir, "LocalApp");
-        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        const string foreignKey = @"HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}_is1";
+        using var result = await environment.RunAsync("install",
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + $$"""
+            $global:AG2Synthetic.Registry['{{foreignKey}}'] = @{
+                DisplayName = 'Some Other Tool'; Publisher = 'Other'; InstallLocation = $target
+            }
+            """);
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Equal("fresh-payload", File.ReadAllText(environment.Exe));
+        Assert.Equal("Some Other Tool", result.State.GetProperty("Registry").GetProperty(foreignKey).GetProperty("DisplayName").GetString());
+        Assert.DoesNotContain(result.Operations, x => x.EndsWith(foreignKey));
+        AssertSyntheticBoundary(environment, result);
+    }
 
-        Directory.CreateDirectory(targetDir);
-        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "installed-exe");
+    /// <summary>
+    /// Validates whether a PowerShell uninstall registration matches the expected AG2 Router identity.
+    /// Implements the exact logic of Test-AG2RouterPowerShellRegistrationMatch in scripts/install.ps1 and scripts/uninstall.ps1.
+    /// </summary>
+    public static bool IsPowerShellUninstallRegistrationOwned(
+        string? displayName,
+        string? publisher,
+        string? installLocation,
+        string? uninstallString,
+        string expectedTargetDir)
+    {
+        if (string.IsNullOrWhiteSpace(displayName) || !string.Equals(displayName.Trim(), "AG2 Router", StringComparison.Ordinal))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(publisher) || !string.Equals(publisher.Trim(), "AG2", StringComparison.Ordinal))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(installLocation))
+            return false;
 
         try
         {
-            // Register an unrelated Inno app with a different GUID and test ownership classification
-            string command = $$"""
-                $ErrorActionPreference = 'Stop'
-                $target = '{{targetDir.Replace("'", "''")}}'
-                $foreignInnoKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}_is1'
-                $regOverride = @{
-                    $foreignInnoKey = @{
-                        DisplayName = 'Some Other Tool'
-                        Publisher = 'Other'
-                        InstallLocation = $target
-                    }
-                    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router' = @{
-                        DisplayName = 'AG2 Router'
-                        Publisher = 'AG2'
-                        InstallLocation = $target
-                        UninstallString = "powershell.exe -File `"$target\uninstall.ps1`""
-                    }
-                }
+            string normInstall = Path.GetFullPath(installLocation).TrimEnd('\\');
+            string normTarget = Path.GetFullPath(expectedTargetDir).TrimEnd('\\');
+            if (!string.Equals(normInstall, normTarget, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        catch
+        {
+            return false;
+        }
 
-                $scriptContent = Get-Content '{{installScriptPath.Replace("'", "''")}}' -Raw
-                $funcStart = $scriptContent.IndexOf('function Get-AG2RouterRegistryValue')
-                $funcEnd = $scriptContent.IndexOf('Write-Host "===================================================="')
-                $funcCode = $scriptContent.Substring($funcStart, $funcEnd - $funcStart)
-                Invoke-Expression $funcCode
+        if (string.IsNullOrWhiteSpace(uninstallString))
+            return false;
 
-                $ownership = Get-AG2RouterInstallationOwnership -TargetDir $target -RegistryOverride $regOverride
-                Write-Output ("STATUS:" + $ownership.Status)
+        string lowerUninst = uninstallString.ToLowerInvariant();
+        if (!lowerUninst.Contains("uninstall.ps1", StringComparison.Ordinal) && !lowerUninst.Contains("ag2router", StringComparison.Ordinal))
+            return false;
+
+        return true;
+    }
+
+    [Theory]
+    // Valid ownership match
+    [InlineData("AG2 Router", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe -File ""C:\Users\test\AppData\Local\Programs\AG2Router\uninstall.ps1""", @"C:\Users\test\AppData\Local\Programs\AG2Router", true)]
+    // Foreign DisplayName
+    [InlineData("Other Product", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe -File ""C:\Users\test\AppData\Local\Programs\AG2Router\uninstall.ps1""", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    // Foreign Publisher
+    [InlineData("AG2 Router", "Other Corp", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe -File ""C:\Users\test\AppData\Local\Programs\AG2Router\uninstall.ps1""", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    // Foreign InstallLocation
+    [InlineData("AG2 Router", "AG2", @"C:\Program Files\OtherApp", @"powershell.exe -File ""C:\Users\test\AppData\Local\Programs\AG2Router\uninstall.ps1""", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    // Foreign/Invalid UninstallString
+    [InlineData("AG2 Router", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"notepad.exe", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    // Null/empty properties
+    [InlineData(null, "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe -File uninstall.ps1", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData("AG2 Router", null, @"C:\Users\test\AppData\Local\Programs\AG2Router", @"powershell.exe -File uninstall.ps1", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData("AG2 Router", "AG2", null, @"powershell.exe -File uninstall.ps1", @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData("AG2 Router", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", null, @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    public void PowerShellUninstallRegistration_StrictGuards_RecognizeOnlyOwnedRegistrations(
+        string? displayName,
+        string? publisher,
+        string? installLocation,
+        string? uninstallString,
+        string expectedTargetDir,
+        bool expectedResult)
+    {
+        bool isOwned = IsPowerShellUninstallRegistrationOwned(displayName, publisher, installLocation, uninstallString, expectedTargetDir);
+        Assert.Equal(expectedResult, isOwned);
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellInstall_RefusesExactKeyForeignIdentity_PreservesRegistryAndFiles()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        Directory.CreateDirectory(environment.UserData);
+        string userDataFile = Path.Combine(environment.UserData, "accounts.json");
+        File.WriteAllText(userDataFile, "synthetic-user-data");
+
+        string foreignSetup = $$"""
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.UninstallKey}}'] = @{
+                DisplayName = 'Foreign Application'
+                Publisher = 'ForeignCorp'
+                InstallLocation = 'C:\ForeignApp'
+                UninstallString = 'C:\ForeignApp\uninstall.exe'
+            }
+            """;
+
+        using var result = await environment.RunAsync("install", foreignSetup);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Installation Channel Conflict", result.Output);
+        Assert.Contains("could not be proven to belong to this installation", result.Output);
+
+        // Registry value-for-value preserved
+        var reg = result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.UninstallKey);
+        Assert.Equal("Foreign Application", reg.GetProperty("DisplayName").GetString());
+        Assert.Equal("ForeignCorp", reg.GetProperty("Publisher").GetString());
+        Assert.Equal(@"C:\ForeignApp", reg.GetProperty("InstallLocation").GetString());
+        Assert.Equal(@"C:\ForeignApp\uninstall.exe", reg.GetProperty("UninstallString").GetString());
+
+        // Files, shortcuts, and user data untouched
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.Equal("synthetic-user-data", File.ReadAllText(userDataFile));
+        Assert.False(File.Exists(environment.StartMenuShortcut));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("SetRegistry") || x.StartsWith("FileSystem/Move-Item") || x.StartsWith("FileSystem/Copy-Item"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    // Correct name & publisher, foreign path
+    [InlineData("AG2 Router", "AG2", @"C:\OtherPath\AG2Router")]
+    // Correct path & publisher, foreign name
+    [InlineData("Other Product", "AG2", null)]
+    // Correct path & name, foreign publisher
+    [InlineData("AG2 Router", "Other Publisher", null)]
+    public async Task InstallationOwnership_PowerShellInstall_RefusesMismatchingIdentityAtFixedKey(
+        string displayName, string publisher, string? customInstallLocation)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+
+        string locExpr = customInstallLocation != null ? $"'{customInstallLocation}'" : "$target";
+        string setupScript = $$"""
+            $loc = {{locExpr}}
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.UninstallKey}}'] = @{
+                DisplayName = '{{displayName}}'
+                Publisher = '{{publisher}}'
+                InstallLocation = $loc
+                UninstallString = "powershell.exe -File `"$loc\uninstall.ps1`""
+            }
+            """;
+
+        using var result = await environment.RunAsync("install", setupScript);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Installation Channel Conflict", result.Output);
+        Assert.Contains("could not be proven to belong to this installation", result.Output);
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("SetRegistry") || x.StartsWith("FileSystem/Move-Item"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData("@{ Publisher = 'AG2'; InstallLocation = $target; UninstallString = 'powershell.exe -File \"$target\\uninstall.ps1\"' }")]
+    [InlineData("@{ DisplayName = 'AG2 Router'; InstallLocation = $target; UninstallString = 'powershell.exe -File \"$target\\uninstall.ps1\"' }")]
+    [InlineData("@{ DisplayName = 'AG2 Router'; Publisher = 'AG2'; UninstallString = 'powershell.exe -File \"$target\\uninstall.ps1\"' }")]
+    [InlineData("@{ DisplayName = 'AG2 Router'; Publisher = 'AG2'; InstallLocation = $target }")]
+    [InlineData("@{ DisplayName = 'AG2 Router'; Publisher = 'AG2'; InstallLocation = $target; UninstallString = 'notepad.exe' }")]
+    [InlineData("@{}")]
+    public async Task InstallationOwnership_PowerShellInstall_RefusesMalformedOrIncompleteFixedKey(string keyProperties)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+
+        string setupScript = $$"""
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.UninstallKey}}'] = {{keyProperties}}
+            """;
+
+        using var result = await environment.RunAsync("install", setupScript);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Installation Channel Conflict", result.Output);
+        Assert.Contains("could not be proven to belong to this installation", result.Output);
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("SetRegistry") || x.StartsWith("FileSystem/Move-Item"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellInstall_SucceedsForLegitimateUpgrade()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+
+        using var result = await environment.RunAsync("install", SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry);
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Equal("fresh-payload", File.ReadAllText(environment.Exe));
+        var reg = result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.UninstallKey);
+        Assert.Equal("AG2 Router", reg.GetProperty("DisplayName").GetString());
+        Assert.Equal("AG2", reg.GetProperty("Publisher").GetString());
+        Assert.Equal(environment.Target, reg.GetProperty("InstallLocation").GetString());
+        Assert.True(File.Exists(environment.StartMenuShortcut));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellInstall_RefusesForeignFixedKey_EvenWhenTargetDirectoryEmpty()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        Assert.False(Directory.Exists(environment.Target));
+
+        string foreignSetup = $$"""
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.UninstallKey}}'] = @{
+                DisplayName = 'Foreign Product'
+                Publisher = 'Foreign Corp'
+                InstallLocation = 'C:\OtherApp'
+                UninstallString = 'C:\OtherApp\uninstall.exe'
+            }
+            """;
+
+        using var result = await environment.RunAsync("install", foreignSetup);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Installation Channel Conflict", result.Output);
+        Assert.Contains("could not be proven to belong to this installation", result.Output);
+
+        var reg = result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.UninstallKey);
+        Assert.Equal("Foreign Product", reg.GetProperty("DisplayName").GetString());
+        Assert.Equal("Foreign Corp", reg.GetProperty("Publisher").GetString());
+        Assert.Equal(@"C:\OtherApp", reg.GetProperty("InstallLocation").GetString());
+
+        Assert.False(File.Exists(environment.Exe));
+        Assert.False(File.Exists(environment.StartMenuShortcut));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("SetRegistry") || x.StartsWith("FileSystem/Copy-Item") || x.StartsWith("FileSystem/Move-Item"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellInstall_RefusesForeignFixedKey_WithInnoEvidencePresent()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation(inno: true);
+
+        string setupScript = SyntheticInstallationTestEnvironment.OwnedInnoRegistry + "\n" + $$"""
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.UninstallKey}}'] = @{
+                DisplayName = 'Foreign Product'
+                Publisher = 'Foreign Corp'
+                InstallLocation = 'C:\OtherApp'
+                UninstallString = 'C:\OtherApp\uninstall.exe'
+            }
+            """;
+
+        using var result = await environment.RunAsync("install", setupScript);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Installation Channel Conflict", result.Output);
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.True(File.Exists(Path.Combine(environment.Target, "unins000.exe")));
+        Assert.True(result.State.GetProperty("Registry").TryGetProperty(SyntheticInstallationTestEnvironment.InnoKey, out _));
+        var reg = result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.UninstallKey);
+        Assert.Equal("Foreign Product", reg.GetProperty("DisplayName").GetString());
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("SetRegistry") || x.StartsWith("FileSystem/Move-Item"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellUninstall_RefusesForeignFixedKey_PreservesRegistryAndFiles()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        Directory.CreateDirectory(environment.UserData);
+        string userDataFile = Path.Combine(environment.UserData, "accounts.json");
+        File.WriteAllText(userDataFile, "synthetic-user-data");
+
+        string foreignSetup = $$"""
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.UninstallKey}}'] = @{
+                DisplayName = 'Foreign Product'
+                Publisher = 'Foreign Corp'
+                InstallLocation = 'C:\OtherApp'
+                UninstallString = 'C:\OtherApp\uninstall.exe'
+            }
+            """;
+
+        using var result = await environment.RunAsync("uninstall", foreignSetup);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Installation Channel Conflict", result.Output);
+        Assert.Contains("could not be proven to belong to this installation", result.Output);
+
+        var reg = result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.UninstallKey);
+        Assert.Equal("Foreign Product", reg.GetProperty("DisplayName").GetString());
+        Assert.Equal("Foreign Corp", reg.GetProperty("Publisher").GetString());
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.Equal("synthetic-user-data", File.ReadAllText(userDataFile));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("RemoveRegistry") || x.StartsWith("FileSystem/Remove-Item"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Fact]
+    public async Task SyntheticInstallation_Uninstall_RemovesOnlySyntheticShortcutsAndRegistry_PreservesData()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        Directory.CreateDirectory(environment.UserData);
+        string data = Path.Combine(environment.UserData, "accounts.json");
+        File.WriteAllText(data, "synthetic-user-data");
+        using var result = await environment.RunAsync("uninstall", $$"""
+            Invoke-SyntheticInstallation -Kind install
+            $exe = Join-Path $target 'AG2Router.exe'
+            $desktop = Join-Path $global:AG2Synthetic.Root 'Desktop\AG2 Router.lnk'
+            & $global:AG2InstallationEnvironment.CreateShortcut @{ Path = $desktop; Target = $exe; WorkingDirectory = $target }
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.RunKey}}'] = @{ AG2Router = '"' + $exe + '" --tray'; Other = 'synthetic-other' }
+            """);
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.False(Directory.Exists(environment.Target));
+        Assert.False(File.Exists(environment.StartMenuShortcut));
+        Assert.False(File.Exists(environment.DesktopShortcut));
+        Assert.Empty(result.State.GetProperty("Shortcuts").EnumerateObject());
+        Assert.False(result.State.GetProperty("Registry").TryGetProperty(SyntheticInstallationTestEnvironment.UninstallKey, out _));
+        var run = result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.RunKey);
+        Assert.False(run.TryGetProperty("AG2Router", out _));
+        Assert.Equal("synthetic-other", run.GetProperty("Other").GetString());
+        Assert.Equal("synthetic-user-data", File.ReadAllText(data));
+        Assert.Contains("ShortcutTarget:" + environment.StartMenuShortcut, result.Operations);
+        Assert.Contains("ShortcutTarget:" + environment.DesktopShortcut, result.Operations);
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Fact]
+    public async Task SyntheticInstallation_Uninstall_PreservesForeignShortcutAndStartupValue()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        using var result = await environment.RunAsync("uninstall",
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + $$"""
+            $foreign = Join-Path $global:AG2Synthetic.Root 'SourcePayload\Other.exe'
+            $shortcut = Join-Path $global:AG2Synthetic.Root 'StartMenu\AG2 Router.lnk'
+            & $global:AG2InstallationEnvironment.CreateShortcut @{ Path = $shortcut; Target = $foreign; WorkingDirectory = $target }
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.RunKey}}'] = @{ AG2Router = '"' + $foreign + '" --tray' }
+            """);
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.True(File.Exists(environment.StartMenuShortcut));
+        Assert.True(result.State.GetProperty("Shortcuts").TryGetProperty(environment.StartMenuShortcut, out _));
+        Assert.True(result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.RunKey).TryGetProperty("AG2Router", out _));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SyntheticInstallation_MissingRegistryKeys_AreAbsenceIncludingLegacyOverride(bool legacyOverride)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        using var result = await environment.RunAsync("install",
+            extraParameters: legacyOverride ? "@{ RegistryOverride = @{} }" : "@{}");
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Single(result.State.GetProperty("Registry").EnumerateObject());
+        Assert.Contains(result.Operations, x => x.StartsWith("RegistryExists:HKLM:"));
+        if (legacyOverride) Assert.DoesNotContain(result.Operations, x => x.StartsWith("ReadRegistry:"));
+        else Assert.Contains("ReadRegistry:" + SyntheticInstallationTestEnvironment.InnoKey, result.Operations);
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData("install")]
+    [InlineData("uninstall")]
+    public async Task SyntheticInstallation_RunningProcessAndMutex_ShutdownIsSimulated(string kind)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        using var result = await environment.RunAsync(kind,
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + """
+            $global:AG2Synthetic.ProcessState = 'RUNNING'
+            $global:AG2Synthetic.MutexState = 'RUNNING'
+            """);
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Equal(1, result.State.GetProperty("ExitRequests").GetInt32());
+        Assert.Equal("STOPPED", result.State.GetProperty("ProcessState").GetString());
+        Assert.Equal("STOPPED", result.State.GetProperty("MutexState").GetString());
+        Assert.Contains("StartExitProcess:" + environment.Exe, result.Operations);
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData("UNKNOWN", "STOPPED")]
+    [InlineData("STOPPED", "UNKNOWN")]
+    [InlineData("UNKNOWN", "UNKNOWN")]
+    public async Task SyntheticInstallation_Install_UnresolvedUnknownState_FailsClosedAndPreservesExistingInstallation(string processState, string mutexState)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        using var result = await environment.RunAsync("install",
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + $$"""
+            $global:AG2Synthetic.ProcessState = '{{processState}}'
+            $global:AG2Synthetic.MutexState = '{{mutexState}}'
+            $global:AG2Synthetic.Registry['{{SyntheticInstallationTestEnvironment.RunKey}}'] = @{ AG2Router = '"' + $target + '\AG2Router.exe" --tray' }
+            """);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("stopped state could not be verified", result.Output);
+        Assert.Contains("Refusing to replace application files while instance state is unknown", result.Output);
+        Assert.Equal(0, result.State.GetProperty("ExitRequests").GetInt32());
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.True(result.State.GetProperty("Registry").GetProperty(SyntheticInstallationTestEnvironment.RunKey).TryGetProperty("AG2Router", out _));
+        Assert.False(File.Exists(environment.StartMenuShortcut));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("FileSystem/Move-Item") || x.StartsWith("FileSystem/Copy-Item") || x.StartsWith("SetRegistry"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData("RUNNING", "STOPPED")]
+    [InlineData("STOPPED", "RUNNING")]
+    public async Task SyntheticInstallation_Install_SingleRunningComponent_ShutsDownGracefullyAndProceeds(string processState, string mutexState)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        using var result = await environment.RunAsync("install",
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + $$"""
+            $global:AG2Synthetic.ProcessState = '{{processState}}'
+            $global:AG2Synthetic.MutexState = '{{mutexState}}'
+            """);
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Equal(1, result.State.GetProperty("ExitRequests").GetInt32());
+        Assert.Equal("STOPPED", result.State.GetProperty("ProcessState").GetString());
+        Assert.Equal("STOPPED", result.State.GetProperty("MutexState").GetString());
+        Assert.Equal("fresh-payload", File.ReadAllText(environment.Exe));
+        Assert.Contains("StartExitProcess:" + environment.Exe, result.Operations);
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData("RUNNING", "UNKNOWN")]
+    [InlineData("UNKNOWN", "RUNNING")]
+    public async Task SyntheticInstallation_Install_RunningWithUnknown_CallsExitAndFailsClosedIfUnknownRemains(string processState, string mutexState)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        string setupScript = processState == "RUNNING"
+            ? $$"""
+                $global:AG2Synthetic.ProcessState = '{{processState}}'
+                1..30 | ForEach-Object { $global:AG2Synthetic.MutexStates.Enqueue('{{mutexState}}') }
+                """
+            : $$"""
+                $global:AG2Synthetic.MutexState = '{{mutexState}}'
+                1..30 | ForEach-Object { $global:AG2Synthetic.ProcessStates.Enqueue('{{processState}}') }
                 """;
 
-            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
-            Assert.True(exitCode == 0, $"Command failed: {stdout} {stderr}");
-            Assert.Contains("STATUS:PowerShellOwned", stdout);
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-            {
-                try { Directory.Delete(tempDir, recursive: true); } catch { }
-            }
-        }
+        using var result = await environment.RunAsync("install",
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + setupScript);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Equal(1, result.State.GetProperty("ExitRequests").GetInt32());
+        Assert.Contains("could not be verified after shutdown request", result.Output);
+        Assert.Contains("Refusing to replace application files while instance state is unknown", result.Output);
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("FileSystem/Move-Item") || x.StartsWith("SetRegistry"));
+        AssertSyntheticBoundary(environment, result);
     }
+
+    [Fact]
+    public async Task SyntheticInstallation_Install_QueryFailureAfterShutdownAttempt_AbortsBeforeMutation()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        using var result = await environment.RunAsync("install",
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + """
+            $global:AG2Synthetic.ProcessStates.Enqueue('RUNNING')
+            1..30 | ForEach-Object { $global:AG2Synthetic.ProcessStates.Enqueue('UNKNOWN') }
+            $global:AG2Synthetic.MutexState = 'STOPPED'
+            """);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Equal(1, result.State.GetProperty("ExitRequests").GetInt32());
+        Assert.Contains("could not be verified after shutdown request", result.Output);
+        Assert.Contains("Refusing to replace application files while instance state is unknown", result.Output);
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("FileSystem/Move-Item") || x.StartsWith("SetRegistry"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData("Process")]
+    [InlineData("Mutex")]
+    public async Task SyntheticInstallation_Install_TransientUnknownResolvesToStopped_ProceedsAfterProof(string transientComponent)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        string queueSetup = transientComponent == "Process"
+            ? """
+                $global:AG2Synthetic.ProcessStates.Enqueue('UNKNOWN')
+                $global:AG2Synthetic.ProcessStates.Enqueue('STOPPED')
+                $global:AG2Synthetic.MutexState = 'STOPPED'
+                """
+            : """
+                $global:AG2Synthetic.MutexStates.Enqueue('UNKNOWN')
+                $global:AG2Synthetic.MutexStates.Enqueue('STOPPED')
+                $global:AG2Synthetic.ProcessState = 'STOPPED'
+                """;
+
+        using var result = await environment.RunAsync("install",
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + queueSetup);
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Equal(0, result.State.GetProperty("ExitRequests").GetInt32());
+        Assert.Equal("fresh-payload", File.ReadAllText(environment.Exe));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData("install")]
+    [InlineData("uninstall")]
+    public async Task SyntheticInstallation_HungShutdown_AbortsBeforeMutation(string kind)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.SeedInstallation();
+        using var result = await environment.RunAsync(kind,
+            SyntheticInstallationTestEnvironment.OwnedPowerShellRegistry + "\n" + """
+            $global:AG2Synthetic.ProcessState = 'RUNNING'
+            $global:AG2Synthetic.ShutdownCompletes = $false
+            """);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("did not finish", result.Output);
+        Assert.Equal(1, result.State.GetProperty("ExitRequests").GetInt32());
+        Assert.Equal("existing-payload", File.ReadAllText(environment.Exe));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("RemoveRegistry") || x.StartsWith("FileSystem/Move-Item"));
+        AssertSyntheticBoundary(environment, result);
+    }
+
+    [Theory]
+    [InlineData("ReadRegistry")]
+    [InlineData("KnownFolder")]
+    [InlineData("ProcessState")]
+    [InlineData("MutexState")]
+    [InlineData("CreateShortcut")]
+    [InlineData("SetRegistry")]
+    [InlineData("FileSystem")]
+    public async Task SyntheticInstallation_MissingDependency_FailsEvenWhenScriptCatchesError(string operation)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        using var result = await environment.RunAsync("install",
+            "$global:AG2InstallationEnvironment.Remove('" + operation + "')");
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(result.BoundaryErrors, x => x.Contains("'" + operation + "'"));
+    }
+
+    [Fact]
+    public async Task SyntheticInstallation_OutsideKnownFolder_IsRejectedBeforeShortcutAccess()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        using var result = await environment.RunAsync("install", """
+            $global:AG2InstallationEnvironment.KnownFolder = { param($p) return $global:AG2Synthetic.Root + '-outside' }
+            """);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(result.BoundaryErrors, x => x.Contains("outside synthetic root"));
+        Assert.False(File.Exists(environment.StartMenuShortcut));
+        Assert.Empty(result.State.GetProperty("Shortcuts").EnumerateObject());
+        Assert.All(result.FilePaths, path => AssertUnderRoot(environment.Root, path));
+    }
+
+    [Fact]
+    public async Task SyntheticInstallation_OutsideSourcePath_IsRejectedBeforeFilesystemAccess()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        using var result = await environment.RunAsync("install", extraParameters: "@{ SourceDir = $global:AG2Synthetic.Root + '-outside' }");
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(result.BoundaryErrors, x => x.Contains("outside synthetic root"));
+        Assert.False(File.Exists(environment.Exe));
+        Assert.All(result.FilePaths, path => AssertUnderRoot(environment.Root, path));
+    }
+
+    [Theory]
+    [InlineData("HKCU:\\Software\\AG2TestSentinel")]
+    [InlineData("Registry::HKEY_CURRENT_USER\\Software\\AG2TestSentinel")]
+    [InlineData("C:relative-path")]
+    public async Task SyntheticInstallation_NonFilesystemPath_IsRejectedBeforeProviderAccess(string path)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.AppendScript("install", "\nTest-AG2RouterFile -LiteralPath '" + path + "'\n");
+        using var result = await environment.RunAsync("install");
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(result.BoundaryErrors, x => x.Contains("Invalid synthetic filesystem path"));
+        Assert.All(result.FilePaths, file => AssertUnderRoot(environment.Root, file));
+    }
+
+    [Theory]
+    [InlineData("Get-ItemProperty -LiteralPath 'HKCU:\\Software\\AG2TestSentinel'")]
+    [InlineData("Set-ItemProperty -LiteralPath 'HKCU:\\Software\\AG2TestSentinel' -Name Test -Value 1")]
+    [InlineData("[System.Environment]::GetFolderPath('Programs')")]
+    [InlineData("Get-Process -Name AG2Router")]
+    [InlineData("[System.Threading.Mutex]::OpenExisting('Local\\AG2Router_Session_Mutex')")]
+    [InlineData("Start-Process AG2Router.exe")]
+    [InlineData("Remove-Item 'unmocked-file'")]
+    [InlineData("& ('Get-' + 'Process')")]
+    public async Task SyntheticInstallation_UnmockedHostOperation_IsRejectedBeforeExecution(string operation)
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.AppendScript("install", "\n" + operation + "\n");
+        using var result = await environment.RunAsync("install");
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.NotEmpty(result.BoundaryErrors);
+        Assert.Empty(result.Operations);
+        Assert.False(Directory.Exists(environment.Target));
+    }
+
+    [Fact]
+    public async Task SyntheticInstallation_ProductionAdapterFallback_IsUnavailable()
+    {
+        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        environment.AppendScript("install", "\nInvoke-AG2RouterProductionEnvironment -Operation ProcessState\n");
+        using var result = await environment.RunAsync("install");
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(result.BoundaryErrors, x => x.Contains("Production adapter reached"));
+        Assert.DoesNotContain(result.Operations, x => x.StartsWith("StartExitProcess"));
+    }
+
+    private static void AssertSyntheticBoundary(SyntheticInstallationTestEnvironment environment, SyntheticInstallationTestEnvironment.Result result)
+    {
+        Assert.Empty(result.BoundaryErrors);
+        Assert.NotEmpty(result.FilePaths);
+        Assert.All(result.FilePaths, path => AssertUnderRoot(environment.Root, path));
+    }
+
+    private static void AssertUnderRoot(string root, string path) =>
+        Assert.StartsWith(Path.GetFullPath(root).TrimEnd('\\') + "\\", Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase);
 
     #endregion
 

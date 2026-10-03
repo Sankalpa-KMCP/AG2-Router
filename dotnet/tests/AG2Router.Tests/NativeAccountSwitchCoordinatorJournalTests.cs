@@ -1247,12 +1247,14 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
             TimeSpan timeout,
             CancellationToken cancellationToken = default,
             Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
-            Action? onStopAttempted = null)
+            Action? onStopAttempted = null,
+            Action? onStopIssued = null)
         {
             if (verifyBeforeKillAsync != null) await verifyBeforeKillAsync(cancellationToken);
             onStopAttempted?.Invoke();
             StopCount++;
             _timeline.Add("PROCESS_STOP");
+            onStopIssued?.Invoke();
         }
 
         public Task<AG2ProcessGeneration> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default)

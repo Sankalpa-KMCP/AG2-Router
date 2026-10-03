@@ -59,14 +59,15 @@ The Inno Setup installer is per-user, uses the stable AppId declared in installe
 
 Inno Setup stages an existing complete `{app}` directory to `{app}.bak` in the abortable `PrepareToInstall` phase. A failed move or pre-existing backup prevents extraction and an old-file overlay. The backup remains until successful `ssDone`; cancellation or failure attempts checked removal of any partial replacement and checked promotion of the complete backup. If rollback cannot finish, the backup is retained for explicit manual recovery. The successful new directory contains no old-only files. Legacy script uninstall registration is cleaned only after strict ownership checks.
 
-The PowerShell installer is the archive installation path. It also installs per-user, performs atomic directory swaps with backup and rollback, creates an owned shortcut, and registers an uninstall entry.
+The PowerShell installer is the archive installation path. It also installs per-user, performs atomic directory swaps with backup and rollback, creates an owned shortcut, and registers an uninstall entry. Installation replacement proceeds only after stopped state is positively established (`process == STOPPED` and `mutex == STOPPED`); an initial transient `UNKNOWN` query may be retried, but any unresolved `UNKNOWN` fails closed without replacing files or mutating directory state. When a running instance is detected, graceful `--exit` shutdown is requested and polled for up to five seconds before failing closed if stopped state cannot be positively verified.
 
 ### Cross-channel ownership and transitions
 
-Installation ownership at `%LOCALAPPDATA%\Programs\AG2Router` is explicitly classified (`None`, `PowerShellOwned`, `InnoOwned`, or `Ambiguous`):
+Installation ownership at `%LOCALAPPDATA%\Programs\AG2Router` is explicitly classified (`None`, `PowerShellOwned`, `InnoOwned`, `Ambiguous`, or `ForeignConflict`):
 
 - **Inno-owned installation detected:** PowerShell `install.ps1` refuses to overwrite it, and PowerShell `uninstall.ps1` refuses to delete it, directing the user to the Inno installer or registered Inno uninstaller. This prevents broken Windows Add/Remove registrations or orphaned uninstallers.
 - **Ambiguous ownership state detected:** When both registrations are present or uninstaller files conflict with registry records, both PowerShell scripts fail closed without replacing or deleting files or registry keys.
+- **Foreign or unproven registration at fixed PowerShell key (`ForeignConflict`):** Exact fixed-key collisions at `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router` that cannot be positively proven to belong to this installation are classified as ownership conflicts (`ForeignConflict`). Foreign or unprovable registrations are preserved untouched; installation and uninstallation fail closed before any directory replacement, file copy, shortcut creation, or registry modification.
 - **Switching from Inno to ZIP/PowerShell:** The user must first uninstall AG2 Router via Windows Settings > Installed Apps (or the registered Inno uninstaller) to cleanly clear the Inno registration, then run `install.ps1`.
 - **Switching from ZIP/PowerShell to Inno:** Supported directly; the Inno Setup installer stages the existing directory and prunes the legacy script uninstall registration after verifying strict ownership guards.
 
@@ -80,6 +81,7 @@ Ownership checks are part of the safety contract. `uninstall.ps1` classifies ins
 - If `PowerShellOwned`, uninstallation proceeds with existing cleanup steps.
 - If `InnoOwned`, `uninstall.ps1` refuses removal and directs the user to the registered Inno uninstaller or Windows Installed Apps.
 - If `Ambiguous`, `uninstall.ps1` fails closed without touching files, shortcuts, or registry entries.
+- If `ForeignConflict`, `uninstall.ps1` refuses to remove or modify unproven/foreign registrations.
 
 Both PowerShell and Inno uninstall entry points coordinate with the session mutex `Local\AG2Router_Session_Mutex` and fail closed if stopped state cannot be proven. PowerShell requires a successful process enumeration both before and after its bounded exit request; query failure is unknown, not stopped. Inno's helper invocation is nonblocking and followed by bounded mutex polling; a query failure or held mutex prevents destructive removal. A missing executable by itself is not proof that the application stopped.
 

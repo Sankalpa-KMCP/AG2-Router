@@ -1,4 +1,18 @@
 <script lang="ts">
+  /**
+   * AccountsTable Component
+   *
+   * Displays enrolled accounts, status badges (active, reserve, candidate),
+   * inline alias editing, and manual switch triggers.
+   *
+   * Architectural & Safety Invariants:
+   * - Mutation Fencing: `canMutate` derives from `lifecycleMutationsAllowed && !isQuarantined`.
+   *   Mutations (switching, alias update, deletion, enrollment) are strictly fenced during
+   *   active switch execution or when quarantine state is active.
+   * - Reserve Account Semantics: Accounts flagged with `isReserve` are excluded from automatic
+   *   quota-based switching, serving as reserved fallbacks for manual invocation.
+   * - Active Account Invariant: The currently active account cannot be deleted or re-switched.
+   */
   import { resolveAccountDisplayName, getAccountSubtitle } from '../utils/helpers.js';
   import type { AccountMetadata } from '../api/types.js';
 

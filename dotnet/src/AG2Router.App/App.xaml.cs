@@ -19,6 +19,20 @@ using AG2Router.Windows.Security;
 
 namespace AG2Router.App;
 
+/// <summary>
+/// Shipped WPF Application Host and Composition Root for AG2 Router.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Lifecycle Invariants:</b>
+/// <list type="bullet">
+/// <item><description>Single-Instance Ownership: Mediated via <see cref="SingleInstanceGuard"/> (mutex + named pipe).</description></item>
+/// <item><description>Tray-First Model: <c>ShutdownMode.OnExplicitShutdown</c> ensures background routing continues when windows close.</description></item>
+/// <item><description>Composition Order: Connect-RPC discovery -> Vault -> Accounts -> Journal Reconciliation -> Router -> Poller -> Loopback -> Tray -> Dashboard.</description></item>
+/// <item><description>R05 Synchronization: Binds configuration generation from <see cref="NativeAutoRouter"/> directly into <see cref="TelemetryPollingCoordinator"/>.</description></item>
+/// </list>
+/// </para>
+/// </remarks>
 public partial class App : System.Windows.Application
 {
     private SingleInstanceGuard? _singleInstanceGuard;
@@ -178,7 +192,7 @@ public partial class App : System.Windows.Application
                 switchCoordinator: _switchCoordinator,
                 autoRouter: _autoRouter,
                 autostartService: _autostartService,
-                onPollingIntervalChanged: interval => _telemetryCoordinator?.UpdateInterval(interval));
+                onPollingIntervalChangedWithGeneration: (interval, gen) => _telemetryCoordinator?.UpdateInterval(interval, gen));
 
             var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
             Log($"Loopback server bound to: {dashboardUrl}");

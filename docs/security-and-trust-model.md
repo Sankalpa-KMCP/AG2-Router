@@ -27,7 +27,7 @@ The application does not claim to defend secrets from a fully compromised same-u
 
 - Kestrel listens on IPAddress.Loopback and rejects non-loopback RemoteIpAddress values.
 - Host is restricted to 127.0.0.1 or localhost.
-- API requests reject foreign Origin and Sec-Fetch-Site: cross-site. A missing Origin remains accepted for same-user native callers.
+- API requests reject foreign Origin and Sec-Fetch-Site: cross-site. A missing Origin remains accepted for same-user native callers. Both the shipped .NET host and the Node reference server enforce these browser mutation checks centrally across all API mutation endpoints before reading or parsing request bodies or executing state changes.
 - Ordinary status and health responses do not issue the switching token. The dedicated POST /api/switching/intent path requires a custom intent-request header and the browser-origin checks before issuing it.
 - Explicit switching requires the per-process token plus confirm: true.
 - WebView2 loads the server URL created by the application.
@@ -40,7 +40,7 @@ LIMITATION: Missing Origin is accepted for same-user local native callers. The s
 
 Remote-network exposure is blocked by loopback binding plus remote-address and Host checks. Same-user, non-browser local processes can reach loopback without general API authentication; most mutations do not require the switch-intent token. Cross-Windows-user/session loopback reachability is UNKNOWN from repository evidence. Do not claim either proven cross-user compromise or proven multi-user isolation without targeted OS-level validation.
 
-Primary evidence: LoopbackServer.cs and LoopbackServerTests, LoopbackServerAccountApiTests, LoopbackSwitchApiTests, and LoopbackRouterApiTests.
+Primary evidence: LoopbackServer.cs, src/server/server.ts, LoopbackServerTests, LoopbackServerAccountApiTests, LoopbackSwitchApiTests, LoopbackRouterApiTests, and test/server.test.ts.
 
 ## WinCred and DPAPI roles
 

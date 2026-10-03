@@ -28,6 +28,7 @@ import {
   VaultError,
   VaultFileEnvelope,
   VaultMutationReceipt,
+  VaultMutationUncertainError,
   VaultedSessionPlaintext
 } from './types.js';
 
@@ -35,6 +36,22 @@ export interface SessionVaultOptions {
   readonly vaultDir?: string;
   readonly dpapiProvider?: IDpapiProvider;
   readonly atomicWriter?: (filePath: string, content: string) => Promise<void>;
+}
+
+// Invariant (R07): Prototype pollution defense.
+// Prevents object injection attacks where an attacker crafts a malicious sessions.dat key
+// that corrupts Object.prototype methods or properties during parsing or traversal.
+const FORBIDDEN_RECORD_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+// Invariant (R07): Strict plain-object enforcement.
+// Rejects arrays, nulls, primitives, and objects with non-standard prototypes.
+// The vault envelope and records container must be plain object dictionaries to prevent schema spoofing.
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 export class SessionVault {
@@ -83,6 +100,18 @@ export class SessionVault {
     await this.saveSessionWithReceipt(accountId, sessionBlob, target);
   }
 
+  /**
+   * Encrypts and persists an account session payload with authoritative readback verification (R07).
+   *
+   * ARCHITECTURAL GUARANTEES:
+   * 1. Internal Identity Framing: Account ID and target are serialized inside the plaintext payload
+   *    prior to DPAPI encryption. Tampering or record swapping will trigger fail-closed validation on read.
+   * 2. Atomic Persistence: Serialized to a temp file and atomically swapped into place via atomicWriter.
+   * 3. Authoritative Readback: Immediately re-reads the persisted envelope from disk to prove durable
+   *    existence and content matching before generating the mutation receipt.
+   * 4. Mutation Uncertainty: If the write fails or the readback differs, throws VaultMutationUncertainError
+   *    so caller knows not to assume success.
+   */
   public async saveSessionWithReceipt(
     accountId: string,
     sessionBlob: Buffer,
@@ -125,7 +154,44 @@ export class SessionVault {
       envelope.records[accountId] = committedRecord;
 
       // 4. Flush temp content before same-directory replacement.
-      await this.writeEnvelope(envelope);
+      let verifiedRecord: VaultAccountRecord | undefined;
+      try {
+        await this.writeEnvelope(envelope);
+      } catch (error) {
+        // A writer may throw after replacement. Only authoritative readback can
+        // distinguish a committed receipt from an unchanged or uncertain outcome.
+        let actual: VaultAccountRecord | undefined;
+        try { actual = this.readEnvelope().records[accountId]; }
+        catch { throw new VaultMutationUncertainError('Vault write outcome is unreadable; manual recovery is required.'); }
+        if (!actual || !this.recordsEqual(actual, committedRecord)) {
+          if ((!actual && !existing) || (actual && existing && this.recordsEqual(actual, existing))) throw error;
+          throw new VaultMutationUncertainError('Vault write outcome changed; manual recovery is required.');
+        }
+        verifiedRecord = actual;
+      }
+
+      // 5. Authoritative readback verification: prove the intended record is durable and readable from disk.
+      if (!verifiedRecord) {
+        let verifiedEnvelope: VaultFileEnvelope;
+        try {
+          verifiedEnvelope = this.readEnvelope();
+        } catch (readError) {
+          if (readError instanceof VaultCorruptionError) {
+            throw readError;
+          }
+          throw new VaultMutationUncertainError(
+            `Vault write completed but authoritative readback failed: ${readError instanceof Error ? readError.message : String(readError)}`
+          );
+        }
+        verifiedRecord = verifiedEnvelope.records[accountId];
+      }
+
+      if (!verifiedRecord || !this.recordsEqual(verifiedRecord, committedRecord)) {
+        throw new VaultMutationUncertainError(
+          'Authoritative readback failed: durable record does not match committed record'
+        );
+      }
+
       return {
         accountId,
         committedRecord,
@@ -147,6 +213,16 @@ export class SessionVault {
       }
       await this.writeEnvelope(envelope);
       return true;
+    });
+  }
+
+  /** Hold the proved record through finalization; action must not reacquire this vault. */
+  public async withCurrentReceipt<T>(receipt: VaultMutationReceipt, action: () => Promise<T>): Promise<T> {
+    return withCoordinatedFileAccess(this.vaultFilePath, async () => {
+      const current = this.readEnvelope().records[receipt.accountId];
+      if (!current || !this.recordsEqual(current, receipt.committedRecord))
+        throw new VaultError('The vaulted session changed before enrollment finalization.');
+      return action();
     });
   }
 
@@ -273,27 +349,88 @@ export class SessionVault {
       );
     }
 
-    const envelope = parsed as Partial<VaultFileEnvelope>;
-    if (envelope.magic !== VAULT_MAGIC) {
+    if (!isPlainObject(parsed)) {
+      throw new VaultCorruptionError(
+        `Vault file at '${this.vaultFilePath}' does not contain a valid JSON object envelope`
+      );
+    }
+
+    if (parsed.magic !== VAULT_MAGIC) {
       throw new VaultCorruptionError(
         `Vault file at '${this.vaultFilePath}' does not have valid magic identifier '${VAULT_MAGIC}'`
       );
     }
 
-    if (envelope.schemaVersion !== VAULT_SCHEMA_VERSION) {
+    if (parsed.schemaVersion !== VAULT_SCHEMA_VERSION) {
       throw new VaultCorruptionError(
-        `Unsupported vault schema version '${envelope.schemaVersion}' (expected ${VAULT_SCHEMA_VERSION})`
+        `Unsupported vault schema version '${String(parsed.schemaVersion)}' (expected ${VAULT_SCHEMA_VERSION})`
       );
     }
 
-    if (!envelope.records || typeof envelope.records !== 'object') {
+    if (!('records' in parsed) || !isPlainObject(parsed.records)) {
       throw new VaultCorruptionError(`Vault file at '${this.vaultFilePath}' missing valid records dictionary`);
     }
 
-    return envelope as VaultFileEnvelope;
+    const recordsObj = parsed.records;
+    for (const key of Object.keys(recordsObj)) {
+      if (!Object.prototype.hasOwnProperty.call(recordsObj, key)) {
+        continue;
+      }
+      if (typeof key !== 'string' || !key.trim() || FORBIDDEN_RECORD_KEYS.has(key)) {
+        throw new VaultCorruptionError(
+          `Vault file at '${this.vaultFilePath}' contains invalid record key '${key}'`
+        );
+      }
+      const entry = recordsObj[key];
+      if (!isPlainObject(entry)) {
+        throw new VaultCorruptionError(
+          `Vault file at '${this.vaultFilePath}' contains invalid record entry for account '${key}'`
+        );
+      }
+      if (typeof entry.accountId !== 'string' || entry.accountId !== key) {
+        throw new VaultCorruptionError(
+          `Vault file at '${this.vaultFilePath}' record accountId '${String(entry.accountId)}' does not match key '${key}'`
+        );
+      }
+      if (typeof entry.target !== 'string' || !entry.target.trim()) {
+        throw new VaultCorruptionError(
+          `Vault file at '${this.vaultFilePath}' record for account '${key}' missing valid target`
+        );
+      }
+      if (typeof entry.encryptedPayloadBase64 !== 'string' || !entry.encryptedPayloadBase64.trim()) {
+        throw new VaultCorruptionError(
+          `Vault file at '${this.vaultFilePath}' record for account '${key}' missing valid encryptedPayloadBase64`
+        );
+      }
+      if (typeof entry.createdAt !== 'string' || !entry.createdAt.trim() || Number.isNaN(Date.parse(entry.createdAt))) {
+        throw new VaultCorruptionError(
+          `Vault file at '${this.vaultFilePath}' record for account '${key}' missing valid createdAt timestamp`
+        );
+      }
+      if (typeof entry.updatedAt !== 'string' || !entry.updatedAt.trim() || Number.isNaN(Date.parse(entry.updatedAt))) {
+        throw new VaultCorruptionError(
+          `Vault file at '${this.vaultFilePath}' record for account '${key}' missing valid updatedAt timestamp`
+        );
+      }
+    }
+
+    const envelope: VaultFileEnvelope = {
+      magic: VAULT_MAGIC,
+      schemaVersion: VAULT_SCHEMA_VERSION,
+      updatedAt: typeof parsed.updatedAt === 'string' && parsed.updatedAt.trim()
+        ? parsed.updatedAt
+        : new Date().toISOString(),
+      records: parsed.records as Record<string, VaultAccountRecord>
+    };
+
+    return envelope;
   }
 
-  private recordsEqual(left: VaultAccountRecord, right: VaultAccountRecord): boolean {
+  private recordsEqual(
+    left: VaultAccountRecord | undefined | null,
+    right: VaultAccountRecord | undefined | null
+  ): boolean {
+    if (!left || !right) return false;
     return left.accountId === right.accountId &&
       left.target === right.target &&
       left.encryptedPayloadBase64 === right.encryptedPayloadBase64 &&

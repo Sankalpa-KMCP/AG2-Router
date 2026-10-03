@@ -1443,6 +1443,17 @@ public class NativeAutoRouterTests : IAsyncDisposable
             return SwitchAsync(targetAccountId, cancellationToken);
         }
 
+        public async Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+            string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
+            string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
+            Func<CancellationToken, Task<IDisposable>> acquireInterruptionAdmissionAsync,
+            CancellationToken cancellationToken = default)
+        {
+            using var admission = await acquireInterruptionAdmissionAsync(cancellationToken);
+            return await SwitchAutomaticallyAsync(targetAccountId, expectedActiveAccountId, planIsCurrent,
+                requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken);
+        }
+
         public NativeSwitchResult MakeResult(string targetAccountId)
         {
 

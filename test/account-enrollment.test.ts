@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { AccountEnrollmentError, AccountEnrollmentService } from '../src/accounts/enrollment.js';
 import { InMemoryAccountStore } from '../src/accounts/account-store.js';
-import { AccountMetadata, CreateAccountInput, IAccountStore, UpdateAccountInput } from '../src/accounts/types.js';
+import { AccountMetadata, CreateAccountInput, EnrollmentAccountCommit, IAccountStore, UpdateAccountInput } from '../src/accounts/types.js';
 import { SessionVault } from '../src/vault/session-vault.js';
 import { IDpapiProvider } from '../src/vault/dpapi.js';
 import { IAG2Adapter } from '../src/ag2/adapter.js';
@@ -60,6 +60,9 @@ class MockWinCredReader implements IWinCredReader {
 }
 
 class FailUpdateAccountStore implements IAccountStore {
+  public async finalizeEnrollment(): Promise<EnrollmentAccountCommit> {
+    throw new Error('injected metadata commit failure');
+  }
   constructor(private readonly inner: IAccountStore) {}
   public listAccounts(): Promise<AccountMetadata[]> { return this.inner.listAccounts(); }
   public getAccount(id: string): Promise<AccountMetadata | null> { return this.inner.getAccount(id); }
@@ -80,6 +83,11 @@ class FailUpdateAccountStore implements IAccountStore {
 }
 
 class BlockingFailUpdateAccountStore implements IAccountStore {
+  public async finalizeEnrollment(): Promise<EnrollmentAccountCommit> {
+    this.signalEntered();
+    await this.release;
+    throw new Error('injected delayed metadata commit failure');
+  }
   public readonly updateEntered: Promise<void>;
   private signalEntered!: () => void;
   private readonly release: Promise<void>;
@@ -111,6 +119,10 @@ class BlockingFailUpdateAccountStore implements IAccountStore {
 }
 
 class RejectActiveCasAccountStore implements IAccountStore {
+  public finalizeEnrollment(expected: AccountMetadata, updates: UpdateAccountInput,
+    _expectedActiveId: string | null, verifyCoherence: () => Promise<void>): Promise<EnrollmentAccountCommit> {
+    return this.inner.finalizeEnrollment!(expected, updates, 'synthetic-concurrent-selection', verifyCoherence);
+  }
   constructor(private readonly inner: IAccountStore) {}
   public listAccounts(): Promise<AccountMetadata[]> { return this.inner.listAccounts(); }
   public getAccount(id: string): Promise<AccountMetadata | null> { return this.inner.getAccount(id); }
@@ -437,10 +449,13 @@ describe('AccountEnrollmentService', () => {
       const enrollment = service.enrollCurrentAccount();
       await blockingStore.updateEntered;
       const newer = Buffer.from('{"token":"newer-synthetic"}');
-      await vault.saveSession(account.id, newer);
+      // Finalization owns the vault; this writer may proceed only after failure
+      // releases that ownership. Conditional compensation must preserve its result.
+      const newerWrite = vault.saveSession(account.id, newer);
+      const rejected = assert.rejects(enrollment);
       blockingStore.releaseFailure();
 
-      await assert.rejects(() => enrollment);
+      await Promise.all([rejected, newerWrite]);
       assert.deepEqual(await vault.getSession(account.id), newer);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });

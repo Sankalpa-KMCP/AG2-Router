@@ -1,4 +1,16 @@
 <script lang="ts">
+  /**
+   * QuotaSection Component
+   *
+   * Renders individual model capacity, quota reset intervals, and exhaustion states.
+   * Wire Contract & Epistemic Alignment:
+   * - Consumes QuotaSnapshotDto from loopback HTTP `/api/quota`.
+   * - Prefers canonical model representations (`canonicalModels`) with stable `canonicalKey`,
+   *   `displayLabel`, and `modes`, falling back to legacy `models` if canonical models are absent.
+   * - Epistemic status: Explicitly preserves distinction between 'unknown' capacity (null fraction,
+   *   depicted in muted neutral styling) versus true 0% exhaustion (`isExhausted: true`). Unknown
+   *   telemetry is NEVER falsely displayed as 0% or full capacity.
+   */
   import { formatQuotaFraction, formatResetTime } from '../utils/helpers.js';
   import type { QuotaSnapshotDto } from '../api/types.js';
 

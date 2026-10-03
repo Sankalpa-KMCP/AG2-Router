@@ -28,6 +28,10 @@ export interface RawModelQuotaDto {
   isExhausted: boolean;
 }
 
+/**
+ * Canonical model quota representation aligned with wire contract (R09).
+ * Properties match both Node reference server and native .NET loopback DTOs.
+ */
 export interface CanonicalModelDto {
   canonicalKey: string;
   displayLabel: string;

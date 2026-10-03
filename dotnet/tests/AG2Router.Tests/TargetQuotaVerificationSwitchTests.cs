@@ -879,6 +879,8 @@ public sealed partial class TargetQuotaVerificationSwitchTests : IDisposable
         public Action? OnReplacement { get; set; }
         public Action? OnRestore { get; set; }
         public Func<Task>? BeforeStopProof { get; set; }
+        public Func<Task>? AfterStopProof { get; set; }
+        public Func<Task>? AfterStopIssued { get; set; }
 
         public TestProcessLifecycle(List<string> timeline)
         {
@@ -896,12 +898,16 @@ public sealed partial class TargetQuotaVerificationSwitchTests : IDisposable
             TimeSpan timeout,
             CancellationToken cancellationToken = default,
             Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
-            Action? onStopAttempted = null)
+            Action? onStopAttempted = null,
+            Action? onStopIssued = null)
         {
             if (BeforeStopProof != null) await BeforeStopProof();
             if (verifyBeforeKillAsync != null) await verifyBeforeKillAsync(cancellationToken);
+            if (AfterStopProof != null) await AfterStopProof();
             onStopAttempted?.Invoke();
             _timeline.Add("PROCESS_STOP");
+            onStopIssued?.Invoke();
+            if (AfterStopIssued != null) await AfterStopIssued();
         }
 
         public Task<AG2ProcessGeneration> LaunchAsync(AG2ProcessSnapshot snapshot, CancellationToken cancellationToken = default)
@@ -1067,6 +1073,17 @@ public sealed partial class TargetQuotaVerificationSwitchTests : IDisposable
             LastRequiredModelKey = requiredWorkloadModelKey;
             LastMinimumCandidateQuotaPercent = minimumCandidateQuotaPercent;
             return SwitchAsync(targetAccountId, cancellationToken);
+        }
+
+        public async Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+            string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
+            string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
+            Func<CancellationToken, Task<IDisposable>> acquireInterruptionAdmissionAsync,
+            CancellationToken cancellationToken = default)
+        {
+            using var admission = await acquireInterruptionAdmissionAsync(cancellationToken);
+            return await SwitchAutomaticallyAsync(targetAccountId, expectedActiveAccountId, planIsCurrent,
+                requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken);
         }
 
         public Task CoordinateShutdownAsync(TimeSpan timeout, CancellationToken cancellationToken = default) =>

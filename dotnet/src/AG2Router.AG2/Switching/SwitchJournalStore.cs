@@ -257,6 +257,10 @@ public sealed class SwitchJournalStore : ISwitchJournalStore
         return DeleteIfUnchangedNonWindows(expectedEntry);
     }
 
+    /// <summary>
+    /// Atomically validates and deletes the journal file on Windows to prevent TOCTOU race conditions.
+    /// Opens the file with GENERIC_READ | DELETE and inspects contents through the same handle before marking delete disposition.
+    /// </summary>
     private async Task<SwitchJournalDeleteResult> DeleteIfUnchangedWindowsAsync(
         SwitchJournalEntry expectedEntry,
         CancellationToken cancellationToken)

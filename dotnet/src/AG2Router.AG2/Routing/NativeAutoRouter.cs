@@ -25,9 +25,32 @@ public class NativeAutoRouter : INativeAutoRouter
     private readonly Dictionary<string, CandidateQuotaEvidence> _quotaEvidence = new(StringComparer.Ordinal);
     private readonly Dictionary<long, string> _activeManualSwitches = new();
     private readonly object _stateLock = new();
+
+    /// <summary>
+    /// Interruption admission gate (R02).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Lock Acquisition Hierarchy:</b>
+    /// <c>Switch ownership (SwitchGate) -> interruption admission (_interruptionAdmission) -> state lock (_stateLock)</c>.
+    /// </para>
+    /// <para>
+    /// <b>Mutual Exclusion Invariant:</b>
+    /// Automatic process interruption (killing the Antigravity instance to apply credentials) and
+    /// configuration updates (<see cref="UpdateConfigWithGeneration"/>) share this admission gate.
+    /// This guarantees that an auto-switch transaction cannot terminate a process under obsolete
+    /// configuration settings, and conversely, a configuration update cannot race or corrupt an
+    /// in-flight process termination. Config saves start at admission, before disk persistence,
+    /// and never acquire switch ownership from inside it.
+    /// </para>
+    /// </remarks>
+    private readonly SemaphoreSlim _interruptionAdmission = new(1, 1);
+    internal Action? ConfigAdmissionContended { get; set; }
+    internal Action? AutomaticAdmissionContended { get; set; }
     internal Func<Task>? BeforeGatePublicationAsync { get; set; }
 
     private RouterConfigDto _config;
+    private long _configGeneration = 1;
     private DateTime? _cooldownUntil;
     private string? _lastActiveAccountId;
     private string? _lastActiveAccountEmail;
@@ -134,26 +157,79 @@ public class NativeAutoRouter : INativeAutoRouter
         }
     }
 
-    public RouterConfigDto UpdateConfig(RouterConfigDto updates)
+    public long ConfigGeneration
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _configGeneration;
+            }
+        }
+    }
+
+    public RouterConfigDto UpdateConfig(RouterConfigDto updates) => UpdateConfigWithGeneration(updates).Config;
+
+    /// <summary>
+    /// Atomically persists configuration updates and publishes a monotonically increasing generation number (R05).
+    /// </summary>
+    /// <param name="updates">The validated new router configuration.</param>
+    /// <returns>A tuple containing the applied configuration and its unique monotonic generation ID.</returns>
+    public (RouterConfigDto Config, long Generation) UpdateConfigWithGeneration(RouterConfigDto updates)
     {
         ArgumentNullException.ThrowIfNull(updates);
         RouterConfigValidator.Validate(updates);
-        lock (_stateLock)
+        if (!_interruptionAdmission.Wait(0))
         {
-            if (!string.IsNullOrEmpty(_configFilePath) && _fileWriter != null)
-            {
-                var json = JsonSerializer.Serialize(updates, new JsonSerializerOptions { WriteIndented = true });
-                _fileWriter.WriteAtomicAsync(_configFilePath, json, CancellationToken.None).GetAwaiter().GetResult();
-            }
-
-            _config = updates;
-            if (!_config.AutoSwitchEnabled &&
-                (_safetyGate.State is RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.WaitingForIdle or RoutingSafetyGateState.LowQuotaDetected))
-            {
-                _safetyGate.Reset("Auto-switch disabled by configuration update.");
-            }
-            return _config;
+            ConfigAdmissionContended?.Invoke();
+            _interruptionAdmission.Wait();
         }
+        try
+        {
+            lock (_stateLock)
+            {
+                if (!string.IsNullOrEmpty(_configFilePath) && _fileWriter != null)
+                {
+                    var json = JsonSerializer.Serialize(updates, new JsonSerializerOptions { WriteIndented = true });
+                    _fileWriter.WriteAtomicAsync(_configFilePath, json, CancellationToken.None).GetAwaiter().GetResult();
+                }
+
+                _config = updates;
+                _configGeneration++;
+                if (!_config.AutoSwitchEnabled &&
+                    (_safetyGate.State is RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.WaitingForIdle or RoutingSafetyGateState.LowQuotaDetected))
+                {
+                    _safetyGate.Reset("Auto-switch disabled by configuration update.");
+                }
+                return (_config, _configGeneration);
+            }
+        }
+        finally { _interruptionAdmission.Release(); }
+    }
+
+    /// <summary>
+    /// Acquires the interruption admission lease for an automatic switch transaction (R02).
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token for acquiring admission.</param>
+    /// <returns>An <see cref="IDisposable"/> lease releasing admission upon disposal.</returns>
+    /// <remarks>
+    /// Held across the pre-kill verification and process termination (<c>Kill</c>), and released
+    /// at <c>onStopIssued</c> before waiting for the process to exit.
+    /// </remarks>
+    internal async Task<IDisposable> AcquireInterruptionAdmissionAsync(CancellationToken cancellationToken)
+    {
+        if (!await _interruptionAdmission.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+        {
+            AutomaticAdmissionContended?.Invoke();
+            await _interruptionAdmission.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        return new InterruptionAdmissionLease(_interruptionAdmission);
+    }
+
+    private sealed class InterruptionAdmissionLease(SemaphoreSlim gate) : IDisposable
+    {
+        private SemaphoreSlim? _gate = gate;
+        public void Dispose() => Interlocked.Exchange(ref _gate, null)?.Release();
     }
 
     public ManualSwitchToken NotifyManualSwitchStarted(string targetAccountId)
@@ -1018,6 +1094,7 @@ public class NativeAutoRouter : INativeAutoRouter
                 targetAccountId, expectedActiveAccountId,
                 () => IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, planConfig, selectedEvidence),
                 requestedModelKey, planConfig.MinimumCandidateQuotaPercent,
+                AcquireInterruptionAdmissionAsync,
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)

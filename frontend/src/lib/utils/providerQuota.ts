@@ -94,6 +94,11 @@ export const MODEL_FAMILIES: ModelFamilyDefinition[] = [
   }
 ];
 
+/**
+ * Extracts normalized model rows for family matching (R09).
+ * Utilizes `canonicalKey` and `displayLabel` from canonicalModels, ensuring family matchers
+ * have rich identity strings without encountering 'undefined undefined'.
+ */
 function modelRows(quota: QuotaSnapshotDto | null): ModelRow[] {
   if (!quota) return [];
   if (quota.canonicalModels?.length) {

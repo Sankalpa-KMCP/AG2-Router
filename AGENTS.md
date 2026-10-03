@@ -57,6 +57,7 @@ Common routes:
 - Polling or WebView2 lifecycle work: runtime-architecture.md and persistence-and-concurrency.md.
 - Build, generated UI, installer, or release work: build-and-release.md and packaging tests.
 - Test design or live integration: testing.md.
+- Codebase onboarding & comprehensive architecture tour: code-tour.md.
 
 ## Derived graph navigation
 

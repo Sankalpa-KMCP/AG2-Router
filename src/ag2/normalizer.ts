@@ -224,6 +224,18 @@ export function selectLatestResetTime(resetTimes: Array<string | undefined>): st
   });
 }
 
+/**
+ * Canonicalizes raw model quotas into structured wire contract objects (R09).
+ *
+ * DUAL PROPERTY EMISSION (R09):
+ * Returns objects containing both `key`/`label` AND `canonicalKey`/`displayLabel`.
+ * This prevents 'undefined undefined' identities in the frontend matcher and guarantees
+ * wire compatibility with both .NET NativeLoopbackServer DTOs and Svelte dashboard components.
+ *
+ * MODEL POOL PRESERVATION:
+ * Preserves individual model rows without synthetic aggregation, ensuring exhausted or low-quota
+ * models cannot be masked by healthy models in distinct quota tiers.
+ */
 export function canonicalizeModelQuotas(models?: readonly ModelQuotaInfo[]): readonly CanonicalModelQuotaInfo[] {
   if (!models || models.length === 0) {
     return [];
@@ -257,12 +269,14 @@ export function canonicalizeModelQuotas(models?: readonly ModelQuotaInfo[]): rea
     const knownFractions = items.map(m => m.remainingFraction).filter((n): n is number => n !== null && Number.isFinite(n));
     const remainingFraction = knownFractions.length > 0 ? Math.max(0, Math.min(1, Math.min(...knownFractions))) : null;
     const isExhausted = items.some((m) => m.isExhausted) || remainingFraction === 0;
-    const resetTime = selectLatestResetTime(items.map((m) => m.resetTime));
-    const modelOrTier = items.find((m) => m.modelOrTier && m.modelOrTier.trim())?.modelOrTier?.trim();
+    const resetTime = selectLatestResetTime(items.map((m) => m.resetTime)) ?? null;
+    const modelOrTier = items.find((m) => m.modelOrTier && m.modelOrTier.trim())?.modelOrTier?.trim() ?? null;
 
     return {
       key,
       label: displayLabel,
+      canonicalKey: key,
+      displayLabel,
       modelOrTier,
       remainingFraction,
       resetTime,

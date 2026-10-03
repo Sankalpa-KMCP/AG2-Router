@@ -85,10 +85,27 @@ export interface AccountSummary {
   readonly quota: AccountQuotaSummary | null;
 }
 
+export interface EnrollmentAccountCommit {
+  readonly account: AccountMetadata;
+  readonly activeUpdated: boolean;
+}
+
+/** The durable outcome or its conditional restoration could not be proved. */
+export class EnrollmentCommitUncertainError extends Error {}
+
 /**
  * Account Store contract interface.
  */
 export interface IAccountStore {
+  /**
+   * Commit only the expected metadata, preserving a newer active choice. Revalidate
+   * after durable writes while still owning storage; restore owned writes on failure.
+   * Stores without this boundary cannot be used for current-session enrollment.
+   */
+  finalizeEnrollment?(
+    expected: AccountMetadata, updates: UpdateAccountInput, expectedActiveId: string | null,
+    verifyCoherence: () => Promise<void>
+  ): Promise<EnrollmentAccountCommit>;
   /**
    * Return all registered accounts sorted by priority.
    */

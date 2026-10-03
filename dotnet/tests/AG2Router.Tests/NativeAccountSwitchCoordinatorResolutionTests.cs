@@ -1568,10 +1568,12 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
             TimeSpan timeout,
             CancellationToken cancellationToken = default,
             Func<CancellationToken, Task>? verifyBeforeKillAsync = null,
-            Action? onStopAttempted = null)
+            Action? onStopAttempted = null,
+            Action? onStopIssued = null)
         {
             StopCount++;
             _timeline.Add("PROCESS_STOP");
+            onStopIssued?.Invoke();
             return Task.CompletedTask;
         }
 

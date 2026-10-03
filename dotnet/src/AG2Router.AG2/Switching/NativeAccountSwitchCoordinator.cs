@@ -660,6 +660,15 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         CancellationToken cancellationToken = default)
         => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken);
 
+    public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+        string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
+        string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
+        Func<CancellationToken, Task<IDisposable>> acquireInterruptionAdmissionAsync,
+        CancellationToken cancellationToken = default)
+        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent,
+            requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken,
+            acquireInterruptionAdmissionAsync ?? throw new ArgumentNullException(nameof(acquireInterruptionAdmissionAsync)));
+
     public bool CanAdmitSwitch(out string? blockingReason)
     {
         lock (_statusLock)
@@ -723,7 +732,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     private async Task<NativeSwitchResult> ObserveSwitchAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool>? planIsCurrent,
         string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<CancellationToken, Task<IDisposable>>? acquireInterruptionAdmissionAsync = null)
     {
         if (!CanAdmitSwitch(out var blockingReason))
         {
@@ -753,7 +763,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         // The inner task owns every switch gate/lease until it actually finishes.
         // Timeout detaches only the caller, never the mutation or its serialization.
         Task<NativeSwitchResult> operation = SwitchCoreAsync(
-            targetAccountId, expectedActiveAccountId, planIsCurrent, requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken);
+            targetAccountId, expectedActiveAccountId, planIsCurrent, requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken,
+            acquireInterruptionAdmissionAsync);
         try
         {
             return await operation.WaitAsync(_transactionTimeout).ConfigureAwait(false);
@@ -794,7 +805,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     private async Task<NativeSwitchResult> SwitchCoreAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool>? planIsCurrent,
         string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<CancellationToken, Task<IDisposable>>? acquireInterruptionAdmissionAsync = null)
     {
         if (!CanAdmitSwitch(out var blockingReason))
         {
@@ -1048,36 +1060,61 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 quarantineReasonCode: null,
                 cancellationToken: mutationToken).ConfigureAwait(false);
 
-            await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken,
-                    async token =>
-                    {
-                        if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
-                            throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
-                                "Account lifecycle is unresolved at the process-stop boundary.");
-                        string? authoritativeId = await _accountStore.GetActiveAccountIdAsync(token)
-                            .ConfigureAwait(false);
-                        var live = await _adapter.GetCurrentAccountAsync(token).ConfigureAwait(false);
-                        if (!string.Equals(authoritativeId, previousAccountId, StringComparison.Ordinal) ||
-                            !SourceIdentityMatches(sourceAccount, live))
-                            throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
-                                "Live or active identity changed at the process-stop boundary.");
-                        var stopActivity = await _adapter.GetActivityStateAsync(token).ConfigureAwait(false);
-                        if (stopActivity.RunningTrajectories > 0 ||
-                            string.Equals(stopActivity.State, "BUSY", StringComparison.OrdinalIgnoreCase))
-                            throw new SwitchRejectedException(SwitchResultCodes.Ag2Busy,
-                                "Antigravity became busy at the process-stop boundary.");
-                        if (!string.Equals(stopActivity.State, "IDLE", StringComparison.OrdinalIgnoreCase))
-                            throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
-                                "Antigravity activity was not proven idle at the process-stop boundary.");
-                        if (planIsCurrent != null && !planIsCurrent())
-                            throw new SwitchRejectedException(SwitchResultCodes.Cancelled,
-                                "Automatic quota evidence changed or expired at the process-stop boundary.");
-                        if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
-                            throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
-                                "Account lifecycle became unresolved at the process-stop boundary.");
-                    },
-                    onStopAttempted: () => processTransitionStarted = true)
-                .ConfigureAwait(false);
+            // R02: Interruption admission lifecycle
+            // When executing an automatic switch, acquireInterruptionAdmissionAsync is provided.
+            // Admission is acquired inside verifyBeforeKillAsync, held across the process Kill() invocation,
+            // and explicitly released in onStopIssued before waiting for the process to exit.
+            // The finally block ensures that if any check throws, the admission lease is deterministically disposed.
+            IDisposable? interruptionAdmission = null;
+            try
+            {
+                await _processLifecycle.StopVerifiedAsync(processSnapshot, _processTimeout, mutationToken,
+                        async token =>
+                        {
+                            if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
+                                throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                                    "Account lifecycle is unresolved at the process-stop boundary.");
+                            string? authoritativeId = await _accountStore.GetActiveAccountIdAsync(token)
+                                .ConfigureAwait(false);
+                            var live = await _adapter.GetCurrentAccountAsync(token).ConfigureAwait(false);
+                            if (!string.Equals(authoritativeId, previousAccountId, StringComparison.Ordinal) ||
+                                !SourceIdentityMatches(sourceAccount, live))
+                                throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
+                                    "Live or active identity changed at the process-stop boundary.");
+                            var stopActivity = await _adapter.GetActivityStateAsync(token).ConfigureAwait(false);
+                            if (stopActivity.RunningTrajectories > 0 ||
+                                string.Equals(stopActivity.State, "BUSY", StringComparison.OrdinalIgnoreCase))
+                                throw new SwitchRejectedException(SwitchResultCodes.Ag2Busy,
+                                    "Antigravity became busy at the process-stop boundary.");
+                            if (!string.Equals(stopActivity.State, "IDLE", StringComparison.OrdinalIgnoreCase))
+                                throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
+                                    "Antigravity activity was not proven idle at the process-stop boundary.");
+                            // Caller cancellation still applies while waiting for final admission:
+                            // no source mutation has occurred yet. Do not hold router state ownership.
+                            if (acquireInterruptionAdmissionAsync != null)
+                            {
+                                using var admissionCts = CancellationTokenSource.CreateLinkedTokenSource(token, cancellationToken);
+                                interruptionAdmission = await acquireInterruptionAdmissionAsync(admissionCts.Token)
+                                    .ConfigureAwait(false)
+                                    ?? throw new InvalidOperationException("Automatic interruption admission did not provide ownership.");
+                                admissionCts.Token.ThrowIfCancellationRequested();
+                            }
+                            if (planIsCurrent != null && !planIsCurrent())
+                                throw new SwitchRejectedException(SwitchResultCodes.Cancelled,
+                                    "Automatic quota evidence changed or expired at the process-stop boundary.");
+                            if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
+                                throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                                    "Account lifecycle became unresolved at the process-stop boundary.");
+                        },
+                        onStopAttempted: () => processTransitionStarted = true,
+                        onStopIssued: () =>
+                        {
+                            // Release only AFTER the kill request, never at the pre-kill notification.
+                            Interlocked.Exchange(ref interruptionAdmission, null)?.Dispose();
+                        })
+                    .ConfigureAwait(false);
+            }
+            finally { Interlocked.Exchange(ref interruptionAdmission, null)?.Dispose(); }
             stages.Add("SOURCE_PROCESS_STOPPED");
 
             // The source may have refreshed WinCred after the provisional preflight read.

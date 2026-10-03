@@ -107,6 +107,17 @@ public interface INativeAccountSwitchCoordinator
         double? minimumCandidateQuotaPercent,
         CancellationToken cancellationToken = default) => SwitchAutomaticallyAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, cancellationToken);
     Task<JournalResolutionResult> ResolveQuarantinedJournalAsync(CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Acquires configuration ownership at the final currentness proof and retains it
+    /// until source interruption is issued, or disposes it if admission/stop fails.
+    /// Acquisition runs under switch ownership; it must not reacquire that ownership.
+    /// </summary>
+    Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+        string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
+        string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
+        Func<CancellationToken, Task<IDisposable>> acquireInterruptionAdmissionAsync,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("This coordinator does not support owned automatic interruption admission.");
     NativeSwitchStatus GetStatus();
     Task CoordinateShutdownAsync(TimeSpan timeout, CancellationToken cancellationToken = default);
     bool CanAdmitSwitch(out string? blockingReason)

@@ -43,6 +43,8 @@ public class LoopbackServer : IAsyncDisposable
         INativeAutoRouter? autoRouter = null,
         IAutostartService? autostartService = null,
         Action<TimeSpan>? onPollingIntervalChanged = null,
+        Action<TimeSpan, long>? onPollingIntervalChangedWithGeneration = null,
+        Func<TimeSpan, long, Task>? onPollingIntervalChangedAsync = null,
         CancellationToken cancellationToken = default)
     {
         string switchIntentToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
@@ -651,10 +653,22 @@ public class LoopbackServer : IAsyncDisposable
                     return Results.Json(new { error = "Invalid configuration payload." }, statusCode: StatusCodes.Status400BadRequest);
                 }
                 RouterConfigValidator.Validate(body);
-                var updated = autoRouter.UpdateConfig(body);
+                var (updated, generation) = autoRouter.UpdateConfigWithGeneration(body);
                 if (body.PollingIntervalMs > 0)
                 {
-                    onPollingIntervalChanged?.Invoke(TimeSpan.FromMilliseconds(body.PollingIntervalMs));
+                    var interval = TimeSpan.FromMilliseconds(body.PollingIntervalMs);
+                    if (onPollingIntervalChangedAsync != null)
+                    {
+                        await onPollingIntervalChangedAsync(interval, generation);
+                    }
+                    else if (onPollingIntervalChangedWithGeneration != null)
+                    {
+                        onPollingIntervalChangedWithGeneration(interval, generation);
+                    }
+                    else
+                    {
+                        onPollingIntervalChanged?.Invoke(interval);
+                    }
                 }
                 return Results.Ok(new { success = true, config = updated });
             }

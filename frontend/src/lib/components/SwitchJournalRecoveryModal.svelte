@@ -1,4 +1,19 @@
 <script lang="ts">
+  /**
+   * SwitchJournalRecoveryModal Component
+   *
+   * Interactive recovery workflow for quarantined account switches.
+   *
+   * Architectural & Recovery Semantics:
+   * - Triggered when `switchStatus.quarantine` is true (indicating an interrupted switch
+   *   or unfinalized journal was discovered during startup or health check).
+   * - Prevents split-brain state: ordinary switches and account lifecycle mutations are
+   *   locked out while in quarantine.
+   * - Reconciles recovery copy based on authoritative backend journal analysis (verifying
+   *   whether credentials and processes reflect the source or target account).
+   * - Submits resolution request (`onConfirm`) to either roll back safely or complete
+   *   the switch, releasing quarantine upon successful resolution.
+   */
   import type { JournalResolutionResult, SwitchStatusDto } from '../api/types.js';
   import { reconcileRecoveryCopy, type ResolutionCopy } from '../utils/recovery.js';
 

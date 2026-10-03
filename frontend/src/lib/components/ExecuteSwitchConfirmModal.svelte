@@ -1,4 +1,14 @@
 <script lang="ts">
+  /**
+   * ExecuteSwitchConfirmModal Component
+   *
+   * Two-step manual switch confirmation dialog.
+   * Ensures intentionality before initiating an account switch:
+   * - Informs the user that Antigravity will be briefly stopped and restarted with
+   *   the target account credentials.
+   * - Invokes onConfirm to execute the switch via the ApiClient.
+   * - Maps failures cleanly via getSwitchErrorMessage without exposing raw stack traces.
+   */
   import type { AccountMetadata } from '../api/types.js';
   import { resolveAccountDisplayName } from '../utils/helpers.js';
   import { getSwitchErrorMessage } from '../utils/switching.js';
