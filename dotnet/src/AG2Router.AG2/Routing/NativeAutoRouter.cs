@@ -48,6 +48,8 @@ public class NativeAutoRouter : INativeAutoRouter
     internal Action? ConfigAdmissionContended { get; set; }
     internal Action? AutomaticAdmissionContended { get; set; }
     internal Func<Task>? BeforeGatePublicationAsync { get; set; }
+    internal Func<string, CancellationToken, Task<IAsyncDisposable>> AcquirePublicationLeaseAsync { get; set; } =
+        async (resource, token) => await CrossProcessFileLease.AcquireAsync(resource, token).ConfigureAwait(false);
 
     private RouterConfigDto _config;
     private long _configGeneration = 1;
@@ -61,6 +63,8 @@ public class NativeAutoRouter : INativeAutoRouter
     private long _nextManualTokenId;
     private bool _manualSwitchPending;
     private bool _disposed;
+    private CancellationTokenSource? _activeEvaluationCts;
+    private Task? _evaluationCancellation;
 
     private sealed record CandidateQuotaEvidence(DateTimeOffset ObservedAtUtc, string Provenance);
 
@@ -454,16 +458,19 @@ public class NativeAutoRouter : INativeAutoRouter
 
     public async Task<SelectionResult> EvaluateCycleAsync(CancellationToken cancellationToken = default)
     {
-        if (_disposed || cancellationToken.IsCancellationRequested)
+        CancellationTokenSource evaluationCts;
+        lock (_stateLock)
         {
-            return new SelectionResult(false, "Evaluation cancelled or router disposed.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
-        }
+            if (_disposed || cancellationToken.IsCancellationRequested)
+                return new SelectionResult(false, "Evaluation cancelled or router disposed.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
 
-        // Concurrency fence: ensure zero overlapping evaluation cycles
-        if (!await _evaluatingGate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
-        {
-            return new SelectionResult(false, "Evaluation already in progress.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+            // Admission and disposal share one owner; concurrent calls never queue.
+            if (!_evaluatingGate.Wait(0))
+                return new SelectionResult(false, "Evaluation already in progress.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
+            evaluationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _activeEvaluationCts = evaluationCts;
         }
+        cancellationToken = evaluationCts.Token;
 
         try
         {
@@ -599,6 +606,7 @@ public class NativeAutoRouter : INativeAutoRouter
 
             // Check Antigravity availability
             var ag2Status = await _adapter.GetStatusAsync(cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             if (!ag2Status.Connected || ag2Status.Status is "DEGRADED" or "OFFLINE" or "ERROR")
             {
                 lock (_stateLock)
@@ -946,7 +954,19 @@ public class NativeAutoRouter : INativeAutoRouter
         }
         finally
         {
-            _evaluatingGate.Release();
+            lock (_stateLock)
+            {
+                _evaluatingGate.Release();
+                _activeEvaluationCts = null;
+                if (_disposed)
+                {
+                    _evaluatingGate.Dispose();
+                    // Cancellation callbacks may still be running after bounded disposal.
+                    _ = _evaluationCancellation!.ContinueWith(_ => evaluationCts.Dispose(),
+                        CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }
+                else evaluationCts.Dispose();
+            }
         }
     }
 
@@ -1111,9 +1131,10 @@ public class NativeAutoRouter : INativeAutoRouter
         // switching. A manual coordinator may have committed a newer identity before
         // its completion callback has published the epoch to this router.
         SemaphoreSlim? publicationLock = null;
-        CrossProcessFileLease? publicationLease = null;
+        IAsyncDisposable? publicationLease = null;
         bool publicationLockHeld = false;
         string? authoritativeActiveId = null;
+        Exception? publicationError = null;
         try
         {
             if (switchResult.Success)
@@ -1123,7 +1144,7 @@ public class NativeAutoRouter : INativeAutoRouter
                 publicationLock = PathLockRegistry.Get(resource);
                 await publicationLock.WaitAsync(deadline.Token).ConfigureAwait(false);
                 publicationLockHeld = true;
-                publicationLease = await CrossProcessFileLease.AcquireAsync(resource, deadline.Token).ConfigureAwait(false);
+                publicationLease = await AcquirePublicationLeaseAsync(resource, deadline.Token).ConfigureAwait(false);
                 authoritativeActiveId = await _accountStore.GetActiveAccountIdAsync(deadline.Token).ConfigureAwait(false);
             }
 
@@ -1195,6 +1216,7 @@ public class NativeAutoRouter : INativeAutoRouter
         }
         catch (Exception ex) when (switchResult.Success)
         {
+            publicationError = ex;
             lock (_stateLock)
             {
                 if (_lastSuccessfulManualEpoch > planEpoch) return;
@@ -1211,16 +1233,43 @@ public class NativeAutoRouter : INativeAutoRouter
         }
         finally
         {
-            if (publicationLease != null) await publicationLease.DisposeAsync().ConfigureAwait(false);
-            if (publicationLockHeld) publicationLock!.Release();
+            try
+            {
+                var cleanupError = await LeaseCleanup.TryDisposeAsync(publicationLease).ConfigureAwait(false);
+                if (cleanupError != null)
+                {
+                    lock (_stateLock)
+                    {
+                        string primaryDetail = publicationError == null ? string.Empty :
+                            $" Primary ownership check failed: {AG2Security.RedactSensitiveText(publicationError.Message)}.";
+                        RequireManualRecovery("Automatic switch result lease cleanup failed; manual recovery required." +
+                            primaryDetail + $" Cleanup failure: {AG2Security.RedactSensitiveText(cleanupError.Message)}");
+                    }
+                }
+            }
+            finally { if (publicationLockHeld) publicationLock!.Release(); }
         }
     }
 
+    /// <summary>Closes evaluation admission and requests cancellation without waiting.
+    /// An admitted evaluation owns gate disposal after its final release.</summary>
     public ValueTask DisposeAsync()
     {
-        if (_disposed) return ValueTask.CompletedTask;
-        _disposed = true;
-        _evaluatingGate.Dispose();
+        lock (_stateLock)
+        {
+            if (_disposed) return ValueTask.CompletedTask;
+            _disposed = true;
+            if (_activeEvaluationCts == null) _evaluatingGate.Dispose();
+            else
+            {
+                // Request cancellation synchronously, but never wait for dependency callbacks.
+                _evaluationCancellation = _activeEvaluationCts.CancelAsync();
+                _ = _evaluationCancellation.ContinueWith(task =>
+                    System.Diagnostics.Trace.TraceError(AG2Security.RedactSensitiveText(task.Exception!.GetBaseException().Message)),
+                    CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+        }
         GC.SuppressFinalize(this);
         return ValueTask.CompletedTask;
     }

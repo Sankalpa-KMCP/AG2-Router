@@ -105,6 +105,227 @@ public class MockAutoRouter : INativeAutoRouter
 
 public class TelemetryPollingCoordinatorTests
 {
+    [Theory]
+    [InlineData("IDLE")]
+    [InlineData("HEALTHY")]
+    [InlineData("MANUAL_RECOVERY_REQUIRED")]
+    [InlineData("ERROR")]
+    public async Task PollFailure_UsesCurrentRouterStatusAndRetainsTelemetryFailure(string routerState)
+    {
+        var router = new MockAutoRouter();
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ =>
+            {
+                // Change after constructor initialization: fallback must read current authority.
+                router.Status = router.Status with { State = routerState, LastDecisionReason = "Current router authority" };
+                throw new IOException("Injected telemetry failure");
+            }
+        };
+        await using var coordinator = new TelemetryPollingCoordinator(adapter, autoRouter: router);
+        SystemStatusDto? published = null;
+        coordinator.StatusUpdated += status => published = status;
+
+        await coordinator.PollAsync();
+
+        Assert.Same(router.Status, coordinator.CurrentStatus.Router);
+        Assert.Same(coordinator.CurrentStatus, published);
+        Assert.Equal("error", published!.Status);
+        Assert.Equal("ERROR", published.Ag2.Status);
+        Assert.Contains("Injected telemetry failure", published.Ag2.Message);
+        Assert.Null(published.Telemetry);
+    }
+
+    [Fact]
+    public async Task StartWhileManualPollActive_PreservesPeriodicLoopWithoutOverlap()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var periodicEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calls = 0;
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = async _ =>
+            {
+                if (Interlocked.Increment(ref calls) == 1)
+                {
+                    entered.TrySetResult();
+                    await release.Task;
+                }
+                else periodicEntered.TrySetResult();
+                return new Ag2StatusDto(false, "OFFLINE", null, "Synthetic status");
+            }
+        };
+        await using var coordinator = new TelemetryPollingCoordinator(adapter, TimeSpan.FromMilliseconds(1));
+        var manual = coordinator.PollAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        coordinator.Start();
+        coordinator.Start();
+        await coordinator.PollAsync();
+        Assert.Equal(1, calls);
+        release.TrySetResult();
+        await manual;
+        await periodicEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await coordinator.StopAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("ok", coordinator.CurrentStatus.Status);
+    }
+
+    [Fact]
+    public async Task StartThenImmediateDispose_IsSafeAndIdempotent()
+    {
+        var coordinator = new TelemetryPollingCoordinator(new MockAG2Adapter());
+        coordinator.Start();
+        await coordinator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        await coordinator.DisposalCompletion;
+        await coordinator.StopAsync();
+        await coordinator.DisposeAsync();
+        Assert.False(coordinator.UpdateInterval(TimeSpan.FromSeconds(1), 100));
+    }
+
+    [Fact]
+    public async Task DisposeActiveManualPoll_CancelsDrainsAndSuppressesPublication()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logs = new List<string>();
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = async token =>
+            {
+                entered.TrySetResult();
+                using var registration = token.Register(() => cancellationObserved.TrySetResult());
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return new Ag2StatusDto(true, "HEALTHY", null, "OK");
+            }
+        };
+        var coordinator = new TelemetryPollingCoordinator(adapter, log: logs.Add);
+        int publications = 0;
+        coordinator.StatusUpdated += _ => publications++;
+        var poll = coordinator.PollAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await coordinator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await poll.WaitAsync(TimeSpan.FromSeconds(2));
+        await coordinator.DisposalCompletion;
+        await coordinator.DisposeAsync();
+        await coordinator.PollAsync();
+        coordinator.Start();
+        Assert.Equal(0, publications);
+        Assert.Empty(logs);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StopTimeoutThenDispose_RetainsResourcesUntilIgnoringPollCompletes(bool background)
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<Ag2StatusDto>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calls = 0;
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ =>
+            {
+                Interlocked.Increment(ref calls);
+                entered.TrySetResult();
+                return release.Task; // Intentionally ignores cancellation.
+            },
+            GetAccountQuotaObservationFunc = _ => throw new InvalidOperationException("Late snapshot assembly must stop")
+        };
+        var logs = new List<string>();
+        var coordinator = new TelemetryPollingCoordinator(adapter, log: logs.Add);
+        int publications = 0;
+        coordinator.StatusUpdated += _ => publications++;
+        Task? manualPoll = null;
+        if (background) coordinator.Start();
+        else manualPoll = coordinator.PollAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await coordinator.PollAsync(); // Single-flight admission skips an overlapping request.
+        using var waitBudget = new CancellationTokenSource();
+        waitBudget.Cancel();
+        try
+        {
+            await coordinator.StopAsync(waitBudget.Token);
+            await coordinator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.False(coordinator.DisposalCompletion.IsCompleted);
+            Assert.Equal(1, calls);
+            await coordinator.PollAsync();
+            Assert.Equal(1, calls);
+        }
+        finally { release.TrySetResult(new Ag2StatusDto(true, "HEALTHY", null, "Late success")); }
+        if (manualPoll != null) await manualPoll.WaitAsync(TimeSpan.FromSeconds(2));
+        await coordinator.DisposalCompletion.WaitAsync(TimeSpan.FromSeconds(2));
+        await coordinator.DisposeAsync();
+        Assert.Equal(0, publications);
+        Assert.Empty(logs);
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
+    public async Task StopActiveManualPoll_CancelsWithoutPublishingError()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = async token =>
+            {
+                entered.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return new Ag2StatusDto(false, "OFFLINE", null, "unused");
+            }
+        };
+        await using var coordinator = new TelemetryPollingCoordinator(adapter);
+        var initial = coordinator.CurrentStatus;
+        var poll = coordinator.PollAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await coordinator.StopAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        await poll;
+        Assert.Same(initial, coordinator.CurrentStatus);
+    }
+
+    [Fact]
+    public async Task PublicationSubscriberCanRequestDisposeAndThrow_WithoutFaultingPoll()
+    {
+        var logs = new List<string>();
+        var coordinator = new TelemetryPollingCoordinator(new MockAG2Adapter(), log: logs.Add);
+        Task? disposal = null;
+        coordinator.StatusUpdated += _ =>
+        {
+            disposal = coordinator.DisposeAsync().AsTask();
+            throw new InvalidOperationException("Injected publication failure");
+        };
+
+        await coordinator.PollAsync();
+        await disposal!.WaitAsync(TimeSpan.FromSeconds(3));
+        await coordinator.DisposalCompletion;
+        Assert.Single(logs);
+        Assert.Contains("StatusUpdated subscriber threw", logs[0]);
+        Assert.Equal("ok", coordinator.CurrentStatus.Status);
+    }
+
+    [Fact]
+    public async Task BackgroundUnexpectedFailure_IsObservedAndSurfacedByDisposal()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failure = new InvalidOperationException("Injected diagnostic failure");
+        var adapter = new MockAG2Adapter { GetStatusFunc = _ => throw new IOException("Injected telemetry failure") };
+        var coordinator = new TelemetryPollingCoordinator(adapter, log: _ =>
+        {
+            entered.TrySetResult();
+            throw failure;
+        });
+        coordinator.Start();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var error = await Record.ExceptionAsync(() => coordinator.DisposeAsync().AsTask());
+
+        Assert.Same(failure, error);
+        Assert.True(coordinator.DisposalCompletion.IsFaulted);
+        Assert.Same(failure, coordinator.DisposalCompletion.Exception!.GetBaseException());
+        await coordinator.PollAsync();
+    }
+
     [Fact]
     public async Task PollAsync_WhenConnected_UpdatesCurrentStatusAndTelemetry()
     {

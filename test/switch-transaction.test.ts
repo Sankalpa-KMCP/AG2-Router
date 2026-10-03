@@ -250,6 +250,8 @@ test('SwitchTransactionCoordinator - Hard execution gate prevents unauthorized e
   const status = coordinator.getStatus();
   assert.strictEqual(status.currentState, 'IDLE');
   assert.strictEqual(status.activeTransactionId, null);
+  assert.strictEqual(status.quarantineActive, false);
+  assert.strictEqual(status.journalRecoveryState, 'NONE');
 });
 
 test('SwitchTransactionCoordinator - Preflight checks fail before any mutation', async () => {

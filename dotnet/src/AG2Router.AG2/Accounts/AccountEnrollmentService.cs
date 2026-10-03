@@ -1,3 +1,4 @@
+using AG2Router.Core.Validation;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -77,6 +78,7 @@ public class AccountEnrollmentService
     {
         try
         {
+            AccountTextValidator.Validate(options?.Name, options?.Alias, options?.Notes);
             // 1. Verify Antigravity 2 is running and has an authenticated account
             var currentAccount = await _adapter.GetCurrentAccountAsync(cancellationToken).ConfigureAwait(false);
             if (currentAccount == null || string.IsNullOrWhiteSpace(currentAccount.Email))
@@ -187,14 +189,14 @@ public class AccountEnrollmentService
                         var committed = await _accountStore.UpdateAccountAsync(
                             pending.Id,
                             new UpdateAccountInput(
-                                Name: options?.Name ?? pending.Name,
+                                Name: options?.Name,
                                 Priority: options?.Priority ?? pending.Priority,
                                 IsReserve: options?.IsReserve ?? pending.IsReserve,
                                 ValidationStatus: AccountValidationStatus.Valid,
                                 HasVaultedSession: true,
                                 LastActiveAt: now,
-                                Notes: options?.Notes ?? pending.Notes,
-                                Alias: options?.Alias ?? pending.Alias
+                                Notes: options?.Notes,
+                                Alias: options?.Alias
                             ),
                             completion.Token).ConfigureAwait(false);
                         if (committed == null)

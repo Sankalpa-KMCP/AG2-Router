@@ -142,7 +142,9 @@ export class SwitchTransactionCoordinator {
     return {
       activeTransactionId: this.activeTransactionId,
       currentState: this.currentState,
-      lastResult: this.lastResult
+      lastResult: this.lastResult,
+      quarantineActive: false,
+      journalRecoveryState: 'NONE'
     };
   }
 

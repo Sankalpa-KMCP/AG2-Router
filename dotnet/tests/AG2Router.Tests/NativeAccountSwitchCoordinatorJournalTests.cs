@@ -59,6 +59,33 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Reconciliation_LeaseCleanup_ReleasesSamePathAndPreservesBodyResult(bool bodyFails, bool cleanupFails)
+    {
+        var coordinator = CreateCoordinator();
+        string resource = _vault.GetVaultPath() + ".switch";
+        LeaseCleanupTestLease? injected = null;
+        coordinator.AcquireRecoveryLeaseAsync = async (path, token) =>
+            injected = new LeaseCleanupTestLease(await CrossProcessFileLease.AcquireAsync(path, token), path, cleanupFails);
+        if (bodyFails) _journal.ReadBehavior = _ => throw new IOException("Primary journal read failure.");
+
+        var result = await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(bodyFails || cleanupFails ? StartupJournalReconciliationStatus.Quarantined :
+            StartupJournalReconciliationStatus.Clean, result.Status);
+        if (bodyFails) Assert.Contains("Primary journal read failure", result.Message);
+        if (cleanupFails) Assert.Contains("Lease cleanup also failed", result.Message);
+        Assert.Equal(bodyFails || cleanupFails, coordinator.GetStatus().QuarantineActive ||
+            coordinator.GetStatus().JournalRecoveryState != JournalRecoveryStates.None);
+        Assert.Equal(1, injected!.DisposeCount);
+        Assert.Equal(1, NativeAccountSwitchCoordinator.SwitchGateForTest.CurrentCount);
+        await LeaseCleanupTestLease.AssertReacquirableAsync(resource);
+    }
+
     private async Task SeedAccountsAsync(bool vaultTarget = true)
     {
         _source = await _accounts.AddAccountAsync(new CreateAccountInput(

@@ -1,3 +1,4 @@
+import { validateAccountText } from './text-validation.js';
 /**
  * AG2 Router - Account Enrollment Service
  *
@@ -93,6 +94,7 @@ export class AccountEnrollmentService {
   public async enrollCurrentAccount(options: EnrollmentOptions = {}): Promise<EnrollmentResult> {
     const capture: { entry: WinCredEntry | null } = { entry: null };
     try {
+      validateAccountText(options);
       const initial = await this.adapter.getCurrentAccount();
       const email = this.requireIdentity(initial);
       if (!this.accountStore.finalizeEnrollment)

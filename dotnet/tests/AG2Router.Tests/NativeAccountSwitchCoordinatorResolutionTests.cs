@@ -51,6 +51,75 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Resolution_LeaseCleanup_ReleasesSamePathAndPreservesBodyResult(bool bodyFails, bool cleanupFails)
+    {
+        var coordinator = CreateCoordinator();
+        string resource = _vault.GetVaultPath() + ".switch";
+        LeaseCleanupTestLease? injected = null;
+        coordinator.AcquireRecoveryLeaseAsync = async (path, token) =>
+            injected = new LeaseCleanupTestLease(await CrossProcessFileLease.AcquireAsync(path, token), path, cleanupFails);
+        if (bodyFails) _journal.ReadBehavior = _ => throw new IOException("Primary journal read failure.");
+
+        var result = await coordinator.ResolveQuarantinedJournalAsync();
+
+        Assert.Equal(bodyFails || cleanupFails ? JournalResolutionStatus.PersistenceFailure :
+            JournalResolutionStatus.NoJournal, result.Status);
+        Assert.Equal(bodyFails ? "IO_ERROR" : cleanupFails ? "LEASE_CLEANUP_FAILED" : null, result.ReasonCode);
+        if (bodyFails) Assert.Contains("I/O error", result.Message);
+        if (cleanupFails) Assert.Contains("Lease cleanup also failed", result.Message);
+        Assert.Equal(1, injected!.DisposeCount);
+        Assert.Equal(1, NativeAccountSwitchCoordinator.SwitchGateForTest.CurrentCount);
+        await LeaseCleanupTestLease.AssertReacquirableAsync(resource);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Resolution_LeaseCleanup_PreservesThrownFailureAndCancellation(bool cancel, bool cleanupFails)
+    {
+        await SeedJournalAsync(SwitchJournalState.RECORDED, "synthetic-source", "synthetic-target");
+        using var cts = new CancellationTokenSource();
+        Exception primary = cancel ? new OperationCanceledException(cts.Token) : new IOException("Primary delete failure.");
+        _journal.DeleteIfUnchangedBehavior = (_, _) =>
+        {
+            if (cancel) cts.Cancel();
+            return Task.FromException<SwitchJournalDeleteResult>(primary);
+        };
+        var coordinator = CreateCoordinator();
+        string resource = _vault.GetVaultPath() + ".switch";
+        LeaseCleanupTestLease? injected = null;
+        coordinator.AcquireRecoveryLeaseAsync = async (path, token) =>
+            injected = new LeaseCleanupTestLease(await CrossProcessFileLease.AcquireAsync(path, token), path, cleanupFails);
+
+        var error = await Record.ExceptionAsync(() => coordinator.ResolveQuarantinedJournalAsync(cts.Token));
+
+        if (cleanupFails && !cancel)
+        {
+            var aggregate = Assert.IsType<AggregateException>(error);
+            Assert.Same(primary, aggregate.InnerExceptions[0]);
+            Assert.Same(injected!.Failure, aggregate.InnerExceptions[1]);
+        }
+        else
+        {
+            Assert.Same(primary, error);
+            if (cancel)
+            {
+                Assert.Equal(cts.Token, Assert.IsType<OperationCanceledException>(error).CancellationToken);
+                if (cleanupFails) Assert.Same(injected!.Failure, error!.Data["LeaseCleanupFailure"]);
+            }
+        }
+        Assert.Equal(1, injected!.DisposeCount);
+        Assert.Equal(1, NativeAccountSwitchCoordinator.SwitchGateForTest.CurrentCount);
+        await LeaseCleanupTestLease.AssertReacquirableAsync(resource);
+    }
+
     private async Task SeedAccountsAsync(
         bool vaultTarget = true,
         bool vaultSource = true,

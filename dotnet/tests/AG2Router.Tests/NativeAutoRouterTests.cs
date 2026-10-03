@@ -9,6 +9,180 @@ namespace AG2Router.Tests;
 
 public class NativeAutoRouterTests : IAsyncDisposable
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DisposeAsync_ActiveIgnoringEvaluation_ReturnsBeforeCompletionAndPreservesFailure(bool fail)
+    {
+        await using var router = CreateRouter();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failure = new IOException("Injected late telemetry failure");
+        CancellationToken evaluationToken = default;
+        _adapter.GetStatusFunc = async token =>
+        {
+            evaluationToken = token;
+            entered.TrySetResult();
+            await release.Task; // Deliberately ignores cancellation.
+            if (fail) throw failure;
+            return new Ag2StatusDto(false, "OFFLINE", null, "Synthetic status");
+        };
+        var evaluation = router.EvaluateCycleAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        try
+        {
+            await router.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(1));
+            await router.DisposeAsync();
+            Assert.False(evaluation.IsCompleted);
+            Assert.True(evaluationToken.IsCancellationRequested);
+            Assert.Contains("disposed", (await router.EvaluateCycleAsync()).Reason);
+        }
+        finally { release.TrySetResult(); }
+        var error = await Record.ExceptionAsync(() => evaluation.WaitAsync(TimeSpan.FromSeconds(2)));
+        if (fail) Assert.Same(failure, error);
+        else Assert.IsAssignableFrom<OperationCanceledException>(error);
+        Assert.Equal(RoutingSafetyGateState.Idle, router.GetStatus().State);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_CooperativeEvaluation_CancelsWithoutRouterError()
+    {
+        await using var router = CreateRouter();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _adapter.GetStatusFunc = async token =>
+        {
+            entered.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            throw new InvalidOperationException("Unreachable after cancellation");
+        };
+        var evaluation = router.EvaluateCycleAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await router.DisposeAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => evaluation.WaitAsync(TimeSpan.FromSeconds(2)));
+        await router.DisposeAsync();
+        Assert.Equal(RoutingSafetyGateState.Idle, router.GetStatus().State);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_SlowCancellationCallback_DoesNotExtendShutdown()
+    {
+        await using var router = CreateRouter();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _adapter.GetStatusFunc = async token =>
+        {
+            using var registration = token.Register(() =>
+            {
+                callbackEntered.TrySetResult();
+                release.Task.GetAwaiter().GetResult();
+            });
+            entered.TrySetResult();
+            await release.Task;
+            return new Ag2StatusDto(false, "OFFLINE", null, "Synthetic status");
+        };
+        var evaluation = router.EvaluateCycleAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        try
+        {
+            await router.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(1));
+            await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.False(evaluation.IsCompleted);
+        }
+        finally { release.TrySetResult(); }
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => evaluation.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task DisposeAsync_ConcurrentEvaluation_IsSkippedAndCannotEnterAfterDisposal()
+    {
+        await using var router = CreateRouter();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<Ag2StatusDto>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calls = 0;
+        _adapter.GetStatusFunc = _ => { Interlocked.Increment(ref calls); entered.TrySetResult(); return release.Task; };
+        var evaluation = router.EvaluateCycleAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        try
+        {
+            Assert.Contains("already in progress", (await router.EvaluateCycleAsync()).Reason);
+            await router.DisposeAsync();
+            Assert.Contains("disposed", (await router.EvaluateCycleAsync()).Reason);
+            Assert.Equal(1, calls);
+        }
+        finally { release.TrySetResult(new Ag2StatusDto(false, "OFFLINE", null, "Synthetic status")); }
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => evaluation.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task DisposeAsync_IdleAndRepeated_ClosesAdmissionSafely()
+    {
+        var router = CreateRouter();
+        _adapter.GetStatusFunc = _ => throw new InvalidOperationException("Disposed router must not poll");
+        await router.DisposeAsync();
+        await router.DisposeAsync();
+        Assert.Contains("disposed", (await router.EvaluateCycleAsync()).Reason);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_ConcurrentAdmission_HasOneAtomicBoundary()
+    {
+        var router = CreateRouter();
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calls = 0;
+        _adapter.GetStatusFunc = _ =>
+        {
+            Interlocked.Increment(ref calls);
+            return Task.FromResult(new Ag2StatusDto(false, "OFFLINE", null, "Synthetic status"));
+        };
+        var evaluation = Task.Run(async () => { await start.Task; return await router.EvaluateCycleAsync(); });
+        var disposal = Task.Run(async () => { await start.Task; await router.DisposeAsync(); });
+        start.TrySetResult();
+        await disposal.WaitAsync(TimeSpan.FromSeconds(2));
+        var error = await Record.ExceptionAsync(() => evaluation.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(error == null || error is OperationCanceledException);
+        int admittedCalls = calls;
+        Assert.InRange(admittedCalls, 0, 1);
+        Assert.Contains("disposed", (await router.EvaluateCycleAsync()).Reason);
+        Assert.Equal(admittedCalls, calls);
+        await router.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PollingBoundedShutdownThenRouterDispose_LateEvaluationCompletesSafely()
+    {
+        await using var router = CreateRouter();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<Ag2StatusDto>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calls = 0;
+        _adapter.GetStatusFunc = _ =>
+        {
+            if (Interlocked.Increment(ref calls) == 1)
+                return Task.FromResult(new Ag2StatusDto(false, "OFFLINE", null, "Synthetic poll"));
+            entered.TrySetResult();
+            return release.Task;
+        };
+        var logs = new List<string>();
+        await using var polling = new AG2Router.App.Services.TelemetryPollingCoordinator(_adapter, autoRouter: router, log: logs.Add);
+        var poll = polling.PollAsync();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        using var expiredBudget = new CancellationTokenSource();
+        expiredBudget.Cancel();
+        try
+        {
+            await polling.StopAsync(expiredBudget.Token);
+            await polling.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.False(polling.DisposalCompletion.IsCompleted);
+            await router.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.False(poll.IsCompleted);
+        }
+        finally { release.TrySetResult(new Ag2StatusDto(false, "OFFLINE", null, "Late evaluation")); }
+        await poll.WaitAsync(TimeSpan.FromSeconds(2));
+        await polling.DisposalCompletion.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Empty(logs);
+        Assert.Equal("ok", polling.CurrentStatus.Status);
+    }
+
     private readonly FakeAccountStore _accountStore = new();
     private readonly FakeSessionVault _sessionVault = new();
     private readonly MockAG2Adapter _adapter = new();
@@ -37,6 +211,51 @@ public class NativeAutoRouterTests : IAsyncDisposable
     {
         _sessionVault.Dispose();
         return ValueTask.CompletedTask;
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task AutomaticPublication_LeaseCleanup_ReleasesSamePathAndReportsBothFailures(bool bodyFails, bool cleanupFails)
+    {
+        await using var router = CreateRouter();
+        var current = CreateAccount("synthetic-current", "current@example.com");
+        var target = CreateAccount("synthetic-target", "target@example.com");
+        _accountStore.Accounts[current.Id] = current;
+        _accountStore.Accounts[target.Id] = target;
+        _accountStore.ActiveAccountId = current.Id;
+        _sessionVault.StoredIds.Add(current.Id);
+        _sessionVault.StoredIds.Add(target.Id);
+        router.SetObservedQuota(target.Id, 0.85, CreateTestModelQuotas(0.85));
+        _adapter.GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "OK"));
+        _adapter.GetQuotaFunc = _ => Task.FromResult<QuotaSnapshotDto?>(new QuotaSnapshotDto(
+            DateTime.UtcNow.ToString("O"), CreateTestModelQuotas(0.05), null, null));
+        _adapter.GetActivityStateFunc = _ => Task.FromResult(new ActivityStatusDto("IDLE", 0, 0, DateTime.UtcNow.ToString("O")));
+        string resource = _sessionVault.GetVaultPath() + ".switch";
+        LeaseCleanupTestLease? injected = null;
+        router.AcquirePublicationLeaseAsync = async (path, token) =>
+        {
+            injected = new LeaseCleanupTestLease(await CrossProcessFileLease.AcquireAsync(path, token), path, cleanupFails);
+            _accountStore.ThrowOnActiveRead = bodyFails;
+            return injected;
+        };
+
+        await router.EvaluateCycleAsync();
+
+        Assert.Equal(1, _switchCoordinator.CallCount);
+        Assert.Equal(bodyFails || cleanupFails ? RoutingSafetyGateState.ManualRecoveryRequired :
+            RoutingSafetyGateState.Cooldown, _safetyGate.State);
+        Assert.Equal(!(bodyFails || cleanupFails), router.GetConfig().AutoSwitchEnabled);
+        var status = router.GetStatus();
+        if (bodyFails) Assert.Contains("Injected active identity read failure", status.LastDecisionReason);
+        if (cleanupFails) Assert.Contains("lease cleanup failed", status.LastDecisionReason);
+        Assert.Equal(1, injected!.DisposeCount);
+        await LeaseCleanupTestLease.AssertReacquirableAsync(resource);
+        _accountStore.ThrowOnActiveRead = false;
+        await router.EvaluateCycleAsync();
+        Assert.Equal(1, _switchCoordinator.CallCount);
     }
 
     private static AccountMetadata CreateAccount(string id, string email, int priority = 1, bool isReserve = false)

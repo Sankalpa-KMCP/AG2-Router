@@ -300,12 +300,12 @@ The loopback HTTP server provides the bridge between the Svelte dashboard UI, tr
 To prevent resource contention, conflicting credential overwrites, and split-brain routing, only one instance of AG2 Router may run per Windows desktop session.
 
 ### Implementation Details (`SingleInstanceGuard.cs`)
-1. **Named Mutex:** Creates a local session mutex `Local\AG2Router-SingleInstance-{UserHash}`.
-2. **Named Pipe IPC:** The primary instance listens on a named pipe `\\.\pipe\ag2-router-{UserHash}`.
+1. **Named Mutex:** Creates a local session mutex `Local\AG2Router_Session_Mutex`. The kernel-scoped `Local\` prefix already isolates it per Windows session.
+2. **Named Pipe IPC:** The named-pipe namespace is machine-global, so the primary instance listens on a session-qualified pipe `AG2Router_Session_IPC_Pipe_{sessionId}` derived from the terminal-services session id (`SingleInstanceIpcNamespace.ForSession`). Independent Windows sessions therefore derive independent pipe names and never contend for one global name. The server listener uses `PipeOptions.CurrentUserOnly` so only the owning user's processes may connect, and each connection is handled on its own task with a bounded command-read timeout, so one stalled client cannot block later commands.
 3. **Command Forwarding:** When a secondary instance is launched (e.g. from the Windows Start menu or installer):
    - It fails to acquire the mutex.
-   - Connects to the named pipe and transmits command arguments (e.g. `--show-dashboard`).
-   - The primary instance receives the command, brings its window to the foreground via Win32 `SetForegroundWindow`, and displays the dashboard.
+   - Connects to the session's named pipe and transmits a command (`ACTIVATE`, `CLOSE`, or `EXIT`).
+   - The primary instance receives the command and activates the dashboard (`ACTIVATE`), closes the dashboard (`CLOSE`), or begins graceful exit (`EXIT`).
    - The secondary instance terminates immediately with exit code 0.
 
 ---

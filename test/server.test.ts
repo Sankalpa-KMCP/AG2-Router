@@ -541,6 +541,9 @@ describe('AppServer (Loopback HTTP & API)', () => {
     const json = JSON.parse(res.body);
     assert.equal(json.status.currentState, 'IDLE');
     assert.equal(json.status.activeTransactionId, null);
+    assert.equal(json.status.lastResult, null);
+    assert.equal(json.status.quarantineActive, false);
+    assert.equal(json.status.journalRecoveryState, 'NONE');
   });
 
   it('should reject POST /api/accounts/:id/switch with 403 Forbidden', async () => {
@@ -548,6 +551,21 @@ describe('AppServer (Loopback HTTP & API)', () => {
     assert.equal(res.status, 403);
     const json = JSON.parse(res.body);
     assert.match(json.error, /Live account switching execution is not authorized/);
+  });
+
+  it('keeps native-only switching, recovery, router-detail, and autostart routes absent', async () => {
+    for (const [urlPath, method] of [
+      ['/api/switching/intent', 'POST'],
+      ['/api/switching/resolve-quarantine', 'POST'],
+      ['/api/router/candidate-evidence', 'GET'],
+      ['/api/router/status', 'GET'],
+      ['/api/router/reset-recovery', 'POST'],
+      ['/api/settings/autostart', 'GET'],
+      ['/api/settings/autostart', 'POST']
+    ]) {
+      const res = await request(urlPath, { method });
+      assert.equal(res.status, 404, `${method} ${urlPath} must remain unsupported`);
+    }
   });
 
   it('should evaluate switch plan via POST /api/accounts/:id/switch-plan when planner is configured', async () => {

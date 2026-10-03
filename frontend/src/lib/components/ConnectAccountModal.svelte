@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { AccountMutationResult } from '../utils/account-mutations.js';
   interface Props {
     isOpen: boolean;
     onClose: () => void;
@@ -8,7 +9,7 @@
       alias?: string;
       priority: number;
       isReserve: boolean;
-    }) => Promise<void>;
+    }) => Promise<AccountMutationResult>;
   }
 
   let {
@@ -65,13 +66,17 @@
     error = null;
 
     try {
-      await onSubmit({
+      const result = await onSubmit({
         email: email.trim(),
         name: name.trim() || undefined,
         alias: alias.trim() || undefined,
         priority: Number(priority) || 1,
         isReserve
       });
+      if (!result.success) {
+        error = result.message;
+        return;
+      }
       resetForm();
       onClose();
     } catch (err) {
@@ -136,6 +141,7 @@
             </label>
             <input
               id="acc-alias"
+              maxlength="64"
               type="text"
               class="input-text"
               placeholder="Work, Personal, Backup 1"
@@ -151,6 +157,7 @@
             </label>
             <input
               id="acc-name"
+              maxlength="256"
               type="text"
               class="input-text"
               placeholder="Google Developer Account"

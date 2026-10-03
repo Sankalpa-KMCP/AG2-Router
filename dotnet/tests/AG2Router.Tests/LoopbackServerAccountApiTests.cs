@@ -67,6 +67,74 @@ public class LoopbackServerAccountApiTests : IAsyncDisposable
         }
     }
 
+    [Theory]
+    [InlineData("name", 256, false)]
+    [InlineData("name", 256, true)]
+    [InlineData("alias", 64, false)]
+    [InlineData("alias", 64, true)]
+    [InlineData("notes", 2048, false)]
+    [InlineData("notes", 2048, true)]
+    public async Task AccountTextBounds_CreateAndEnroll_RejectWithoutMutation(string field, int maximum, bool unicode)
+    {
+        await EnsureServerStartedAsync();
+        string value = unicode ? string.Concat(Enumerable.Repeat("😀", maximum / 2)) : new string('x', maximum);
+        _mockAdapter.CurrentAccount = new AccountIdentityDto("bounds-enroll@example.com", "Provider name");
+        _winCredStore.Seed(VaultConstants.DefaultAg2WinCredTarget, VaultConstants.DefaultAg2WinCredUserName,
+            Encoding.UTF8.GetBytes("{\"token\":\"synthetic-token\",\"auth_method\":\"oauth\"}"));
+        foreach (string route in new[] { "/api/accounts", "/api/accounts/enroll-current" })
+        {
+            var payload = new Dictionary<string, object> { [field] = value, ["email"] = "bounds-create@example.com" };
+            var accepted = await _client.PostAsync(route, new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+            Assert.Equal(route.EndsWith("enroll-current") ? HttpStatusCode.OK : HttpStatusCode.Created, accepted.StatusCode);
+            using var json = JsonDocument.Parse(await accepted.Content.ReadAsStringAsync());
+            Assert.Equal(value, json.RootElement.GetProperty("account").GetProperty(field).GetString());
+            var before = (await _accountStore.ListAccountsAsync()).ToArray();
+            byte[]? vaultBefore = File.Exists(_sessionVault.GetVaultPath()) ? await File.ReadAllBytesAsync(_sessionVault.GetVaultPath()) : null;
+            foreach (string invalid in new[] { value + "x", new string('z', 16000) })
+            {
+                payload[field] = invalid;
+                payload["email"] = "rejected@example.com";
+                var rejected = await _client.PostAsync(route, new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+                Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
+                string error = await rejected.Content.ReadAsStringAsync();
+                Assert.Contains("UTF-16 code units", error);
+                Assert.True(error.Length < 200);
+                Assert.DoesNotContain(invalid, error);
+                Assert.Equal(before, await _accountStore.ListAccountsAsync());
+                if (vaultBefore != null) Assert.Equal(vaultBefore, await File.ReadAllBytesAsync(_sessionVault.GetVaultPath()));
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AccountTextBounds_AliasPatch_IsAtomicAndPreservesClearing(bool unicode)
+    {
+        await EnsureServerStartedAsync();
+        var account = await _accountStore.AddAccountAsync(new CreateAccountInput("patch-bounds@example.com"));
+        string value = unicode ? string.Concat(Enumerable.Repeat("😀", 32)) : new string('x', 64);
+        var accepted = await _client.PatchAsJsonAsync($"/api/accounts/{account.Id}", new { alias = value });
+        Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        var before = await _accountStore.GetAccountAsync(account.Id);
+        Assert.Equal(value, before!.Alias);
+        foreach (string invalid in new[] { value + "x", new string('z', 16000), new string(' ', 65) })
+        {
+            var rejected = await _client.PatchAsJsonAsync($"/api/accounts/{account.Id}", new { alias = invalid });
+            Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
+            Assert.Equal(before, await _accountStore.GetAccountAsync(account.Id));
+            string error = await rejected.Content.ReadAsStringAsync();
+            Assert.Contains("UTF-16 code units", error);
+            Assert.True(error.Length < 200);
+            Assert.DoesNotContain(invalid, error);
+        }
+        foreach (string? clear in new string?[] { null, "", "  " })
+        {
+            Assert.Equal(HttpStatusCode.OK, (await _client.PatchAsJsonAsync($"/api/accounts/{account.Id}", new { alias = clear })).StatusCode);
+            Assert.Null((await _accountStore.GetAccountAsync(account.Id))!.Alias);
+        }
+    }
+
     [Fact]
     public async Task GetAccounts_ReturnsEnrichedList_WithVaultAndActiveStatus()
     {

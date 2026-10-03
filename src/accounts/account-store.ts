@@ -1,3 +1,4 @@
+import { validateAccountText } from './text-validation.js';
 /**
  * Non-secret account metadata stores shared by the TypeScript oracle and .NET runtime.
  */
@@ -62,6 +63,7 @@ function accountsEqual(left: AccountMetadata, right: AccountMetadata): boolean {
 }
 
 function enrollmentMetadata(expected: AccountMetadata, updates: UpdateAccountInput): AccountMetadata {
+  validateAccountText(updates);
   return {
     ...expected,
     name: updates.name !== undefined ? updates.name.trim() : expected.name,
@@ -169,6 +171,7 @@ export class InMemoryAccountStore implements IAccountStore {
   }
 
   public async addAccount(input: CreateAccountInput): Promise<AccountMetadata> {
+    validateAccountText(input);
     const existing = await this.getAccountByEmail(input.email);
     if (existing) throw new Error(`Account with email '${input.email}' already exists.`);
 
@@ -192,6 +195,7 @@ export class InMemoryAccountStore implements IAccountStore {
   }
 
   public async updateAccount(id: string, updates: UpdateAccountInput): Promise<AccountMetadata | null> {
+    validateAccountText(updates);
     const existing = this.accounts.get(id);
     if (!existing) return null;
     const updated: AccountMetadata = {
@@ -382,6 +386,7 @@ export class LocalMetadataAccountStore implements IAccountStore {
   }
 
   public addAccount(input: CreateAccountInput): Promise<AccountMetadata> {
+    validateAccountText(input);
     if (!input.email?.includes('@')) throw new Error('A valid email address is required.');
     return this.mutate((current) => {
       const email = input.email.trim();
@@ -408,6 +413,7 @@ export class LocalMetadataAccountStore implements IAccountStore {
   }
 
   public updateAccount(id: string, updates: UpdateAccountInput): Promise<AccountMetadata | null> {
+    validateAccountText(updates);
     return this.mutate((current) => {
       const index = current.accounts.findIndex((account) => account.id === id);
       if (index < 0) return { next: current, result: null, changed: false };

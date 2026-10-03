@@ -24,6 +24,13 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
 
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
+    private readonly CancellationTokenSource _lifetimeCts = new();
+    private TaskCompletionSource? _activePollCompletion;
+    private CancellationTokenSource? _activePollCts;
+    private Task? _disposeDrainTask;
+    private bool _stopping;
+    private bool _disposeRequested;
+    internal Task DisposalCompletion { get { lock (_stateLock) return _disposeDrainTask ?? Task.CompletedTask; } }
     private long _pollSequence;
     private long _lastAppliedSequence;
     private long _lastAppliedConfigGeneration;
@@ -115,7 +122,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
     {
         lock (_stateLock)
         {
-            if (newInterval <= TimeSpan.Zero) return false;
+            if (_disposeRequested || newInterval <= TimeSpan.Zero) return false;
             if (generation > 0)
             {
                 if (generation < _lastAppliedConfigGeneration)
@@ -145,100 +152,109 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
 
     public void Start()
     {
-        if (_cts != null) return; // Already started
-
-        _cts = new CancellationTokenSource();
-        var token = _cts.Token;
-
-        // Start background polling loop: immediate initial poll followed by periodic timer ticks
-        _pollTask = Task.Run(async () =>
+        lock (_stateLock)
         {
-            try
-            {
-                await PollAsync(token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-            catch (Exception ex)
-            {
-                _log?.Invoke($"Background telemetry polling loop encountered an unexpected error: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
-            }
+            if (_disposeRequested || (_pollTask != null && !_pollTask.IsCompleted) ||
+                (_cts != null && _activePollCompletion != null)) return;
+            _cts?.Dispose();
+            _cts = new CancellationTokenSource();
+            _stopping = false;
+            var token = _cts.Token;
 
-            PeriodicTimer timer;
-            lock (_stateLock)
+            // Start background polling loop: immediate initial poll followed by periodic timer ticks
+            _pollTask = Task.Run(async () =>
             {
-                if (_interval <= TimeSpan.Zero)
+                try
                 {
-                    _log?.Invoke("Polling interval must be positive; cannot start timer.");
+                    await PollAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
                     return;
                 }
-                _timer = new PeriodicTimer(_interval);
-                timer = _timer;
-            }
-
-            try
-            {
-                while (!token.IsCancellationRequested)
+                catch (Exception ex)
                 {
-                    try
+                    _log?.Invoke($"Background telemetry polling loop encountered an unexpected error: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
+                }
+
+                PeriodicTimer timer;
+                lock (_stateLock)
+                {
+                    if (_stopping || _disposeRequested || token.IsCancellationRequested) return;
+                    if (_interval <= TimeSpan.Zero)
                     {
-                        if (!await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+                        _log?.Invoke("Polling interval must be positive; cannot start timer.");
+                        return;
+                    }
+                    _timer = new PeriodicTimer(_interval);
+                    timer = _timer;
+                }
+
+                try
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        try
+                        {
+                            if (!await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+                            {
+                                break;
+                            }
+                            await PollAsync(token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
                         {
                             break;
                         }
-                        await PollAsync(token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        _log?.Invoke($"Background telemetry polling loop encountered an unexpected error: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
+                        catch (Exception ex)
+                        {
+                            _log?.Invoke($"Background telemetry polling loop encountered an unexpected error: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
+                        }
                     }
                 }
-            }
-            finally
-            {
-                lock (_stateLock)
+                finally
                 {
-                    timer.Dispose();
-                    if (ReferenceEquals(_timer, timer))
+                    lock (_stateLock)
                     {
-                        _timer = null;
+                        timer.Dispose();
+                        if (ReferenceEquals(_timer, timer))
+                        {
+                            _timer = null;
+                        }
                     }
                 }
-            }
-        }, token);
+            }, token);
+            // Observe even unexpected loop faults (for example a failing diagnostic subscriber).
+            _ = _pollTask.ContinueWith(task =>
+                System.Diagnostics.Trace.TraceError(AG2Security.RedactSensitiveText(task.Exception!.GetBaseException().GetType().Name + ": " + task.Exception.GetBaseException().Message)),
+                CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
     }
 
     public async Task PollAsync(CancellationToken cancellationToken = default)
     {
-        if (cancellationToken.IsCancellationRequested)
+        CancellationTokenSource pollCts;
+        TaskCompletionSource completion;
+        lock (_stateLock)
         {
-            return;
+            if (_stopping || _disposeRequested || cancellationToken.IsCancellationRequested) return;
+            // Admission and disposal share one owner. The zero-wait gate never queues polls.
+            if (!_semaphore.Wait(0)) return;
+            pollCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, _lifetimeCts.Token, _cts?.Token ?? CancellationToken.None);
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _activePollCompletion = completion;
+            _activePollCts = pollCts;
         }
-
-        // Guard against overlapping polls: if a poll is already active, skip this tick cleanly
-        try
-        {
-            if (!await _semaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
-            {
-                return;
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            return;
-        }
+        cancellationToken = pollCts.Token;
 
         long sequence = Interlocked.Increment(ref _pollSequence);
 
         try
         {
             var ag2Status = await _adapter.GetStatusAsync(cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
 
             if (_autoRouter != null)
             {
@@ -248,7 +264,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 }
                 catch (OperationCanceledException)
                 {
-                    // Clean cancellation during shutdown; don't log as an error
+                    throw; // Stop snapshot assembly on expected shutdown cancellation.
                 }
                 catch (Exception ex)
                 {
@@ -256,12 +272,14 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 }
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             var routerDto = _autoRouter?.GetStatus();
 
             SystemStatusDto newStatus;
             if (ag2Status.Connected)
             {
                 var observation = await _adapter.GetAccountQuotaObservationAsync(cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
                 var account = observation?.Account;
                 var quota = observation?.Quota;
 
@@ -272,6 +290,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 }
 
                 var activity = await _adapter.GetActivityStateAsync(cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
 
                 newStatus = new SystemStatusDto(
                     Status: "ok",
@@ -319,17 +338,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 );
             }
 
-            if (TryApplyStatus(sequence, newStatus))
-            {
-                try
-                {
-                    StatusUpdated?.Invoke(newStatus);
-                }
-                catch (Exception ex)
-                {
-                    _log?.Invoke($"StatusUpdated subscriber threw an exception: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
-                }
-            }
+            PublishStatus(sequence, newStatus);
         }
         catch (OperationCanceledException)
         {
@@ -347,7 +356,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                     Activity: new ActivityStatusDto("ERROR", 0, 0, DateTime.UtcNow.ToString("o")),
                     Message: $"Polling error: {safeMessage}"
                 ),
-                Router: new RouterStatusDto(
+                Router: _autoRouter?.GetStatus() ?? new RouterStatusDto(
                     State: "ERROR",
                     AutoSwitchEnabled: false,
                     ActiveAccountId: null,
@@ -360,21 +369,32 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 Telemetry: null
             );
 
-            if (TryApplyStatus(sequence, fallbackStatus))
-            {
-                try
-                {
-                    StatusUpdated?.Invoke(fallbackStatus);
-                }
-                catch (Exception subscriberEx)
-                {
-                    _log?.Invoke($"StatusUpdated subscriber threw an exception on fallback status: {AG2Security.RedactSensitiveText(subscriberEx.GetType().Name + ": " + subscriberEx.Message)}");
-                }
-            }
+            PublishStatus(sequence, fallbackStatus, fallback: true);
         }
         finally
         {
-            _semaphore.Release();
+            lock (_stateLock)
+            {
+                pollCts.Dispose();
+                _semaphore.Release();
+                _activePollCompletion = null;
+                _activePollCts = null;
+                completion.TrySetResult();
+            }
+        }
+    }
+
+    private void PublishStatus(long sequence, SystemStatusDto status, bool fallback = false)
+    {
+        lock (_stateLock)
+        {
+            if (!TryApplyStatus(sequence, status)) return;
+            try { StatusUpdated?.Invoke(status); }
+            catch (Exception ex)
+            {
+                string context = fallback ? " on fallback status" : string.Empty;
+                _log?.Invoke($"StatusUpdated subscriber threw an exception{context}: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
+            }
         }
     }
 
@@ -382,7 +402,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
     {
         lock (_stateLock)
         {
-            if (sequence >= _lastAppliedSequence)
+            if (!_stopping && !_disposeRequested && sequence >= _lastAppliedSequence)
             {
                 _lastAppliedSequence = sequence;
                 Volatile.Write(ref _currentStatus, status);
@@ -392,34 +412,80 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         }
     }
 
+    /// <summary>Requests stop and drains admitted work within the caller's wait budget.
+    /// A canceled wait retains task/CTS ownership; a late poll cannot publish after stop.</summary>
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
-        if (_cts != null)
+        Task background;
+        Task active;
+        lock (_stateLock)
         {
-            _cts.Cancel();
-            if (_pollTask != null)
+            if (_disposeRequested)
             {
-                try
-                {
-                    await _pollTask.WaitAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch { }
+                background = _disposeDrainTask ?? Task.CompletedTask;
+                active = Task.CompletedTask;
             }
-
-            _cts.Dispose();
-            _cts = null;
+            else
+            {
+                _stopping = true;
+                _cts?.Cancel();
+                _activePollCts?.Cancel();
+                _timer?.Dispose();
+                background = _pollTask ?? Task.CompletedTask;
+                active = _activePollCompletion?.Task ?? Task.CompletedTask;
+            }
         }
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        await StopAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
-            await _semaphore.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            await background.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await active.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch { }
-        _semaphore.Dispose();
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || background.IsCanceled) { }
+    }
+
+    /// <summary>Closes admission/publication immediately and waits at most two seconds.
+    /// Cancellation-ignoring work retains its resources until the owned drain completes.</summary>
+    public async ValueTask DisposeAsync()
+    {
+        Task drain;
+        lock (_stateLock)
+        {
+            if (_disposeDrainTask == null)
+            {
+                _disposeRequested = true;
+                _stopping = true;
+                _lifetimeCts.Cancel();
+                _cts?.Cancel();
+                _timer?.Dispose();
+                var background = _pollTask ?? Task.CompletedTask;
+                var active = _activePollCompletion?.Task ?? Task.CompletedTask;
+                _disposeDrainTask = Task.Run(async () =>
+                {
+                    try { await background.ConfigureAwait(false); }
+                    catch (OperationCanceledException) when (background.IsCanceled) { }
+                    finally
+                    {
+                        await active.ConfigureAwait(false);
+                        lock (_stateLock)
+                        {
+                            _timer?.Dispose();
+                            _timer = null;
+                            _cts?.Dispose();
+                            _cts = null;
+                            _lifetimeCts.Dispose();
+                            _semaphore.Dispose();
+                        }
+                    }
+                });
+                _ = _disposeDrainTask.ContinueWith(task =>
+                    System.Diagnostics.Trace.TraceError(AG2Security.RedactSensitiveText(task.Exception!.GetBaseException().GetType().Name + ": " + task.Exception.GetBaseException().Message)),
+                    CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+            drain = _disposeDrainTask;
+        }
+        try { await drain.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); }
+        catch (TimeoutException) when (!drain.IsFaulted) { /* The owned drain retains resources and observes late completion. */ }
         GC.SuppressFinalize(this);
     }
 }

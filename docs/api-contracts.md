@@ -55,6 +55,12 @@ The following C# records define the backend serialization surface:
 
 Account objects must not expose credential blobs, DPAPI ciphertext, WinCred payloads, RPC tokens, or raw process command lines.
 
+### Account text input limits
+
+New account metadata mutations accept alias up to 64, name up to 256, and notes up to 2048 UTF-16 code units, measured before trimming. .NET String.Length and JavaScript string.length use this same metric; an astral character consumes two units. These bounds accommodate short friendly aliases, longer display names, and freeform notes without accepting body-sized metadata. Oversized supplied values are rejected without truncation or persistence, using HTTP 400 and the existing { error } shape with a fixed field-specific message that never includes the value. Existing missing/null/empty, trimming, and alias-clearing semantics remain unchanged.
+
+Native metadata creation and enrollment accept all three fields; native PATCH updates alias only. Node HTTP creation and enrollment accept name/notes and continue to ignore alias; Node PATCH updates alias only. Both account-store implementations bound supplied name/alias/notes in creation, updates, and guarded finalization; enrollment validates options before session mutation. The dashboard name and alias controls use matching maxlengths, while server/domain validation remains authoritative. Existing oversized persisted metadata can still be read and replaced with valid inputs; omitted legacy values and trusted compensation snapshots are preserved rather than revalidated as new input. Evidence: AccountTextValidationTests, LoopbackServerAccountApiTests, account-text-validation.test.ts, and server.test.ts.
+
 AccountMetadata uses lastActiveAt on both backend wire and frontend type. Both .NET and Node backends serialize canonicalKey and displayLabel aliases alongside key and label on canonicalModels; frontend consumption accepts those wire fields. NativeSwitchResult.code is a string.
 
 ### Routing configuration and candidate status
@@ -68,6 +74,8 @@ CandidateEvidenceStatusDto contains modelKey, minimumCandidateQuotaPercent, avai
 ### Recovery status and resolution
 
 GET /api/switching/status returns { status } with activeTransactionId, currentState, lastResult, quarantineActive, and journalRecoveryState. All non-NONE recovery states (ACTION_REQUIRED, NOT_RESOLVABLE, UNKNOWN, RESTART_REQUIRED), independent quarantine, and an active transaction block switching. A failed status refresh revokes frontend safety authority. Confirmation does not freeze permission: the client rechecks current safety before mutation.
+
+The Node reference server also emits the required switching-status recovery fields, both with and without a configured SwitchTransactionCoordinator. It has no persistent switch journal or quarantine mechanism, so quarantineActive is false and journalRecoveryState is NONE. These values describe recovery state, not capability or execution authorization: the Node HTTP switch route remains forbidden (403), switching intent and journal resolution remain absent (404), and the production coordinator execution gate remains disabled. Native router-detail, candidate-evidence, reset-recovery, and autostart routes are also absent in Node. Node account mutation semantics and error redaction are not guaranteed to match the native server.
 
 JournalResolutionResult carries status, message, coherentAccountId, restartRequired, and reasonCode. NoJournal, CleanCleanupCompleted, and ResolvedRestartRequired map to 200; NotResolvable and ordinary ProofFailed map to 409; LIVE_IDENTITY_UNAVAILABLE proof failure maps to 503; PersistenceFailure maps to 500. The client rejects contradictory HTTP/result combinations. ResolvedRestartRequired requires restart before switching resumes. NoJournal and CleanCleanupCompleted also report restartRequired true when quarantine or an established restart requirement remains; journal cleanup does not clear quarantine. The modal independently reconciles its guidance with authoritative subsequent switching status and never claims full completion while switching remains blocked. Recovery mechanics belong in [persistence-and-concurrency.md](persistence-and-concurrency.md#interrupted-switch-consistency).
 

@@ -34,6 +34,9 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     private readonly CancellationTokenSource _shutdownCts = new();
     private volatile bool _isShuttingDown;
     internal Func<Task>? BeforeLeaseReleaseAsync { get; set; }
+    // Internal fault-injection seam; production always acquires the real file lease.
+    internal Func<string, CancellationToken, Task<IAsyncDisposable>> AcquireRecoveryLeaseAsync { get; set; } =
+        async (resource, token) => await CrossProcessFileLease.AcquireAsync(resource, token).ConfigureAwait(false);
     internal void SetJournalRecoveryStateForTest(string state) { lock (_statusLock) { _journalRecoveryState = state; } }
     internal void SetActiveTransactionForTest(string? txId, string state = NativeSwitchStates.Idle) { lock (_statusLock) { _activeTransactionId = txId; _currentState = state; } }
     internal static SemaphoreSlim SwitchGateForTest => SwitchGate;
@@ -154,12 +157,12 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, "Lock acquisition timed out during startup reconciliation."), JournalRecoveryStates.Unknown);
             }
 
-            CrossProcessFileLease? switchLease = null;
-            try
+            IAsyncDisposable? switchLease = null;
+            async Task<StartupJournalReconciliationResult> ReconcileUnderLeaseAsync()
             {
                 try
                 {
-                    switchLease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken).ConfigureAwait(false);
+                    switchLease = await AcquireRecoveryLeaseAsync(switchResource, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -273,14 +276,38 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 _sessionVault.QuarantineUnresolvedMutation();
                 return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unknown switch journal read status '{readResult.Status}'."), JournalRecoveryStates.Unknown);
             }
+            StartupJournalReconciliationResult result;
+            Exception? primaryError = null;
+            Exception? cleanupError = null;
+            try { result = await ReconcileUnderLeaseAsync().ConfigureAwait(false); }
+            catch (Exception ex) { primaryError = ex; throw; }
             finally
             {
-                if (switchLease != null)
+                try
                 {
-                    await switchLease.DisposeAsync().ConfigureAwait(false);
+                    cleanupError = await LeaseCleanup.TryDisposeAsync(switchLease).ConfigureAwait(false);
+                    if (cleanupError != null)
+                    {
+                        _recoveryQuarantine.Mark();
+                        _sessionVault.QuarantineUnresolvedMutation();
+                    }
                 }
-                switchLock.Release();
+                finally { switchLock.Release(); }
+                if (cleanupError != null) LeaseCleanup.PreservePrimaryFailure(primaryError, cleanupError);
             }
+            if (cleanupError != null)
+            {
+                result = result with
+                {
+                    Status = result.Status == StartupJournalReconciliationStatus.Clean
+                        ? StartupJournalReconciliationStatus.Quarantined : result.Status,
+                    Message = result.Message + " Lease cleanup also failed; manual recovery is required."
+                };
+                return RecordStartupReconciliationResult(result,
+                    _journalRecoveryState == JournalRecoveryStates.None ? JournalRecoveryStates.Unknown : _journalRecoveryState);
+            }
+            return result;
+
         }
         finally
         {
@@ -472,12 +499,12 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Lock acquisition timed out during journal resolution.", ReasonCode: "LOCK_TIMEOUT"));
             }
 
-            CrossProcessFileLease? switchLease = null;
-            try
+            IAsyncDisposable? switchLease = null;
+            async Task<JournalResolutionResult> ResolveUnderLeaseAsync()
             {
                 try
                 {
-                    switchLease = await CrossProcessFileLease.AcquireAsync(switchResource, cancellationToken).ConfigureAwait(false);
+                    switchLease = await AcquireRecoveryLeaseAsync(switchResource, cancellationToken).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -614,28 +641,58 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                         ReasonCode: "DELETE_FAILED")
                 });
             }
+            JournalResolutionResult result;
+            Exception? primaryError = null;
+            Exception? cleanupError = null;
+            try { result = await ResolveUnderLeaseAsync().ConfigureAwait(false); }
+            catch (Exception ex) { primaryError = ex; throw; }
             finally
             {
-                if (BeforeLeaseReleaseAsync is { } beforeRelease)
+                bool reusable = false;
+                try
                 {
-                    try { await beforeRelease().ConfigureAwait(false); } catch { }
+                    if (BeforeLeaseReleaseAsync is { } beforeRelease)
+                    {
+                        try { await beforeRelease().ConfigureAwait(false); } catch { }
+                    }
+                    string? completedTransactionId;
+                    lock (_statusLock) completedTransactionId = _activeTransactionId == null ? _lastResult?.TransactionId : null;
+                    reusable = completedTransactionId != null &&
+                        await ProveTransactionReusableAsync(completedTransactionId).ConfigureAwait(false);
                 }
-                string? completedTransactionId;
-                lock (_statusLock) completedTransactionId = _activeTransactionId == null ? _lastResult?.TransactionId : null;
-                bool reusable = completedTransactionId != null &&
-                    await ProveTransactionReusableAsync(completedTransactionId).ConfigureAwait(false);
-                if (switchLease != null)
+                catch (Exception ex) { cleanupError = ex; }
+                try
                 {
-                    await switchLease.DisposeAsync().ConfigureAwait(false);
+                    cleanupError = await LeaseCleanup.TryDisposeAsync(switchLease, cleanupError).ConfigureAwait(false);
+                    lock (_statusLock)
+                    {
+                        if (cleanupError == null && reusable && _activeTransactionId == null && !IsQuarantinedOrRecoveryUnresolved() &&
+                            _currentState is NativeSwitchStates.Complete or NativeSwitchStates.RolledBack or NativeSwitchStates.Failed)
+                            _currentState = NativeSwitchStates.Idle;
+                    }
+                    if (cleanupError != null)
+                    {
+                        _recoveryQuarantine.Mark();
+                        _sessionVault.QuarantineUnresolvedMutation();
+                    }
                 }
-                lock (_statusLock)
-                {
-                    if (reusable && _activeTransactionId == null && !IsQuarantinedOrRecoveryUnresolved() &&
-                        _currentState is NativeSwitchStates.Complete or NativeSwitchStates.RolledBack or NativeSwitchStates.Failed)
-                        _currentState = NativeSwitchStates.Idle;
-                }
-                switchLock.Release();
+                finally { switchLock.Release(); }
+                if (cleanupError != null) LeaseCleanup.PreservePrimaryFailure(primaryError, cleanupError);
             }
+            if (cleanupError != null)
+            {
+                bool failed = result.Status is JournalResolutionStatus.ProofFailed or
+                    JournalResolutionStatus.NotResolvable or JournalResolutionStatus.PersistenceFailure;
+                return RecordResolutionResult(result with
+                {
+                    Status = failed ? result.Status : JournalResolutionStatus.PersistenceFailure,
+                    ReasonCode = failed ? result.ReasonCode : "LEASE_CLEANUP_FAILED",
+                    RestartRequired = true,
+                    Message = result.Message + " Lease cleanup also failed; manual recovery is required."
+                });
+            }
+            return result;
+
         }
         finally
         {

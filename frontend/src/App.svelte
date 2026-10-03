@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { updateAlias, connectAccount, type ConnectAccountInput } from './lib/utils/account-mutations.js';
   import { onMount, onDestroy } from 'svelte';
   import Header from './lib/components/Header.svelte';
   import SummaryCards from './lib/components/SummaryCards.svelte';
@@ -22,6 +23,7 @@
   import {
     getBannerCopy,
     isValidJournalRecoveryState,
+    validateSwitchStatusDto,
     getRecoveryActivityLogMessage,
     canExecuteLifecycleMutation
   } from './lib/utils/recovery.js';
@@ -127,24 +129,6 @@
     routerConfig?.lowQuotaThresholdPercent ?? status?.router?.config?.lowQuotaThresholdPercent ?? 15
   );
 
-  function validateSwitchStatusDto(raw: unknown): SwitchStatusDto | null {
-    if (!raw || typeof raw !== 'object') return null;
-    const obj = raw as Record<string, unknown>;
-    if (typeof obj.quarantineActive !== 'boolean') return null;
-    if (typeof obj.journalRecoveryState !== 'string') return null;
-    if (!isValidJournalRecoveryState(obj.journalRecoveryState)) return null;
-    return {
-      activeTransactionId: typeof obj.activeTransactionId === 'string' ? obj.activeTransactionId : null,
-      currentState: typeof obj.currentState === 'string' ? obj.currentState : 'UNKNOWN',
-      lastResult: (obj.lastResult && typeof obj.lastResult === 'object') ? {
-        code: String((obj.lastResult as Record<string, unknown>).code || ''),
-        message: String((obj.lastResult as Record<string, unknown>).message || '')
-      } : null,
-      quarantineActive: obj.quarantineActive,
-      journalRecoveryState: obj.journalRecoveryState
-    };
-  }
-
   const quarantineActive = $derived(
     switchStatus ? Boolean(switchStatus.quarantineActive) : true
   );
@@ -247,16 +231,15 @@
 
   // Handlers
   async function handleUpdateAlias(id: string, newAlias: string) {
-    refreshGate.beginMutation();
-    try {
-      const res = await api.updateAccountAlias(id, newAlias);
-      if (res.success && res.account) {
-        accounts = accounts.map(a => (a.id === id ? { ...a, alias: res.account.alias } : a));
-        logActivity(`Updated alias for ${res.account.email} to "${res.account.alias || '(cleared)'}".`);
-      }
-    } finally {
-      refreshGate.endMutation();
-    }
+    return updateAlias(id, newAlias, {
+      refreshGate,
+      updateAccountAlias: (id, alias) => api.updateAccountAlias(id, alias),
+      publishAlias: (id, alias) => {
+        accounts = accounts.map(a => (a.id === id ? { ...a, alias } : a));
+      },
+      logActivity,
+      notifyError: message => { globalNotification = { type: 'error', message }; }
+    });
   }
 
   function checkLifecycleMutationsAllowed(operationName: string): boolean {
@@ -293,21 +276,14 @@
     await refreshAll();
   }
 
-  async function handleConnectAccount(data: {
-    email: string;
-    name?: string;
-    alias?: string;
-    priority: number;
-    isReserve: boolean;
-  }) {
-    refreshGate.beginMutation();
-    try {
-      const res = await api.createAccount(data);
-      logActivity(`Connected account metadata for ${res.account.email}.`);
-    } finally {
-      refreshGate.endMutation();
-    }
-    await refreshAll();
+  async function handleConnectAccount(data: ConnectAccountInput) {
+    return connectAccount(data, {
+      refreshGate,
+      createAccount: data => api.createAccount(data),
+      logActivity,
+      notifyError: message => { globalNotification = { type: 'error', message }; },
+      refreshAll
+    });
   }
 
   function handleOpenExecuteSwitch(account: AccountMetadata) {

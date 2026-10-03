@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
 using AG2Router.Windows.Lifecycle;
 using Xunit;
 
@@ -11,14 +14,81 @@ public class SingleInstanceGuardTests
 {
     private readonly SingleInstanceIpcNamespace _ipcNamespace = SingleInstanceTestIpc.CreateNamespace();
 
+    private static async Task<NamedPipeClientStream> ConnectAndSendAsync(
+        SingleInstanceIpcNamespace ipcNamespace, string command, int connectTimeoutMs = 3000)
+    {
+        var client = new NamedPipeClientStream(".", ipcNamespace.PipeName, PipeDirection.Out);
+        await client.ConnectAsync(connectTimeoutMs);
+        var writer = new StreamWriter(client) { AutoFlush = true };
+        await writer.WriteLineAsync(command);
+        return client;
+    }
+
+    private static async Task<NamedPipeClientStream> ConnectStalledClientAsync(SingleInstanceIpcNamespace ipcNamespace)
+    {
+        // Connects and deliberately sends no command line: the handler must isolate it.
+        var client = new NamedPipeClientStream(".", ipcNamespace.PipeName, PipeDirection.Out);
+        await client.ConnectAsync(3000);
+        return client;
+    }
+
     [Fact]
-    public void ProductionNamespace_RetainsExistingEndpointNames()
+    public void ProductionNamespace_IsSessionScoped_AndMutexIsInvariant()
     {
         // Inspect constants only: never open the production endpoints in a test.
+        int sessionId = Process.GetCurrentProcess().SessionId;
+
         Assert.Equal(@"Local\AG2Router_Session_Mutex", SingleInstanceIpcNamespace.Production.MutexName);
-        Assert.Equal("AG2Router_Session_IPC_Pipe", SingleInstanceIpcNamespace.Production.PipeName);
+        Assert.Equal(SingleInstanceIpcNamespace.ForSession(sessionId).PipeName, SingleInstanceIpcNamespace.Production.PipeName);
+        Assert.Equal(SingleInstanceIpcNamespace.ForSession(sessionId).MutexName, SingleInstanceIpcNamespace.Production.MutexName);
+
+        // The historical machine-global pipe name must not remain in use.
+        Assert.NotEqual("AG2Router_Session_IPC_Pipe", SingleInstanceIpcNamespace.Production.PipeName);
+
         Assert.NotEqual(SingleInstanceIpcNamespace.Production.MutexName, _ipcNamespace.MutexName);
         Assert.NotEqual(SingleInstanceIpcNamespace.Production.PipeName, _ipcNamespace.PipeName);
+    }
+
+    [Fact]
+    public void ForSession_IsDeterministicWithinSession_AndDistinctAcrossSessions()
+    {
+        var first = SingleInstanceIpcNamespace.ForSession(7);
+        var second = SingleInstanceIpcNamespace.ForSession(7);
+        var otherSession = SingleInstanceIpcNamespace.ForSession(8);
+
+        Assert.Equal(first.MutexName, second.MutexName);
+        Assert.Equal(first.PipeName, second.PipeName);
+
+        Assert.NotEqual(first.PipeName, otherSession.PipeName);
+        // The mutex is session-scoped by its Local\ prefix, so its name is invariant.
+        Assert.Equal(first.MutexName, otherSession.MutexName);
+    }
+
+    [Fact]
+    public void ForSession_ReconstructsSamePipeName_AcrossIndependentInstances()
+    {
+        // Two independently constructed namespaces for one discriminator must agree,
+        // mirroring two processes of the same session deriving the production name.
+        var left = SingleInstanceIpcNamespace.ForSession(42);
+        var right = new SingleInstanceIpcNamespace(@"Local\AG2Router_Session_Mutex", $"AG2Router_Session_IPC_Pipe_42");
+
+        Assert.Equal(left.MutexName, right.MutexName);
+        Assert.Equal(left.PipeName, right.PipeName);
+        Assert.Equal(@"Local\AG2Router_Session_Mutex", left.MutexName);
+    }
+
+    [Fact]
+    public void ProductionServerPipeOptions_RestrictToCurrentUser()
+    {
+        // Structural assertion of the listener's security configuration. Behavioral
+        // same-user delivery is covered by every command test; genuine cross-user
+        // rejection needs a second OS account and remains a documented limitation.
+        Assert.True(
+            (SingleInstanceGuard.ServerPipeOptions & PipeOptions.CurrentUserOnly) != 0,
+            "The production listener must restrict connections to the current user.");
+        Assert.True(
+            (SingleInstanceGuard.ServerPipeOptions & PipeOptions.Asynchronous) != 0,
+            "The production listener must remain asynchronous.");
     }
 
     [Theory]
@@ -220,5 +290,68 @@ public class SingleInstanceGuardTests
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         var result = await Task.WhenAny(activate2Tcs.Task, Task.Delay(Timeout.Infinite, timeoutCts.Token));
         Assert.True(result == activate2Tcs.Task, "Primary 2 should receive activation signal");
+    }
+
+    [Fact]
+    public async Task StalledClient_CannotBlockSubsequentCommands()
+    {
+        await using var primary = new SingleInstanceGuard(_ipcNamespace);
+        var firstActivationTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondActivationTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int activations = 0;
+        Assert.True(primary.TryAcquire(() =>
+        {
+            int count = Interlocked.Increment(ref activations);
+            if (count == 1) firstActivationTcs.TrySetResult(true);
+            if (count == 2) secondActivationTcs.TrySetResult(true);
+        }));
+
+        // Client A connects and stalls without sending any command line.
+        await using var stalledClient = await ConnectStalledClientAsync(_ipcNamespace);
+
+        // Client B must be serviced while A remains stalled.
+        await using var clientB = await ConnectAndSendAsync(_ipcNamespace, "ACTIVATE");
+        Assert.True(await firstActivationTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)),
+            "A command behind a stalled client must still be delivered within a bounded interval.");
+
+        // Client C proves the listener remains usable after A and B.
+        await using var clientC = await ConnectAndSendAsync(_ipcNamespace, "ACTIVATE");
+        Assert.True(await secondActivationTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)),
+            "The listener must remain usable after servicing a command behind a stalled client.");
+        Assert.Equal(2, Volatile.Read(ref activations));
+    }
+
+    [Fact]
+    public async Task MalformedCommand_DoesNotTerminateListener()
+    {
+        await using var primary = new SingleInstanceGuard(_ipcNamespace);
+        var activatedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(primary.TryAcquire(() => activatedTcs.TrySetResult(true)));
+
+        await using var malformed = await ConnectAndSendAsync(_ipcNamespace, "NOT-A-COMMAND");
+        await using var followUp = await ConnectAndSendAsync(_ipcNamespace, "ACTIVATE");
+
+        Assert.True(await activatedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)),
+            "The listener must keep serving valid commands after a malformed one.");
+    }
+
+    [Fact]
+    public async Task Dispose_WithStalledClientConnected_CompletesBoundedAndReleasesNamespace()
+    {
+        var guard = new SingleInstanceGuard(_ipcNamespace);
+        Assert.True(guard.TryAcquire(() => { }));
+
+        await using var stalledClient = await ConnectStalledClientAsync(_ipcNamespace);
+
+        // Shutdown must cancel the stalled read, drain the per-connection handler,
+        // and release the namespace without deadlock or unobserved exceptions.
+        await guard.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        await using var successor = new SingleInstanceGuard(_ipcNamespace);
+        var activatedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(successor.TryAcquire(() => activatedTcs.TrySetResult(true)));
+        Assert.True(SingleInstanceGuard.SendCommand(_ipcNamespace, "ACTIVATE"),
+            "A new primary must own the pipe after the previous guard shut down with a stalled client.");
+        Assert.True(await activatedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 }

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -8,10 +9,30 @@ namespace AG2Router.Windows.Lifecycle;
 /// The paired endpoints used by a single-instance owner and its command clients.
 /// Tests supply unique endpoints instead of opening the production namespace.
 /// </summary>
+/// <remarks>
+/// <para>
+/// <b>Isolation scope:</b> Both production endpoints are scoped to one Windows session.
+/// The mutex uses the kernel-managed <c>Local\</c> namespace, and the pipe name is qualified
+/// with the terminal-services session id so that independent Windows sessions never contend
+/// for one machine-global pipe. <see cref="Production"/> evaluates the session id once per
+/// process, so every AG2 Router process in the same session reconstructs the same name.
+/// </para>
+/// </remarks>
 public sealed class SingleInstanceIpcNamespace
 {
-    public static SingleInstanceIpcNamespace Production { get; } = new(
-        @"Local\AG2Router_Session_Mutex", "AG2Router_Session_IPC_Pipe");
+    private const string ProductionMutexName = @"Local\AG2Router_Session_Mutex";
+    private const string ProductionPipePrefix = "AG2Router_Session_IPC_Pipe_";
+
+    public static SingleInstanceIpcNamespace Production { get; } =
+        ForSession(Process.GetCurrentProcess().SessionId);
+
+    /// <summary>
+    /// Builds the production endpoint pair for a session discriminator. The mutex name is
+    /// invariant because the <c>Local\</c> prefix already scopes it per session; the pipe name
+    /// carries the discriminator explicitly because the named-pipe namespace is machine-global.
+    /// </summary>
+    public static SingleInstanceIpcNamespace ForSession(int sessionId) => new(
+        ProductionMutexName, $"{ProductionPipePrefix}{sessionId}");
 
     public string MutexName { get; }
     public string PipeName { get; }
@@ -32,7 +53,23 @@ public sealed class SingleInstanceIpcNamespace
 /// </summary>
 public class SingleInstanceGuard : IAsyncDisposable
 {
+    /// <summary>
+    /// Server-side pipe options for the IPC listener. <see cref="PipeOptions.CurrentUserOnly"/>
+    /// restricts connections to the owning Windows user; this is structural configuration,
+    /// asserted by tests, while true cross-user rejection requires a second OS account to
+    /// verify dynamically.
+    /// </summary>
+    internal static PipeOptions ServerPipeOptions { get; } =
+        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly;
+
+    /// <summary>Legitimate clients write one command line immediately after connecting.</summary>
+    private static readonly TimeSpan CommandReadTimeout = TimeSpan.FromSeconds(5);
+
+    private static readonly TimeSpan ListenerRestartDelay = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan ConnectionDrainTimeout = TimeSpan.FromSeconds(2);
+
     private readonly SingleInstanceIpcNamespace _ipcNamespace;
+    private readonly ConcurrentDictionary<Task, byte> _connectionTasks = new();
 
     private Mutex? _mutex;
     private bool _isPrimaryInstance;
@@ -227,14 +264,15 @@ public class SingleInstanceGuard : IAsyncDisposable
             bool isFirstLoop = true;
             while (!token.IsCancellationRequested)
             {
+                NamedPipeServerStream? server = null;
                 try
                 {
-                    await using var server = new NamedPipeServerStream(
+                    server = new NamedPipeServerStream(
                         _ipcNamespace.PipeName,
                         PipeDirection.In,
                         NamedPipeServerStream.MaxAllowedServerInstances,
                         PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous
+                        ServerPipeOptions
                     );
 
                     var waitTask = server.WaitForConnectionAsync(token);
@@ -246,23 +284,15 @@ public class SingleInstanceGuard : IAsyncDisposable
                     }
 
                     await waitTask.ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
 
-                    using var reader = new StreamReader(server);
-                    var message = await reader.ReadLineAsync(token).ConfigureAwait(false);
-                    switch (message)
-                    {
-                        case "ACTIVATE":
-                            _ = Task.Run(() => { try { onActivateRequested(); } catch { } });
-                            break;
-                        case "CLOSE":
-                            if (onCloseRequested != null)
-                                _ = Task.Run(() => { try { onCloseRequested(); } catch { } });
-                            break;
-                        case "EXIT":
-                            if (onExitRequested != null)
-                                _ = Task.Run(() => { try { onExitRequested(); } catch { } });
-                            break;
-                    }
+                    // Connection ownership moves to an independent handler so one stalled
+                    // client can never occupy the accept path; the loop immediately creates
+                    // the next server instance and stays available for later clients.
+                    var connection = server;
+                    server = null;
+                    TrackConnection(HandleConnectionAsync(
+                        connection, token, onActivateRequested, onCloseRequested, onExitRequested));
                 }
                 catch (OperationCanceledException)
                 {
@@ -278,10 +308,79 @@ public class SingleInstanceGuard : IAsyncDisposable
                     }
 
                     // Delay before re-listening to avoid tight loops on unexpected transient error
-                    await Task.Delay(250, token).ConfigureAwait(false);
+                    try
+                    {
+                        await Task.Delay(ListenerRestartDelay, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                }
+                finally
+                {
+                    if (server != null)
+                    {
+                        try { await server.DisposeAsync().ConfigureAwait(false); } catch { }
+                    }
                 }
             }
         }, token);
+    }
+
+    private async Task HandleConnectionAsync(
+        NamedPipeServerStream connection,
+        CancellationToken shutdownToken,
+        Action onActivateRequested,
+        Action? onCloseRequested,
+        Action? onExitRequested)
+    {
+        try
+        {
+            // A client that connects but never completes a command must release its handler:
+            // this read is bounded independently of the accept loop and of other clients.
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
+            readCts.CancelAfter(CommandReadTimeout);
+            using var reader = new StreamReader(connection);
+            var message = await reader.ReadLineAsync(readCts.Token).ConfigureAwait(false);
+            switch (message)
+            {
+                case "ACTIVATE":
+                    _ = Task.Run(() => { try { onActivateRequested(); } catch { } });
+                    break;
+                case "CLOSE":
+                    if (onCloseRequested != null)
+                        _ = Task.Run(() => { try { onCloseRequested(); } catch { } });
+                    break;
+                case "EXIT":
+                    if (onExitRequested != null)
+                        _ = Task.Run(() => { try { onExitRequested(); } catch { } });
+                    break;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Stalled command read timed out, or the instance is shutting down.
+        }
+        catch
+        {
+            // Malformed or failed clients must never terminate the listener.
+        }
+        finally
+        {
+            try { await connection.DisposeAsync().ConfigureAwait(false); } catch { }
+        }
+    }
+
+    private void TrackConnection(Task handler)
+    {
+        _connectionTasks[handler] = 0;
+        _ = handler.ContinueWith(
+            static (completed, state) => ((ConcurrentDictionary<Task, byte>)state!).TryRemove(completed, out _),
+            _connectionTasks,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     public async ValueTask DisposeAsync()
@@ -299,6 +398,19 @@ public class SingleInstanceGuard : IAsyncDisposable
                 catch { }
                 _listenerTask = null;
             }
+
+            if (!_connectionTasks.IsEmpty)
+            {
+                // Connected handlers exit promptly through their shutdown-linked read token;
+                // the bounded drain only guards against pathological waits.
+                try
+                {
+                    await Task.WhenAll(_connectionTasks.Keys.ToArray())
+                        .WaitAsync(ConnectionDrainTimeout).ConfigureAwait(false);
+                }
+                catch { }
+            }
+            _connectionTasks.Clear();
             _pipeCts.Dispose();
             _pipeCts = null;
         }

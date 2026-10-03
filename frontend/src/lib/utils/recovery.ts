@@ -16,6 +16,24 @@ export function isValidJournalRecoveryState(val: unknown): val is JournalRecover
   return typeof val === 'string' && (KNOWN_JOURNAL_RECOVERY_STATES as readonly string[]).includes(val);
 }
 
+export function validateSwitchStatusDto(raw: unknown): SwitchStatusDto | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.quarantineActive !== 'boolean') return null;
+  if (typeof obj.journalRecoveryState !== 'string') return null;
+  if (!isValidJournalRecoveryState(obj.journalRecoveryState)) return null;
+  return {
+    activeTransactionId: typeof obj.activeTransactionId === 'string' ? obj.activeTransactionId : null,
+    currentState: typeof obj.currentState === 'string' ? obj.currentState : 'UNKNOWN',
+    lastResult: (obj.lastResult && typeof obj.lastResult === 'object') ? {
+      code: String((obj.lastResult as Record<string, unknown>).code || ''),
+      message: String((obj.lastResult as Record<string, unknown>).message || '')
+    } : null,
+    quarantineActive: obj.quarantineActive,
+    journalRecoveryState: obj.journalRecoveryState
+  };
+}
+
 export function canExecuteLifecycleMutation(
   isSafetyAuthoritative: boolean,
   switchStatus: { quarantineActive?: boolean; journalRecoveryState?: string } | null | undefined

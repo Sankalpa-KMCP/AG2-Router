@@ -14,6 +14,7 @@
    * - Active Account Invariant: The currently active account cannot be deleted or re-switched.
    */
   import { resolveAccountDisplayName, getAccountSubtitle } from '../utils/helpers.js';
+  import type { AccountMutationResult } from '../utils/account-mutations.js';
   import type { AccountMetadata } from '../api/types.js';
 
   interface Props {
@@ -22,7 +23,7 @@
     onOpenConnect: () => void;
     onExecuteSwitch: (account: AccountMetadata) => void;
     onDeleteAccount: (account: AccountMetadata) => void;
-    onUpdateAlias: (id: string, newAlias: string) => Promise<void>;
+    onUpdateAlias: (id: string, newAlias: string) => Promise<AccountMutationResult>;
     isSavingCurrent?: boolean;
     isSwitching?: boolean;
     isQuarantined?: boolean;
@@ -67,8 +68,9 @@
     isSavingAlias = true;
     aliasError = null;
     try {
-      await onUpdateAlias(id, editValue);
-      editingId = null;
+      const result = await onUpdateAlias(id, editValue);
+      if (result.success) editingId = null;
+      else aliasError = result.message;
     } catch (err) {
       aliasError = err instanceof Error ? err.message : 'Failed to save alias';
     } finally {
@@ -172,6 +174,7 @@
                       <label for="edit-alias-{acc.id}" class="sr-only">Edit Friendly Alias for {acc.email}</label>
                       <input
                         id="edit-alias-{acc.id}"
+                        maxlength="64"
                         type="text"
                         class="input-text alias-input"
                         placeholder="Friendly alias (e.g. Work, Personal)"

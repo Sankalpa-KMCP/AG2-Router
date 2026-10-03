@@ -60,6 +60,8 @@ Security properties are in [security-and-trust-model.md](security-and-trust-mode
 
 The application is tray-first and uses explicit shutdown. Secondary invocations signal the primary instance. The loopback server and polling coordinator are stopped during application exit, and the dashboard/WebView2 environment has its own lazy creation and close lifecycle.
 
+Telemetry polling shutdown closes snapshot publication and cancels admitted work. StopAsync uses the caller's wait budget and retains ownership after an expired wait. DisposeAsync waits at most two seconds; cancellation-ignoring work is drained by an owned completion task before its synchronization and cancellation resources are disposed. This includes explicitly requested PollAsync calls as well as the periodic loop. Telemetry failures retain their error indication while the router projection comes from the current AutoRouter status. Behavioral coverage is in TelemetryPollingCoordinatorTests; configuration-generation and latest-wins checks remain in the polling test suites.
+
 ## TypeScript status
 
 The Node/TypeScript implementation under src/ and its tests under test/ remain build and CI inputs. They are useful reference and parity evidence, but the released Windows executable is composed from dotnet/src/ and the built frontend assets. A TypeScript behavior must not be assumed to exist in the native application without corresponding .NET source, composition, and tests.

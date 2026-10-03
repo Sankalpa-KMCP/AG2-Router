@@ -8,6 +8,8 @@ import { AG2AdapterFoundation } from '../src/ag2/adapter.js';
 import { normalizeQuotaSnapshot, type RawUserStatusResponse } from '../src/ag2/normalizer.js';
 import { QuotaRouter } from '../src/router/router.js';
 import { AppServer } from '../src/server/server.js';
+import { SwitchTransactionCoordinator, type SwitchCoordinatorDependencies } from '../src/switching/transaction.js';
+import { validateSwitchStatusDto, canExecuteLifecycleMutation, getBannerCopy } from '../frontend/src/lib/utils/recovery.js';
 import { type AppConfig } from '../src/config/config.js';
 import type {
   CanonicalModelDto,
@@ -152,6 +154,7 @@ describe('AUD-103 API contract alignment & drift prevention', () => {
         assert.equal(typeof dto.currentState, 'string');
         assert.equal(typeof dto.quarantineActive, 'boolean');
         assert.equal(dto.journalRecoveryState, state);
+        assert.ok(validateSwitchStatusDto(dto), 'Actual frontend validator must recognize the recovery vocabulary');
       }
     });
 
@@ -165,6 +168,96 @@ describe('AUD-103 API contract alignment & drift prevention', () => {
       assert.equal(dto.quarantineActive, true);
       assert.equal(dto.journalRecoveryState, 'NONE');
     });
+  });
+
+  describe('Node switching-status producer to frontend consumer', () => {
+    // Status reads and the disabled execution gate must never touch OS/vault dependencies.
+    function forbiddenDependency<T>(): T {
+      return new Proxy({}, { get() { throw new Error('Status test accessed a forbidden dependency'); } }) as T;
+    }
+
+    for (const configured of [false, true]) {
+      describe(configured ? 'real coordinator configured' : 'no coordinator configured', () => {
+        let server: AppServer;
+        let serializedStatus: string;
+        let coordinator: SwitchTransactionCoordinator | undefined;
+        const port = configured ? 39602 : 39601;
+
+        before(async () => {
+          const store = new InMemoryAccountStore();
+          const adapter = new AG2AdapterFoundation();
+          const config: AppConfig = {
+            host: '127.0.0.1', port,
+            storageDir: path.resolve('unused-synthetic-status-storage'),
+            uiDir: path.resolve('src', 'ui'), isDev: true,
+            router: { autoSwitchEnabled: false, lowQuotaThresholdPercent: 15,
+              minimumCandidateQuotaPercent: 30, pollingIntervalMs: 10000 }
+          };
+          if (configured) {
+            coordinator = new SwitchTransactionCoordinator({
+              accountStore: store, ag2Adapter: adapter,
+              sessionVault: forbiddenDependency<SwitchCoordinatorDependencies['sessionVault']>(),
+              winCredReader: forbiddenDependency<SwitchCoordinatorDependencies['winCredReader']>(),
+              winCredWriter: forbiddenDependency<SwitchCoordinatorDependencies['winCredWriter']>(),
+              processController: forbiddenDependency<SwitchCoordinatorDependencies['processController']>()
+            });
+          }
+          server = new AppServer(config, store, adapter, new QuotaRouter(store, adapter, config.router),
+            undefined, undefined, undefined, coordinator);
+          await server.start();
+          serializedStatus = await new Promise<string>((resolve, reject) => {
+            const req = http.get({ hostname: '127.0.0.1', port, path: '/api/switching/status' }, res => {
+              let body = '';
+              res.on('data', chunk => { body += chunk; });
+              res.on('error', reject);
+              res.on('end', () => {
+                if (res.statusCode !== 200) reject(new Error(`Unexpected HTTP ${res.statusCode}`));
+                else resolve(body);
+              });
+            });
+            req.on('error', reject);
+          });
+        });
+
+        after(async () => { await server?.stop(); });
+
+        it('accepts the actual serialized Node response through the dashboard validator and lifecycle gate', async () => {
+          const raw = JSON.parse(serializedStatus).status;
+          assert.deepEqual(raw, { activeTransactionId: null, currentState: 'IDLE', lastResult: null,
+            quarantineActive: false, journalRecoveryState: 'NONE' });
+          const validated = validateSwitchStatusDto(raw);
+          assert.ok(validated);
+          assert.equal(canExecuteLifecycleMutation(true, validated), true);
+          assert.equal(canExecuteLifecycleMutation(false, validated), false);
+          assert.equal(getBannerCopy(validated.quarantineActive!, validated.journalRecoveryState!), null);
+          if (coordinator) {
+            assert.equal(coordinator.isExecutionAuthorized(), false);
+            await assert.rejects(coordinator.executeSwitch('synthetic-target'),
+              { name: 'SwitchExecutionNotAuthorizedError' });
+            assert.deepEqual(coordinator.getStatus(), raw);
+          }
+        });
+
+        it('still fails closed when required recovery fields are removed or corrupted in the wire response', () => {
+          const raw = JSON.parse(serializedStatus).status;
+          const { quarantineActive: _quarantine, ...missingQuarantine } = raw;
+          const { journalRecoveryState: _recovery, ...missingRecovery } = raw;
+          for (const malformed of [null, {}, missingQuarantine, missingRecovery,
+            { ...raw, quarantineActive: 'false' }, { ...raw, journalRecoveryState: 'INVALID' },
+            { ...raw, journalRecoveryState: null }]) {
+            const validated = validateSwitchStatusDto(malformed);
+            assert.equal(validated, null);
+            assert.equal(canExecuteLifecycleMutation(true, validated), false);
+          }
+          for (const blocked of [{ ...raw, quarantineActive: true },
+            { ...raw, journalRecoveryState: 'UNKNOWN' }]) {
+            const validated = validateSwitchStatusDto(blocked);
+            assert.ok(validated);
+            assert.equal(canExecuteLifecycleMutation(true, validated), false);
+          }
+        });
+      });
+    }
   });
 
   describe('JournalResolutionResult contract', () => {

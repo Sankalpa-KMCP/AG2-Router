@@ -71,6 +71,9 @@ export interface SwitchTransactionResult {
 }
 
 export interface SwitchStatusResponse {
+  /** Node has no persistent journal/quarantine mechanism; these are not capability flags. */
+  readonly quarantineActive: false;
+  readonly journalRecoveryState: 'NONE';
   readonly activeTransactionId: string | null;
   readonly currentState: SwitchTransactionState;
   readonly lastResult: SwitchTransactionResult | null;

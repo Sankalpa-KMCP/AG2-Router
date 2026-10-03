@@ -1,3 +1,4 @@
+using AG2Router.Core.Validation;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -132,6 +133,7 @@ public class LocalMetadataAccountStore : IAccountStore
     public Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(input);
+        AccountTextValidator.Validate(input.Name, input.Alias, input.Notes);
         if (string.IsNullOrWhiteSpace(input.Email) || !input.Email.Contains('@'))
         {
             throw new ArgumentException("A valid email address is required.", nameof(input));
@@ -170,6 +172,7 @@ public class LocalMetadataAccountStore : IAccountStore
     public Task<AccountMetadata?> UpdateAccountAsync(string id, UpdateAccountInput updates, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(updates);
+        AccountTextValidator.Validate(updates.Name, updates.Alias, updates.Notes);
         if (string.IsNullOrWhiteSpace(id)) return Task.FromResult<AccountMetadata?>(null);
 
         return MutateAsync<AccountMetadata?>(state =>
@@ -304,6 +307,7 @@ public class LocalMetadataAccountStore : IAccountStore
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(updates);
+        AccountTextValidator.Validate(updates.Name, updates.Alias, updates.Notes);
         if (string.IsNullOrWhiteSpace(targetId)) return Task.FromResult<AccountMetadata?>(null);
 
         return MutateAsync<AccountMetadata?>(state =>

@@ -1,3 +1,4 @@
+using AG2Router.Core.Validation;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
 
@@ -56,6 +57,7 @@ public class InMemoryAccountStore : IAccountStore
     public Task<AccountMetadata> AddAccountAsync(CreateAccountInput input, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(input);
+        AccountTextValidator.Validate(input.Name, input.Alias, input.Notes);
 
         if (string.IsNullOrWhiteSpace(input.Email) || !input.Email.Contains('@'))
         {
@@ -103,6 +105,7 @@ public class InMemoryAccountStore : IAccountStore
     {
         if (string.IsNullOrWhiteSpace(id)) return Task.FromResult<AccountMetadata?>(null);
         ArgumentNullException.ThrowIfNull(updates);
+        AccountTextValidator.Validate(updates.Name, updates.Alias, updates.Notes);
 
         lock (_syncRoot)
         {
@@ -234,6 +237,7 @@ public class InMemoryAccountStore : IAccountStore
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(updates);
+        AccountTextValidator.Validate(updates.Name, updates.Alias, updates.Notes);
         lock (_syncRoot)
         {
             if (!string.Equals(_activeAccountId, expectedActiveId, StringComparison.Ordinal) ||

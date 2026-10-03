@@ -1,3 +1,4 @@
+import { validateAccountText } from '../accounts/text-validation.js';
 /**
  * AG2 Router - Lightweight Loopback HTTP Server
  *
@@ -23,6 +24,7 @@ import { QuotaRouter } from '../router/router.js';
 import { SessionVault } from '../vault/session-vault.js';
 import { SwitchPlanner } from '../switching/planner.js';
 import { SwitchTransactionCoordinator } from '../switching/transaction.js';
+import type { SwitchStatusResponse } from '../switching/types.js';
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -356,6 +358,7 @@ export class AppServer {
           notes: typeof body.notes === 'string' ? body.notes : undefined
         };
 
+        validateAccountText(options);
         const result = await this.enrollmentService.enrollCurrentAccount(options);
         this.sendJson(res, 200, {
           success: true,
@@ -404,6 +407,8 @@ export class AppServer {
           return;
         }
 
+        validateAccountText({ name: typeof body.name === 'string' ? body.name : undefined,
+          notes: typeof body.notes === 'string' ? body.notes : undefined });
         const created = await this.accountStore.addAccount({
           email: body.email,
           name: typeof body.name === 'string' ? body.name : undefined,
@@ -453,6 +458,11 @@ export class AppServer {
         return;
       }
 
+      try { validateAccountText({ alias: typeof body.alias === 'string' ? body.alias : undefined }); }
+      catch (err) {
+        this.sendJson(res, 400, { error: (err as Error).message });
+        return;
+      }
       const rawAlias = typeof body.alias === 'string' ? body.alias.trim() : '';
       const updated = await this.accountStore.updateAccount(id, { alias: rawAlias });
       if (!updated) {
@@ -477,9 +487,10 @@ export class AppServer {
 
     // GET /api/switching/status
     if (pathname === '/api/switching/status' && normalizedMethod === 'GET') {
-      const status = this.switchCoordinator
+      const status: SwitchStatusResponse = this.switchCoordinator
         ? this.switchCoordinator.getStatus()
-        : { activeTransactionId: null, currentState: 'IDLE', lastResult: null };
+        : { activeTransactionId: null, currentState: 'IDLE', lastResult: null,
+            quarantineActive: false, journalRecoveryState: 'NONE' };
       this.sendJson(res, 200, { status });
       return;
     }

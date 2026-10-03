@@ -206,6 +206,7 @@ public class LoopbackServer : IAsyncDisposable
             try
             {
                 input = input with { HasVaultedSession = false };
+                AccountTextValidator.Validate(input.Name, input.Alias, input.Notes);
                 var created = await accountStore.AddAccountAsync(input);
                 return Results.Json(new { account = created }, statusCode: StatusCodes.Status201Created);
             }
@@ -242,6 +243,7 @@ public class LoopbackServer : IAsyncDisposable
 
             try
             {
+                AccountTextValidator.Validate(options?.Name, options?.Alias, options?.Notes);
                 var result = await enrollmentService.EnrollCurrentAccountAsync(options);
                 return Results.Ok(new
                 {
@@ -302,6 +304,11 @@ public class LoopbackServer : IAsyncDisposable
                 return Results.Json(new { error = "Invalid JSON payload" }, statusCode: StatusCodes.Status400BadRequest);
             }
 
+            try { AccountTextValidator.Validate(alias: request.Alias); }
+            catch (ArgumentException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
+            }
             string? normalizedAlias = string.IsNullOrWhiteSpace(request.Alias) ? "" : request.Alias.Trim();
             var updated = await accountStore.UpdateAccountAsync(id, new UpdateAccountInput(Alias: normalizedAlias));
             if (updated == null)
