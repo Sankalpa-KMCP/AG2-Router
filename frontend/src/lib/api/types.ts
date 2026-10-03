@@ -124,6 +124,14 @@ export interface SystemStatusDto {
 
 export type JournalRecoveryState = 'NONE' | 'ACTION_REQUIRED' | 'RESTART_REQUIRED' | 'NOT_RESOLVABLE' | 'UNKNOWN';
 
+/** Dashboard-consumed fields of the native NativeSwitchResult wire contract. */
+export interface SwitchResultDto {
+  success: boolean;
+  code: string;
+  message: string;
+  manualRecoveryRequired?: boolean;
+}
+
 export interface SwitchStatusDto {
   activeTransactionId?: string | null;
   currentState: string;

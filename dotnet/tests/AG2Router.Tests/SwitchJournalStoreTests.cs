@@ -807,6 +807,152 @@ public sealed class SwitchJournalStoreTests : IDisposable
         Assert.Equal(originalBytes, currentBytes);
     }
 
+    // 30. Wrong token kind for schemaVersion -> Corrupt classification and file bytes unchanged
+    [Theory]
+    [InlineData("\"1\"")]
+    [InlineData("true")]
+    [InlineData("[1]")]
+    [InlineData("{\"version\": 1}")]
+    [InlineData("null")]
+    [InlineData("1.5")]
+    public async Task Scenario30_Read_WhenSchemaVersionIsWrongTokenKind_ReturnsCorrupt_AndPreservesFileBytes(string schemaVersionValue)
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        string json = $$"""
+        {
+          "magic": "AG2SWITCHJRNL",
+          "schemaVersion": {{schemaVersionValue}},
+          "transactionId": "11111111-2222-3333-4444-555555555555",
+          "state": "RECORDED",
+          "updatedAt": "2026-09-27T12:00:00.0000000Z",
+          "sourceAccountId": "acc-1",
+          "targetAccountId": "acc-2",
+          "quarantineReasonCode": null
+        }
+        """;
+
+        byte[] originalBytes = Encoding.UTF8.GetBytes(json);
+        await File.WriteAllBytesAsync(path, originalBytes);
+
+        var result = await store.ReadAsync();
+
+        Assert.Equal(SwitchJournalReadStatus.Corrupt, result.Status);
+        Assert.NotNull(result.ErrorMessage);
+        Assert.Contains("schemaVersion", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(result.Entry);
+
+        Assert.True(File.Exists(path));
+        byte[] currentBytes = await File.ReadAllBytesAsync(path);
+        Assert.Equal(originalBytes, currentBytes);
+    }
+
+    // 31. Wrong token kind for updatedAt -> Corrupt classification and file bytes unchanged
+    [Theory]
+    [InlineData("1234567890")]
+    [InlineData("true")]
+    [InlineData("[\"2026-09-27T12:00:00Z\"]")]
+    [InlineData("{\"date\": \"2026-09-27\"}")]
+    [InlineData("null")]
+    [InlineData("\"not-an-iso8601-date\"")]
+    public async Task Scenario31_Read_WhenUpdatedAtIsWrongTokenKind_ReturnsCorrupt_AndPreservesFileBytes(string updatedAtValue)
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        string json = $$"""
+        {
+          "magic": "AG2SWITCHJRNL",
+          "schemaVersion": 1,
+          "transactionId": "11111111-2222-3333-4444-555555555555",
+          "state": "RECORDED",
+          "updatedAt": {{updatedAtValue}},
+          "sourceAccountId": "acc-1",
+          "targetAccountId": "acc-2",
+          "quarantineReasonCode": null
+        }
+        """;
+
+        byte[] originalBytes = Encoding.UTF8.GetBytes(json);
+        await File.WriteAllBytesAsync(path, originalBytes);
+
+        var result = await store.ReadAsync();
+
+        Assert.Equal(SwitchJournalReadStatus.Corrupt, result.Status);
+        Assert.NotNull(result.ErrorMessage);
+        Assert.Contains("updatedAt", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(result.Entry);
+
+        Assert.True(File.Exists(path));
+        byte[] currentBytes = await File.ReadAllBytesAsync(path);
+        Assert.Equal(originalBytes, currentBytes);
+    }
+
+    // 32. Wrong token kinds for other properties -> Corrupt classification and file bytes unchanged
+    [Theory]
+    [InlineData("magic", "123")]
+    [InlineData("magic", "true")]
+    [InlineData("transactionId", "12345")]
+    [InlineData("transactionId", "true")]
+    [InlineData("transactionId", "[1, 2, 3]")]
+    [InlineData("state", "true")]
+    [InlineData("state", "[\"RECORDED\"]")]
+    [InlineData("sourceAccountId", "999")]
+    [InlineData("sourceAccountId", "false")]
+    [InlineData("targetAccountId", "888")]
+    [InlineData("targetAccountId", "true")]
+    [InlineData("quarantineReasonCode", "100")]
+    [InlineData("quarantineReasonCode", "true")]
+    [InlineData("quarantineReasonCode", "[\"REASON\"]")]
+    [InlineData("quarantineReasonCode", "{\"reason\": \"code\"}")]
+    public async Task Scenario32_Read_WhenOtherFieldsHaveWrongTokenKinds_ReturnsCorrupt_AndPreservesFileBytes(
+        string propertyName,
+        string rawValue)
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        var jsonObject = new Dictionary<string, string>
+        {
+            ["magic"] = "\"AG2SWITCHJRNL\"",
+            ["schemaVersion"] = "1",
+            ["transactionId"] = "\"11111111-2222-3333-4444-555555555555\"",
+            ["state"] = "\"RECORDED\"",
+            ["updatedAt"] = "\"2026-09-27T12:00:00.0000000Z\"",
+            ["sourceAccountId"] = "\"acc-1\"",
+            ["targetAccountId"] = "\"acc-2\"",
+            ["quarantineReasonCode"] = "null"
+        };
+
+        jsonObject[propertyName] = rawValue;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("{");
+        var items = jsonObject.ToList();
+        for (int i = 0; i < items.Count; i++)
+        {
+            sb.Append($"  \"{items[i].Key}\": {items[i].Value}");
+            if (i < items.Count - 1) sb.Append(",");
+            sb.AppendLine();
+        }
+        sb.AppendLine("}");
+
+        byte[] originalBytes = Encoding.UTF8.GetBytes(sb.ToString());
+        await File.WriteAllBytesAsync(path, originalBytes);
+
+        var result = await store.ReadAsync();
+
+        Assert.Equal(SwitchJournalReadStatus.Corrupt, result.Status);
+        Assert.NotNull(result.ErrorMessage);
+        Assert.Contains(propertyName, result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(result.Entry);
+
+        Assert.True(File.Exists(path));
+        byte[] currentBytes = await File.ReadAllBytesAsync(path);
+        Assert.Equal(originalBytes, currentBytes);
+    }
+
     private sealed class TestDurableFileWriterSpy : IDurableFileWriter
     {
         public string? WrittenPath { get; private set; }

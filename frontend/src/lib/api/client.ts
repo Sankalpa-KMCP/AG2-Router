@@ -3,12 +3,37 @@ import type {
   AccountMetadata,
   SystemStatusDto,
   SwitchStatusDto,
+  SwitchResultDto,
   RouterConfigDto,
   RouterConfigUpdate,
   CandidateEvidenceStatusDto,
   JournalResolutionResult,
   JournalResolutionStatus
 } from './types.js';
+
+export class SwitchRequestError extends Error {
+  constructor(public readonly result: SwitchResultDto, public readonly httpStatus: number) {
+    super(result.message);
+    this.name = 'SwitchRequestError';
+  }
+
+  get code(): string { return this.result.code; }
+  get manualRecoveryRequired(): boolean | undefined { return this.result.manualRecoveryRequired; }
+}
+
+function parseSwitchResult(data: unknown): SwitchResultDto | null {
+  if (!data || typeof data !== 'object') return null;
+  const raw = data as Record<string, unknown>;
+  if (typeof raw.success !== 'boolean' || typeof raw.code !== 'string' || !raw.code.trim() ||
+      typeof raw.message !== 'string' ||
+      (raw.manualRecoveryRequired !== undefined && typeof raw.manualRecoveryRequired !== 'boolean')) return null;
+  return {
+    success: raw.success,
+    code: raw.code,
+    message: raw.message,
+    ...(typeof raw.manualRecoveryRequired === 'boolean' ? { manualRecoveryRequired: raw.manualRecoveryRequired } : {})
+  };
+}
 
 export const VALID_RESOLUTION_STATUSES = new Set<JournalResolutionStatus>([
   'CleanCleanupCompleted',
@@ -159,22 +184,36 @@ export class ApiClient {
     });
   }
 
-  public async executeSwitch(id: string): Promise<{ success: boolean; code: string; message: string }> {
+  public async executeSwitch(id: string): Promise<SwitchResultDto> {
     // If we don't have a token, attempt to acquire one first
     if (!this.switchIntentToken) {
       await this.getSwitchIntent();
     }
 
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (this.switchIntentToken) {
       headers['X-AG2-Switch-Token'] = this.switchIntentToken;
     }
 
-    return this.request<{ success: boolean; code: string; message: string }>(`/api/accounts/${encodeURIComponent(id)}/switch`, {
+    const res = await fetch(`/api/accounts/${encodeURIComponent(id)}/switch`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ confirm: true })
     });
+    const switchHeader = res.headers.get('x-ag2-switch-token');
+    if (switchHeader) this.switchIntentToken = switchHeader;
+
+    let data: unknown = null;
+    try { data = await res.json(); } catch { /* Use the HTTP fallback below. */ }
+    const result = parseSwitchResult(data);
+    if (result && !result.success) throw new SwitchRequestError(result, res.status);
+    if (res.ok && result && !result.manualRecoveryRequired) return result;
+
+    const raw = data && typeof data === 'object' ? data as Record<string, unknown> : null;
+    const message = typeof raw?.error === 'string' && raw.error.trim()
+      ? raw.error
+      : res.ok ? 'Invalid switch response; inspect switching status before retrying.' : `HTTP ${res.status}`;
+    throw new Error(message);
   }
 
   public async resolveQuarantine(): Promise<JournalResolutionResult> {

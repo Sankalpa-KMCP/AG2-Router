@@ -9,10 +9,82 @@ public class SingleInstanceGuardTestCollection { }
 [Collection("SingleInstanceGuard")]
 public class SingleInstanceGuardTests
 {
+    private readonly SingleInstanceIpcNamespace _ipcNamespace = SingleInstanceTestIpc.CreateNamespace();
+
+    [Fact]
+    public void ProductionNamespace_RetainsExistingEndpointNames()
+    {
+        // Inspect constants only: never open the production endpoints in a test.
+        Assert.Equal(@"Local\AG2Router_Session_Mutex", SingleInstanceIpcNamespace.Production.MutexName);
+        Assert.Equal("AG2Router_Session_IPC_Pipe", SingleInstanceIpcNamespace.Production.PipeName);
+        Assert.NotEqual(SingleInstanceIpcNamespace.Production.MutexName, _ipcNamespace.MutexName);
+        Assert.NotEqual(SingleInstanceIpcNamespace.Production.PipeName, _ipcNamespace.PipeName);
+    }
+
+    [Theory]
+    [InlineData("ACTIVATE")]
+    [InlineData("CLOSE")]
+    [InlineData("EXIT")]
+    public async Task Commands_AreDeliveredOnlyWithinTheirExplicitNamespace(string command)
+    {
+        var otherNamespace = SingleInstanceTestIpc.CreateNamespace();
+        var received = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int otherCommands = 0;
+        await using var other = new SingleInstanceGuard(otherNamespace);
+        Assert.True(other.TryAcquire(
+            () => Interlocked.Increment(ref otherCommands),
+            () => Interlocked.Increment(ref otherCommands),
+            () => Interlocked.Increment(ref otherCommands)));
+
+        await using var target = new SingleInstanceGuard(_ipcNamespace);
+        Assert.True(target.TryAcquire(
+            () => received.TrySetResult(true),
+            () => received.TrySetResult(true),
+            () => received.TrySetResult(true)));
+
+        Assert.True(SingleInstanceGuard.SendCommand(_ipcNamespace, command));
+        Assert.True(await received.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, Volatile.Read(ref otherCommands));
+    }
+
+    [Fact]
+    public async Task SecondaryActivation_UsesItsOwnersNamespace()
+    {
+        var otherNamespace = SingleInstanceTestIpc.CreateNamespace();
+        int otherActivations = 0;
+        await using var other = new SingleInstanceGuard(otherNamespace);
+        Assert.True(other.TryAcquire(() => Interlocked.Increment(ref otherActivations)));
+
+        var activated = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var primary = new SingleInstanceGuard(_ipcNamespace);
+        Assert.True(primary.TryAcquire(() => activated.TrySetResult(true)));
+        await using var secondary = new SingleInstanceGuard(_ipcNamespace);
+        Assert.False(secondary.TryAcquire(() => { }));
+
+        Assert.True(await activated.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, Volatile.Read(ref otherActivations));
+    }
+
+    [Fact]
+    public async Task ExitHelpers_ForAbsentNamespace_DoNotSignalOrWaitForAnotherOwner()
+    {
+        var absentNamespace = SingleInstanceTestIpc.CreateNamespace();
+        int exitRequests = 0;
+        await using var primary = new SingleInstanceGuard(_ipcNamespace);
+        Assert.True(primary.TryAcquire(() => { }, onExitRequested: () => Interlocked.Increment(ref exitRequests)));
+
+        Assert.True(SingleInstanceGuard.RequestExitAndWait(absentNamespace, timeoutMs: 100));
+        Assert.True(SingleInstanceGuard.WaitForPrimaryExit(absentNamespace, timeoutMs: 100));
+        Assert.Equal(0, Volatile.Read(ref exitRequests));
+        // The unrelated synthetic primary must still own its namespace.
+        await using var secondary = new SingleInstanceGuard(_ipcNamespace);
+        Assert.False(secondary.TryAcquire(() => { }));
+    }
+
     [Fact]
     public async Task SingleInstanceGuard_AcquiresPrimary_AndDetectsSecondary()
     {
-        await using var primary = new SingleInstanceGuard();
+        await using var primary = new SingleInstanceGuard(_ipcNamespace);
         var activationReceivedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         bool primaryAcquired = primary.TryAcquire(() =>
@@ -23,7 +95,7 @@ public class SingleInstanceGuardTests
         Assert.True(primaryAcquired, "First instance must successfully acquire the session guard");
 
         // Attempt secondary instance acquisition immediately in the same user session (no artificial sleep)
-        await using var secondary = new SingleInstanceGuard();
+        await using var secondary = new SingleInstanceGuard(_ipcNamespace);
         bool secondaryAcquired = secondary.TryAcquire(() => { });
 
         Assert.False(secondaryAcquired, "Secondary instance must be rejected");
@@ -39,7 +111,7 @@ public class SingleInstanceGuardTests
     [Fact]
     public async Task SingleInstanceGuard_RoutesCommandsDeterministically_OverNamedPipe()
     {
-        await using var primary = new SingleInstanceGuard();
+        await using var primary = new SingleInstanceGuard(_ipcNamespace);
         var closeReceivedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var exitReceivedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -52,7 +124,7 @@ public class SingleInstanceGuardTests
         Assert.True(primaryAcquired, "First instance must successfully acquire the session guard");
 
         // Send CLOSE command
-        bool closeSent = SingleInstanceGuard.SendCommand("CLOSE");
+        bool closeSent = SingleInstanceGuard.SendCommand(_ipcNamespace, "CLOSE");
         Assert.True(closeSent, "CLOSE command should be delivered over named pipe");
 
         using var closeTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -60,7 +132,7 @@ public class SingleInstanceGuardTests
         Assert.True(closeResult == closeReceivedTcs.Task, "Primary instance should have received CLOSE command within bounded timeout");
 
         // Send EXIT command
-        bool exitSent = SingleInstanceGuard.SendCommand("EXIT");
+        bool exitSent = SingleInstanceGuard.SendCommand(_ipcNamespace, "EXIT");
         Assert.True(exitSent, "EXIT command should be delivered over named pipe");
 
         using var exitTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -71,7 +143,7 @@ public class SingleInstanceGuardTests
     [Fact]
     public async Task SingleInstanceGuard_RecyclesListener_ForMultipleSequentialCommands()
     {
-        await using var primary = new SingleInstanceGuard();
+        await using var primary = new SingleInstanceGuard(_ipcNamespace);
         var activateCount = 0;
         var closeCount = 0;
         var exitCount = 0;
@@ -107,10 +179,10 @@ public class SingleInstanceGuardTests
         Assert.True(primaryAcquired, "First instance must successfully acquire the session guard");
 
         // Send sequential commands back-to-back: ACTIVATE, CLOSE, EXIT, ACTIVATE
-        Assert.True(SingleInstanceGuard.SendCommand("ACTIVATE"), "First ACTIVATE should succeed");
-        Assert.True(SingleInstanceGuard.SendCommand("CLOSE"), "CLOSE should succeed");
-        Assert.True(SingleInstanceGuard.SendCommand("EXIT"), "EXIT should succeed");
-        Assert.True(SingleInstanceGuard.SendCommand("ACTIVATE"), "Second ACTIVATE should succeed");
+        Assert.True(SingleInstanceGuard.SendCommand(_ipcNamespace, "ACTIVATE"), "First ACTIVATE should succeed");
+        Assert.True(SingleInstanceGuard.SendCommand(_ipcNamespace, "CLOSE"), "CLOSE should succeed");
+        Assert.True(SingleInstanceGuard.SendCommand(_ipcNamespace, "EXIT"), "EXIT should succeed");
+        Assert.True(SingleInstanceGuard.SendCommand(_ipcNamespace, "ACTIVATE"), "Second ACTIVATE should succeed");
 
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         var result = await Task.WhenAny(allDoneTcs.Task, Task.Delay(Timeout.Infinite, timeoutCts.Token));
@@ -124,12 +196,12 @@ public class SingleInstanceGuardTests
     [Fact]
     public async Task SingleInstanceGuard_DisposesCleanly_AndAllowsNewPrimaryToAcquire()
     {
-        var primary1 = new SingleInstanceGuard();
+        var primary1 = new SingleInstanceGuard(_ipcNamespace);
         bool acquired1 = primary1.TryAcquire(() => { });
         Assert.True(acquired1, "Primary 1 must acquire");
 
         // Secondary should fail while Primary 1 is active
-        var secondary1 = new SingleInstanceGuard();
+        var secondary1 = new SingleInstanceGuard(_ipcNamespace);
         bool secondaryAcquired = secondary1.TryAcquire(() => { });
         Assert.False(secondaryAcquired, "Secondary must fail while Primary 1 active");
         await secondary1.DisposeAsync();
@@ -138,13 +210,13 @@ public class SingleInstanceGuardTests
         await primary1.DisposeAsync();
 
         // Now a new Primary 2 should be able to acquire cleanly without collisions
-        await using var primary2 = new SingleInstanceGuard();
+        await using var primary2 = new SingleInstanceGuard(_ipcNamespace);
         var activate2Tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         bool acquired2 = primary2.TryAcquire(() => activate2Tcs.TrySetResult(true));
         Assert.True(acquired2, "Primary 2 must successfully acquire after Primary 1 disposed");
 
         // Verify IPC still works on the new instance
-        Assert.True(SingleInstanceGuard.SendCommand("ACTIVATE"), "ACTIVATE on Primary 2 should succeed");
+        Assert.True(SingleInstanceGuard.SendCommand(_ipcNamespace, "ACTIVATE"), "ACTIVATE on Primary 2 should succeed");
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         var result = await Task.WhenAny(activate2Tcs.Task, Task.Delay(Timeout.Infinite, timeoutCts.Token));
         Assert.True(result == activate2Tcs.Task, "Primary 2 should receive activation signal");

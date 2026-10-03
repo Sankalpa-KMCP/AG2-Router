@@ -860,7 +860,7 @@ public class NativeAutoRouter : INativeAutoRouter
                 if (execute)
                 {
                     await ExecuteSwitchAsync(selection.BestCandidate.Account.Id, activeAccountId, planEpoch,
-                        requestedModelKey, configSnapshot.MinimumCandidateQuotaPercent,
+                        requestedModelKey, configSnapshot,
                         candidateModelObservations?.GetValueOrDefault(selection.BestCandidate.Account.Id),
                         cancellationToken).ConfigureAwait(false);
                 }
@@ -875,17 +875,19 @@ public class NativeAutoRouter : INativeAutoRouter
     }
 
     private bool IsAutomaticPlanCurrent(long epoch, string candidateAccountId,
-        string? requestedModelKey, double? minimumPercent, AccountModelQuotaObservation? selectedEvidence)
+        string? requestedModelKey, RouterConfigDto planConfig, AccountModelQuotaObservation? selectedEvidence)
     {
         lock (_stateLock)
         {
-            if (!IsAutomaticPlanCurrentLocked(epoch)) return false;
+            // Bind all decision inputs, including source pressure, to the immutable
+            // selection snapshot. A changed configuration requires a fresh cycle.
+            if (!IsAutomaticPlanCurrentLocked(epoch) || _config != planConfig) return false;
             if (_quotaObservationStore == null)
                 return _quotaEvidence.TryGetValue(candidateAccountId, out var memoryEvidence) &&
                     IsCandidateEvidenceFresh(memoryEvidence.ObservedAtUtc, _timeProvider.GetUtcNow(),
                         CandidateEvidenceLifetime(_config.PollingIntervalMs));
             if (selectedEvidence == null || selectedEvidence.AccountId != candidateAccountId ||
-                selectedEvidence.ModelKey != requestedModelKey || minimumPercent != _config.MinimumCandidateQuotaPercent ||
+                selectedEvidence.ModelKey != requestedModelKey ||
                 !string.Equals(CandidateSelector.CanonicalizeModelKey(_config.WorkloadModelKey), requestedModelKey, StringComparison.Ordinal))
                 return false;
         }
@@ -896,10 +898,9 @@ public class NativeAutoRouter : INativeAutoRouter
             var current = _quotaObservationStore.GetObservationAsync(candidateAccountId, requestedModelKey!)
                 .GetAwaiter().GetResult();
             if (current != selectedEvidence || !QuotaObservationEvidence.IsUsable(selectedEvidence,
-                _timeProvider.GetUtcNow(), minimumPercent!.Value)) return false;
+                _timeProvider.GetUtcNow(), planConfig.MinimumCandidateQuotaPercent)) return false;
             lock (_stateLock) return IsAutomaticPlanCurrentLocked(epoch) &&
-                minimumPercent == _config.MinimumCandidateQuotaPercent &&
-                string.Equals(CandidateSelector.CanonicalizeModelKey(_config.WorkloadModelKey), requestedModelKey, StringComparison.Ordinal);
+                _config == planConfig;
         }
         catch { return false; }
     }
@@ -972,10 +973,10 @@ public class NativeAutoRouter : INativeAutoRouter
 
     private async Task ExecuteSwitchAsync(
         string targetAccountId, string? expectedActiveAccountId, long planEpoch,
-        string? requestedModelKey, double? minimumCandidateQuotaPercent,
+        string? requestedModelKey, RouterConfigDto planConfig,
         AccountModelQuotaObservation? selectedEvidence, CancellationToken cancellationToken)
     {
-        if (!IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, minimumCandidateQuotaPercent, selectedEvidence))
+        if (!IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, planConfig, selectedEvidence))
         {
             lock (_stateLock)
             {
@@ -1015,8 +1016,8 @@ public class NativeAutoRouter : INativeAutoRouter
         {
             switchResult = await _switchCoordinator.SwitchAutomaticallyAsync(
                 targetAccountId, expectedActiveAccountId,
-                () => IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, minimumCandidateQuotaPercent, selectedEvidence),
-                requestedModelKey, minimumCandidateQuotaPercent,
+                () => IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, planConfig, selectedEvidence),
+                requestedModelKey, planConfig.MinimumCandidateQuotaPercent,
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)

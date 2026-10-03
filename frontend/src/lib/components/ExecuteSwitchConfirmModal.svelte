@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { AccountMetadata } from '../api/types.js';
   import { resolveAccountDisplayName } from '../utils/helpers.js';
+  import { getSwitchErrorMessage } from '../utils/switching.js';
 
   interface Props {
     isOpen: boolean;
@@ -34,7 +35,7 @@
       await onConfirm(account);
       onClose();
     } catch (err) {
-      error = err instanceof Error ? err.message : 'Switch failed';
+      error = getSwitchErrorMessage(err);
     }
   }
 </script>

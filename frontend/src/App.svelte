@@ -12,6 +12,7 @@
   import ExecuteSwitchConfirmModal from './lib/components/ExecuteSwitchConfirmModal.svelte';
   import SwitchJournalRecoveryModal from './lib/components/SwitchJournalRecoveryModal.svelte';
   import { api } from './lib/api/client.js';
+  import { executeDashboardSwitch } from './lib/utils/switching.js';
   import {
     resolveAccountDisplayName,
     getAccountSubtitle,
@@ -319,15 +320,20 @@
       return;
     }
     isSwitching = true;
-    refreshGate.beginMutation();
     try {
-      const res = await api.executeSwitch(account.id);
+      const res = await executeDashboardSwitch(account.id, {
+        client: api,
+        refreshGate,
+        invalidateSafety: () => {
+          switchStatus = null;
+          isSafetyAuthoritative = false;
+        },
+        refreshAll
+      });
       logActivity(res.message || `Switched active account to ${account.email}.`);
     } finally {
-      refreshGate.endMutation();
       isSwitching = false;
     }
-    await refreshAll();
   }
 
   function handleOpenDelete(account: AccountMetadata) {

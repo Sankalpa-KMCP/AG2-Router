@@ -61,13 +61,25 @@ Inno Setup stages an existing complete `{app}` directory to `{app}.bak` in the a
 
 The PowerShell installer is the archive installation path. It also installs per-user, performs atomic directory swaps with backup and rollback, creates an owned shortcut, and registers an uninstall entry.
 
+### Cross-channel ownership and transitions
+
+Installation ownership at `%LOCALAPPDATA%\Programs\AG2Router` is explicitly classified (`None`, `PowerShellOwned`, `InnoOwned`, or `Ambiguous`):
+
+- **Inno-owned installation detected:** PowerShell `install.ps1` refuses to overwrite it, and PowerShell `uninstall.ps1` refuses to delete it, directing the user to the Inno installer or registered Inno uninstaller. This prevents broken Windows Add/Remove registrations or orphaned uninstallers.
+- **Ambiguous ownership state detected:** When both registrations are present or uninstaller files conflict with registry records, both PowerShell scripts fail closed without replacing or deleting files or registry keys.
+- **Switching from Inno to ZIP/PowerShell:** The user must first uninstall AG2 Router via Windows Settings > Installed Apps (or the registered Inno uninstaller) to cleanly clear the Inno registration, then run `install.ps1`.
+- **Switching from ZIP/PowerShell to Inno:** Supported directly; the Inno Setup installer stages the existing directory and prunes the legacy script uninstall registration after verifying strict ownership guards.
+
 Persistent application data under the separate AG2-Router user-data directory is outside the binary installation directory. Install and upgrade procedures must not rewrite it.
 
 ## Uninstall boundary
 
 Uninstall may remove only owned program binaries, shortcuts, uninstall registration, and an autostart value positively matched to this installation. It must preserve account metadata, vault data, WebView/user data unless an explicitly designed future policy says otherwise, and the live Antigravity credential.
 
-Ownership checks are part of the safety contract. Path or registry cleanup must fail/skip safely when ownership cannot be established.
+Ownership checks are part of the safety contract. `uninstall.ps1` classifies installation ownership before stopping processes or removing files:
+- If `PowerShellOwned`, uninstallation proceeds with existing cleanup steps.
+- If `InnoOwned`, `uninstall.ps1` refuses removal and directs the user to the registered Inno uninstaller or Windows Installed Apps.
+- If `Ambiguous`, `uninstall.ps1` fails closed without touching files, shortcuts, or registry entries.
 
 Both PowerShell and Inno uninstall entry points coordinate with the session mutex `Local\AG2Router_Session_Mutex` and fail closed if stopped state cannot be proven. PowerShell requires a successful process enumeration both before and after its bounded exit request; query failure is unknown, not stopped. Inno's helper invocation is nonblocking and followed by bounded mutex polling; a query failure or held mutex prevents destructive removal. A missing executable by itself is not proof that the application stopped.
 

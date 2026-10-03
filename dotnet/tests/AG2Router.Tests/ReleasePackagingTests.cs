@@ -9,6 +9,8 @@ namespace AG2Router.Tests;
 
 public class ReleasePackagingTests
 {
+    private readonly SingleInstanceIpcNamespace _ipcNamespace = SingleInstanceTestIpc.CreateNamespace();
+
     private const string ExpectedInstallDir = @"C:\Users\testuser\AppData\Local\Programs\AG2Router";
     private const string ExpectedExe = @"C:\Users\testuser\AppData\Local\Programs\AG2Router\AG2Router.exe";
     private const string ProtectedUserDataDir = @"C:\Users\testuser\AppData\Local\AG2-Router";
@@ -129,7 +131,7 @@ public class ReleasePackagingTests
     {
         var exitReceivedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var guardAcquiredTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var guard = new SingleInstanceGuard();
+        var guard = new SingleInstanceGuard(_ipcNamespace);
 
         // Dedicated thread ensures Mutex is acquired and released on the exact same thread
         var primaryThread = new Thread(() =>
@@ -161,7 +163,7 @@ public class ReleasePackagingTests
         try
         {
             // Bounded wait: helper sends EXIT and confirms primary released mutex
-            bool exited = SingleInstanceGuard.RequestExitAndWait(timeoutMs: 3000);
+            bool exited = SingleInstanceGuard.RequestExitAndWait(_ipcNamespace, timeoutMs: 3000);
             Assert.True(exited, "RequestExitAndWait must confirm primary instance termination");
             Assert.True(await exitReceivedTcs.Task, "Primary instance must receive EXIT command");
         }
@@ -176,7 +178,7 @@ public class ReleasePackagingTests
     {
         // When no primary instance is running, RequestExitAndWait should complete immediately with true
         var sw = Stopwatch.StartNew();
-        bool exited = SingleInstanceGuard.RequestExitAndWait(timeoutMs: 500);
+        bool exited = SingleInstanceGuard.RequestExitAndWait(_ipcNamespace, timeoutMs: 500);
         sw.Stop();
 
         Assert.True(exited, "Must report true when primary is already not running");
@@ -186,7 +188,7 @@ public class ReleasePackagingTests
     [Fact]
     public async Task SingleInstanceGuard_RequestExitAndWait_WhenPrimaryHangs_TimesOutAndReturnsFalse()
     {
-        var guard = new SingleInstanceGuard();
+        var guard = new SingleInstanceGuard(_ipcNamespace);
         // Acquire on a background thread so the test thread does not have mutex ownership
         bool acquired = await Task.Run(() => guard.TryAcquire(
             onActivateRequested: () => { },
@@ -202,7 +204,7 @@ public class ReleasePackagingTests
         try
         {
             // Short timeout to verify bounded failure
-            bool exited = SingleInstanceGuard.RequestExitAndWait(timeoutMs: 300);
+            bool exited = SingleInstanceGuard.RequestExitAndWait(_ipcNamespace, timeoutMs: 300);
             Assert.False(exited, "RequestExitAndWait must return false when primary fails to exit within timeout");
         }
         finally
@@ -362,6 +364,17 @@ public class ReleasePackagingTests
 
         string packageLockJson = File.ReadAllText(Path.Combine(repoRoot, "package-lock.json"));
         Assert.Contains($"\"version\": \"{canonicalVersion}\"", packageLockJson);
+
+        using (var pkgDoc = System.Text.Json.JsonDocument.Parse(packageJson))
+        using (var lockDoc = System.Text.Json.JsonDocument.Parse(packageLockJson))
+        {
+            string pkgNodeEngine = pkgDoc.RootElement.GetProperty("engines").GetProperty("node").GetString()!;
+            string lockNodeEngine = lockDoc.RootElement.GetProperty("packages").GetProperty("").GetProperty("engines").GetProperty("node").GetString()!;
+            Assert.Equal(pkgNodeEngine, lockNodeEngine);
+            Assert.DoesNotContain(">=20.0.0", pkgNodeEngine);
+            Assert.Contains("20.19", pkgNodeEngine);
+            Assert.Contains("22.12", pkgNodeEngine);
+        }
 
         // 3. installer/AG2Router.iss fallback literal
         string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
@@ -739,6 +752,544 @@ public class ReleasePackagingTests
         string error = await standardError;
         Assert.True(child.ExitCode == 0,
             $"Synthetic {scenario} query failure exited {child.ExitCode}: {output} {error}");
+    }
+
+    #endregion
+
+    #region Installation Ownership & Cross-Channel Invariants (F04)
+
+    public const string CanonicalInnoAppId = "{D37E7404-585A-4B6A-B7F9-5360980DF628}";
+    public const string CanonicalInnoKeyName = "{D37E7404-585A-4B6A-B7F9-5360980DF628}_is1";
+    public const string CanonicalLegacyKeyName = "AG2Router";
+
+    /// <summary>
+    /// Validates whether an Inno Setup uninstall registration belongs to this AG2 Router installation.
+    /// </summary>
+    public static bool IsInnoUninstallRegistrationOwned(
+        string? displayName,
+        string? publisher,
+        string? installLocation,
+        string? appPath,
+        string? uninstallString,
+        string expectedAppDir)
+    {
+        if (string.IsNullOrWhiteSpace(displayName) ||
+            !Regex.IsMatch(displayName.Trim(), @"^AG2\s+Router", RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(publisher) &&
+            !string.Equals(publisher.Trim(), "AG2", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        string cleanExpected = Path.GetFullPath(expectedAppDir).TrimEnd('\\');
+
+        if (!string.IsNullOrWhiteSpace(installLocation))
+        {
+            try
+            {
+                string cleanInstall = Path.GetFullPath(installLocation).TrimEnd('\\');
+                if (string.Equals(cleanInstall, cleanExpected, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            catch { }
+        }
+
+        if (!string.IsNullOrWhiteSpace(appPath))
+        {
+            try
+            {
+                string cleanApp = Path.GetFullPath(appPath).TrimEnd('\\');
+                if (string.Equals(cleanApp, cleanExpected, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            catch { }
+        }
+
+        if (!string.IsNullOrWhiteSpace(uninstallString))
+        {
+            try
+            {
+                string trimmed = uninstallString.Trim();
+                string? exe = null;
+                var quoted = Regex.Match(trimmed, @"^""(?<exe>[^""]+)""");
+                if (quoted.Success)
+                    exe = quoted.Groups["exe"].Value;
+                else
+                {
+                    var unquoted = Regex.Match(trimmed, @"^(?<exe>\S+\.exe)");
+                    if (unquoted.Success)
+                        exe = unquoted.Groups["exe"].Value;
+                }
+
+                if (!string.IsNullOrWhiteSpace(exe))
+                {
+                    string? dir = Path.GetDirectoryName(Path.GetFullPath(exe))?.TrimEnd('\\');
+                    if (string.Equals(dir, cleanExpected, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            catch { }
+        }
+
+        return false;
+    }
+
+    [Theory]
+    // Positive matches: exact properties or valid paths
+    [InlineData("AG2 Router", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", null, null, @"C:\Users\test\AppData\Local\Programs\AG2Router", true)]
+    [InlineData("AG2 Router version 0.4.0", "AG2", null, @"C:\Users\test\AppData\Local\Programs\AG2Router", null, @"C:\Users\test\AppData\Local\Programs\AG2Router", true)]
+    [InlineData("AG2 Router", "AG2", null, null, @"""C:\Users\test\AppData\Local\Programs\AG2Router\unins000.exe""", @"C:\Users\test\AppData\Local\Programs\AG2Router", true)]
+    [InlineData("AG2 Router", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router\", null, null, @"C:\Users\test\AppData\Local\Programs\AG2Router", true)]
+    // Negative guards: foreign app name, foreign publisher, wrong path
+    [InlineData("Other App", "AG2", @"C:\Users\test\AppData\Local\Programs\AG2Router", null, null, @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData("AG2 Router", "Other Corp", @"C:\Program Files\OtherApp", null, null, @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData("AG2 Router", "AG2", @"C:\Program Files\OtherApp", null, null, @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    [InlineData(null, null, @"C:\Users\test\AppData\Local\Programs\AG2Router", null, null, @"C:\Users\test\AppData\Local\Programs\AG2Router", false)]
+    public void InnoUninstallRegistration_StrictGuards_RecognizeOnlyOwnedRegistrations(
+        string? displayName,
+        string? publisher,
+        string? installLocation,
+        string? appPath,
+        string? uninstallString,
+        string expectedAppDir,
+        bool expectedResult)
+    {
+        bool isOwned = IsInnoUninstallRegistrationOwned(displayName, publisher, installLocation, appPath, uninstallString, expectedAppDir);
+        Assert.Equal(expectedResult, isOwned);
+    }
+
+    [Fact]
+    public void InstallationOwnership_Contracts_AreSynchronizedAcrossInnoAndScripts()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string issContent = File.ReadAllText(Path.Combine(repoRoot, "installer", "AG2Router.iss"));
+        string installScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "install.ps1"));
+        string uninstallScript = File.ReadAllText(Path.Combine(repoRoot, "scripts", "uninstall.ps1"));
+
+        // AppId alignment
+        Assert.Contains("AppId={" + CanonicalInnoAppId, issContent);
+        Assert.Contains(CanonicalInnoAppId, installScript);
+        Assert.Contains(CanonicalInnoAppId, uninstallScript);
+
+        // Preflight ownership checks presence
+        Assert.Contains("Get-AG2RouterInstallationOwnership", installScript);
+        Assert.Contains("Get-AG2RouterInstallationOwnership", uninstallScript);
+        Assert.Contains("Installation Channel Conflict", installScript);
+        Assert.Contains("Installation Channel Conflict", uninstallScript);
+        Assert.Contains("InnoOwned", installScript);
+        Assert.Contains("InnoOwned", uninstallScript);
+        Assert.Contains("Ambiguous", installScript);
+        Assert.Contains("Ambiguous", uninstallScript);
+    }
+
+    private static async Task<(int ExitCode, string StdOut, string StdErr)> RunPowerShellCommandAsync(string scriptText, TimeSpan? timeout = null)
+    {
+        var start = new ProcessStartInfo("powershell.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add("-NoProfile");
+        start.ArgumentList.Add("-NonInteractive");
+        start.ArgumentList.Add("-EncodedCommand");
+        start.ArgumentList.Add(Convert.ToBase64String(Encoding.Unicode.GetBytes(scriptText)));
+
+        using var child = Process.Start(start) ?? throw new InvalidOperationException("PowerShell test process failed to start.");
+        var outTask = child.StandardOutput.ReadToEndAsync();
+        var errTask = child.StandardError.ReadToEndAsync();
+
+        var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(30);
+        try
+        {
+            await child.WaitForExitAsync().WaitAsync(effectiveTimeout);
+        }
+        catch (TimeoutException)
+        {
+            try { child.Kill(entireProcessTree: true); } catch { }
+            throw new TimeoutException($"PowerShell script timed out after {effectiveTimeout}. stdout: {await outTask} stderr: {await errTask}");
+        }
+
+        return (child.ExitCode, await outTask, await errTask);
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellUninstall_SucceedsForPowerShellOwned()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
+        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_PsUninst_{Guid.NewGuid():N}");
+        string localApp = Path.Combine(tempDir, "LocalApp");
+        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
+
+        Directory.CreateDirectory(targetDir);
+        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "dummy-exe");
+        File.Copy(uninstallScriptPath, Path.Combine(targetDir, "uninstall.ps1"));
+
+        try
+        {
+            string command = $$"""
+                $ErrorActionPreference = 'Stop'
+                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
+                $target = '{{targetDir.Replace("'", "''")}}'
+                $regOverride = @{
+                    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router' = @{
+                        DisplayName = 'AG2 Router'
+                        Publisher = 'AG2'
+                        InstallLocation = $target
+                        UninstallString = "powershell.exe -File `"$target\uninstall.ps1`""
+                    }
+                }
+                function Get-AG2RouterProcessState { return 'STOPPED' }
+                function Get-AG2RouterMutexState { return 'STOPPED' }
+
+                & '{{uninstallScriptPath.Replace("'", "''")}}' -RegistryOverride $regOverride
+                """;
+
+            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
+            Assert.True(exitCode == 0, $"PowerShell uninstall failed ({exitCode}): stdout: {stdout} stderr: {stderr}");
+            Assert.False(Directory.Exists(targetDir), "Target program directory must be removed for PowerShellOwned installation.");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellUninstall_RefusesInnoOwned_WithoutDeletingFiles()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
+        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_InnoUninst_{Guid.NewGuid():N}");
+        string localApp = Path.Combine(tempDir, "LocalApp");
+        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
+
+        Directory.CreateDirectory(targetDir);
+        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "inno-app");
+        File.WriteAllText(Path.Combine(targetDir, "unins000.exe"), "inno-uninstaller");
+        File.WriteAllText(Path.Combine(targetDir, "unins000.dat"), "inno-data");
+        File.Copy(uninstallScriptPath, Path.Combine(targetDir, "uninstall.ps1"));
+
+        try
+        {
+            string command = $$"""
+                $ErrorActionPreference = 'Stop'
+                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
+                $target = '{{targetDir.Replace("'", "''")}}'
+                $innoKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{{CanonicalInnoKeyName}}"
+                $regOverride = @{
+                    $innoKey = @{
+                        DisplayName = 'AG2 Router'
+                        Publisher = 'AG2'
+                        InstallLocation = $target
+                        UninstallString = "`"$target\unins000.exe`""
+                    }
+                }
+                function Get-AG2RouterProcessState { return 'STOPPED' }
+                function Get-AG2RouterMutexState { return 'STOPPED' }
+
+                & '{{uninstallScriptPath.Replace("'", "''")}}' -RegistryOverride $regOverride
+                """;
+
+            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
+            Assert.NotEqual(0, exitCode);
+            Assert.Contains("Installation Channel Conflict", stderr + stdout);
+            Assert.True(Directory.Exists(targetDir), "Target program directory must NOT be deleted for InnoOwned installation.");
+            Assert.True(File.Exists(Path.Combine(targetDir, "unins000.exe")), "Inno uninstaller must NOT be deleted.");
+            Assert.True(File.Exists(Path.Combine(targetDir, "unins000.dat")), "Inno data must NOT be deleted.");
+            Assert.True(File.Exists(Path.Combine(targetDir, "AG2Router.exe")), "Application binary must NOT be deleted.");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellInstall_RefusesInnoOwned_WithoutReplacingFiles()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string installScriptPath = Path.Combine(repoRoot, "scripts", "install.ps1");
+        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
+        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_InnoInstall_{Guid.NewGuid():N}");
+        string localApp = Path.Combine(tempDir, "LocalApp");
+        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
+        string sourceDir = Path.Combine(tempDir, "SourcePayload");
+
+        Directory.CreateDirectory(sourceDir);
+        File.WriteAllText(Path.Combine(sourceDir, "AG2Router.exe"), "new-powershell-payload");
+        File.Copy(uninstallScriptPath, Path.Combine(sourceDir, "uninstall.ps1"));
+
+        Directory.CreateDirectory(targetDir);
+        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "existing-inno-payload");
+        File.WriteAllText(Path.Combine(targetDir, "unins000.exe"), "inno-uninstaller");
+
+        try
+        {
+            string command = $$"""
+                $ErrorActionPreference = 'Stop'
+                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
+                $target = '{{targetDir.Replace("'", "''")}}'
+                $innoKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{{CanonicalInnoKeyName}}"
+                $regOverride = @{
+                    $innoKey = @{
+                        DisplayName = 'AG2 Router'
+                        Publisher = 'AG2'
+                        InstallLocation = $target
+                        UninstallString = "`"$target\unins000.exe`""
+                    }
+                }
+                function Get-AG2RouterProcessState { return 'STOPPED' }
+                function Get-AG2RouterMutexState { return 'STOPPED' }
+
+                & '{{installScriptPath.Replace("'", "''")}}' -SourceDir '{{sourceDir.Replace("'", "''")}}' -RegistryOverride $regOverride
+                """;
+
+            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
+            Assert.NotEqual(0, exitCode);
+            Assert.Contains("Installation Channel Conflict", stderr + stdout);
+            Assert.Equal("existing-inno-payload", File.ReadAllText(Path.Combine(targetDir, "AG2Router.exe")));
+            Assert.True(File.Exists(Path.Combine(targetDir, "unins000.exe")));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellInstall_SucceedsForFreshInstall()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string installScriptPath = Path.Combine(repoRoot, "scripts", "install.ps1");
+        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
+        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_FreshInstall_{Guid.NewGuid():N}");
+        string localApp = Path.Combine(tempDir, "LocalApp");
+        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
+        string sourceDir = Path.Combine(tempDir, "SourcePayload");
+
+        Directory.CreateDirectory(sourceDir);
+        File.WriteAllText(Path.Combine(sourceDir, "AG2Router.exe"), "fresh-payload");
+        File.Copy(uninstallScriptPath, Path.Combine(sourceDir, "uninstall.ps1"));
+
+        try
+        {
+            string command = $$"""
+                $ErrorActionPreference = 'Stop'
+                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
+                $regOverride = @{}
+                function Get-AG2RouterProcessState { return 'STOPPED' }
+                function Get-AG2RouterMutexState { return 'STOPPED' }
+
+                & '{{installScriptPath.Replace("'", "''")}}' -SourceDir '{{sourceDir.Replace("'", "''")}}' -RegistryOverride $regOverride
+                """;
+
+            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
+            Assert.True(exitCode == 0, $"Fresh install failed ({exitCode}): stdout: {stdout} stderr: {stderr}");
+            Assert.True(File.Exists(Path.Combine(targetDir, "AG2Router.exe")));
+            Assert.Equal("fresh-payload", File.ReadAllText(Path.Combine(targetDir, "AG2Router.exe")));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_PowerShellUninstall_OnAbsentDirectory_CompletesCleanly()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
+        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_AbsentUninst_{Guid.NewGuid():N}");
+        string localApp = Path.Combine(tempDir, "LocalApp");
+
+        try
+        {
+            string command = $$"""
+                $ErrorActionPreference = 'Stop'
+                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
+                $regOverride = @{}
+
+                & '{{uninstallScriptPath.Replace("'", "''")}}' -RegistryOverride $regOverride
+                """;
+
+            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
+            Assert.True(exitCode == 0, $"Uninstall on absent directory failed ({exitCode}): stdout: {stdout} stderr: {stderr}");
+            Assert.Contains("No AG2 Router installation detected", stdout);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_AmbiguousRegistrations_FailsClosedWithoutMutation()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string installScriptPath = Path.Combine(repoRoot, "scripts", "install.ps1");
+        string uninstallScriptPath = Path.Combine(repoRoot, "scripts", "uninstall.ps1");
+        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_Ambiguous_{Guid.NewGuid():N}");
+        string localApp = Path.Combine(tempDir, "LocalApp");
+        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
+        string sourceDir = Path.Combine(tempDir, "SourcePayload");
+
+        Directory.CreateDirectory(sourceDir);
+        File.WriteAllText(Path.Combine(sourceDir, "AG2Router.exe"), "source-exe");
+        File.Copy(uninstallScriptPath, Path.Combine(sourceDir, "uninstall.ps1"));
+
+        Directory.CreateDirectory(targetDir);
+        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "target-exe");
+        File.Copy(uninstallScriptPath, Path.Combine(targetDir, "uninstall.ps1"));
+
+        try
+        {
+            string innoKey = $"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{CanonicalInnoKeyName}";
+            string psKey = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AG2Router";
+
+            // Test 1: install.ps1 fails closed when both registrations exist
+            string installCommand = $$"""
+                $ErrorActionPreference = 'Stop'
+                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
+                $target = '{{targetDir.Replace("'", "''")}}'
+                $regOverride = @{
+                    '{{innoKey.Replace("'", "''")}}' = @{
+                        DisplayName = 'AG2 Router'
+                        Publisher = 'AG2'
+                        InstallLocation = $target
+                    }
+                    '{{psKey.Replace("'", "''")}}' = @{
+                        DisplayName = 'AG2 Router'
+                        Publisher = 'AG2'
+                        InstallLocation = $target
+                        UninstallString = "powershell.exe -File `"$target\uninstall.ps1`""
+                    }
+                }
+                function Get-AG2RouterProcessState { return 'STOPPED' }
+                function Get-AG2RouterMutexState { return 'STOPPED' }
+
+                & '{{installScriptPath.Replace("'", "''")}}' -SourceDir '{{sourceDir.Replace("'", "''")}}' -RegistryOverride $regOverride
+                """;
+
+            var (installExit, installOut, installErr) = await RunPowerShellCommandAsync(installCommand);
+            Assert.NotEqual(0, installExit);
+            Assert.Contains("Ambiguous", installOut + installErr);
+            Assert.Equal("target-exe", File.ReadAllText(Path.Combine(targetDir, "AG2Router.exe")));
+
+            // Test 2: uninstall.ps1 fails closed when both registrations exist
+            string uninstallCommand = $$"""
+                $ErrorActionPreference = 'Stop'
+                $env:LOCALAPPDATA = '{{localApp.Replace("'", "''")}}'
+                $target = '{{targetDir.Replace("'", "''")}}'
+                $regOverride = @{
+                    '{{innoKey.Replace("'", "''")}}' = @{
+                        DisplayName = 'AG2 Router'
+                        Publisher = 'AG2'
+                        InstallLocation = $target
+                    }
+                    '{{psKey.Replace("'", "''")}}' = @{
+                        DisplayName = 'AG2 Router'
+                        Publisher = 'AG2'
+                        InstallLocation = $target
+                        UninstallString = "powershell.exe -File `"$target\uninstall.ps1`""
+                    }
+                }
+                function Get-AG2RouterProcessState { return 'STOPPED' }
+                function Get-AG2RouterMutexState { return 'STOPPED' }
+
+                & '{{uninstallScriptPath.Replace("'", "''")}}' -RegistryOverride $regOverride
+                """;
+
+            var (uninstExit, uninstOut, uninstErr) = await RunPowerShellCommandAsync(uninstallCommand);
+            Assert.NotEqual(0, uninstExit);
+            Assert.Contains("Ambiguous", uninstOut + uninstErr);
+            Assert.True(Directory.Exists(targetDir));
+            Assert.Equal("target-exe", File.ReadAllText(Path.Combine(targetDir, "AG2Router.exe")));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task InstallationOwnership_RegistryIdentity_IgnoresForeignRegistrations()
+    {
+        string repoRoot = FindRepositoryRoot();
+        string installScriptPath = Path.Combine(repoRoot, "scripts", "install.ps1");
+        string tempDir = Path.Combine(Path.GetTempPath(), $"AG2_Test_ForeignReg_{Guid.NewGuid():N}");
+        string localApp = Path.Combine(tempDir, "LocalApp");
+        string targetDir = Path.Combine(localApp, "Programs", "AG2Router");
+
+        Directory.CreateDirectory(targetDir);
+        File.WriteAllText(Path.Combine(targetDir, "AG2Router.exe"), "installed-exe");
+
+        try
+        {
+            // Register an unrelated Inno app with a different GUID and test ownership classification
+            string command = $$"""
+                $ErrorActionPreference = 'Stop'
+                $target = '{{targetDir.Replace("'", "''")}}'
+                $foreignInnoKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}_is1'
+                $regOverride = @{
+                    $foreignInnoKey = @{
+                        DisplayName = 'Some Other Tool'
+                        Publisher = 'Other'
+                        InstallLocation = $target
+                    }
+                    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router' = @{
+                        DisplayName = 'AG2 Router'
+                        Publisher = 'AG2'
+                        InstallLocation = $target
+                        UninstallString = "powershell.exe -File `"$target\uninstall.ps1`""
+                    }
+                }
+
+                $scriptContent = Get-Content '{{installScriptPath.Replace("'", "''")}}' -Raw
+                $funcStart = $scriptContent.IndexOf('function Get-AG2RouterRegistryValue')
+                $funcEnd = $scriptContent.IndexOf('Write-Host "===================================================="')
+                $funcCode = $scriptContent.Substring($funcStart, $funcEnd - $funcStart)
+                Invoke-Expression $funcCode
+
+                $ownership = Get-AG2RouterInstallationOwnership -TargetDir $target -RegistryOverride $regOverride
+                Write-Output ("STATUS:" + $ownership.Status)
+                """;
+
+            var (exitCode, stdout, stderr) = await RunPowerShellCommandAsync(command);
+            Assert.True(exitCode == 0, $"Command failed: {stdout} {stderr}");
+            Assert.Contains("STATUS:PowerShellOwned", stdout);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+            }
+        }
     }
 
     #endregion

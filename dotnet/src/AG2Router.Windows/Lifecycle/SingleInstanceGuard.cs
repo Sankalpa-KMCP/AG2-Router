@@ -5,19 +5,44 @@ using System.IO.Pipes;
 namespace AG2Router.Windows.Lifecycle;
 
 /// <summary>
+/// The paired endpoints used by a single-instance owner and its command clients.
+/// Tests supply unique endpoints instead of opening the production namespace.
+/// </summary>
+public sealed class SingleInstanceIpcNamespace
+{
+    public static SingleInstanceIpcNamespace Production { get; } = new(
+        @"Local\AG2Router_Session_Mutex", "AG2Router_Session_IPC_Pipe");
+
+    public string MutexName { get; }
+    public string PipeName { get; }
+
+    public SingleInstanceIpcNamespace(string mutexName, string pipeName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(mutexName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(pipeName);
+        MutexName = mutexName;
+        PipeName = pipeName;
+    }
+}
+
+/// <summary>
 /// Manages per-user session single-instance execution using a session-scoped Mutex and Named Pipe.
 /// When a duplicate instance is launched in the same user session, it signals the primary instance
 /// to activate its window and terminates cleanly.
 /// </summary>
 public class SingleInstanceGuard : IAsyncDisposable
 {
-    private const string MutexName = @"Local\AG2Router_Session_Mutex";
-    private const string PipeName = "AG2Router_Session_IPC_Pipe";
+    private readonly SingleInstanceIpcNamespace _ipcNamespace;
 
     private Mutex? _mutex;
     private bool _isPrimaryInstance;
     private CancellationTokenSource? _pipeCts;
     private Task? _listenerTask;
+
+    public SingleInstanceGuard(SingleInstanceIpcNamespace? ipcNamespace = null)
+    {
+        _ipcNamespace = ipcNamespace ?? SingleInstanceIpcNamespace.Production;
+    }
 
     /// <summary>
     /// Attempt to acquire the session-scoped mutex.
@@ -27,7 +52,7 @@ public class SingleInstanceGuard : IAsyncDisposable
     /// </summary>
     public bool TryAcquire(Action onActivateRequested, Action? onCloseRequested = null, Action? onExitRequested = null)
     {
-        _mutex = new Mutex(true, MutexName, out _isPrimaryInstance);
+        _mutex = new Mutex(true, _ipcNamespace.MutexName, out _isPrimaryInstance);
 
         if (!_isPrimaryInstance)
         {
@@ -82,10 +107,14 @@ public class SingleInstanceGuard : IAsyncDisposable
     /// Sends a command to the primary running instance over the session named pipe.
     /// </summary>
     public static bool SendCommand(string command, int timeoutMs = 3000)
+        => SendCommand(SingleInstanceIpcNamespace.Production, command, timeoutMs);
+
+    public static bool SendCommand(SingleInstanceIpcNamespace ipcNamespace, string command, int timeoutMs = 3000)
     {
+        ArgumentNullException.ThrowIfNull(ipcNamespace);
         try
         {
-            using var client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
+            using var client = new NamedPipeClientStream(".", ipcNamespace.PipeName, PipeDirection.Out);
             client.Connect(timeoutMs);
             using var writer = new StreamWriter(client);
             writer.WriteLine(command);
@@ -105,13 +134,17 @@ public class SingleInstanceGuard : IAsyncDisposable
     /// instance was running; returns false if the primary instance timed out.
     /// </summary>
     public static bool RequestExitAndWait(int timeoutMs = 5000)
+        => RequestExitAndWait(SingleInstanceIpcNamespace.Production, timeoutMs);
+
+    public static bool RequestExitAndWait(SingleInstanceIpcNamespace ipcNamespace, int timeoutMs = 5000)
     {
+        ArgumentNullException.ThrowIfNull(ipcNamespace);
         // 1. Send the EXIT command over the session IPC pipe
-        bool sent = SendCommand("EXIT", timeoutMs: Math.Min(timeoutMs, 2000));
+        bool sent = SendCommand(ipcNamespace, "EXIT", timeoutMs: Math.Min(timeoutMs, 2000));
         if (!sent)
         {
             // No primary instance was listening. Check if mutex exists.
-            if (!Mutex.TryOpenExisting(MutexName, out var existingMutex))
+            if (!Mutex.TryOpenExisting(ipcNamespace.MutexName, out var existingMutex))
             {
                 // No mutex and no pipe -> primary instance is definitely not running
                 return true;
@@ -120,7 +153,7 @@ public class SingleInstanceGuard : IAsyncDisposable
         }
 
         // 2. Wait boundedly for the primary instance to release/abandon the mutex
-        return WaitForPrimaryExit(timeoutMs);
+        return WaitForPrimaryExit(ipcNamespace, timeoutMs);
     }
 
     /// <summary>
@@ -128,13 +161,17 @@ public class SingleInstanceGuard : IAsyncDisposable
     /// Returns true if the primary instance exited or was not running; false if timed out.
     /// </summary>
     public static bool WaitForPrimaryExit(int timeoutMs = 5000)
+        => WaitForPrimaryExit(SingleInstanceIpcNamespace.Production, timeoutMs);
+
+    public static bool WaitForPrimaryExit(SingleInstanceIpcNamespace ipcNamespace, int timeoutMs = 5000)
     {
+        ArgumentNullException.ThrowIfNull(ipcNamespace);
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < timeoutMs)
         {
             try
             {
-                if (!Mutex.TryOpenExisting(MutexName, out var mutex))
+                if (!Mutex.TryOpenExisting(ipcNamespace.MutexName, out var mutex))
                 {
                     // Mutex no longer exists: primary instance has disposed it and exited
                     return true;
@@ -171,9 +208,9 @@ public class SingleInstanceGuard : IAsyncDisposable
         return false;
     }
 
-    private static void SendActivationSignal()
+    private void SendActivationSignal()
     {
-        SendCommand("ACTIVATE");
+        SendCommand(_ipcNamespace, "ACTIVATE");
     }
 
     private void StartPipeListener(
@@ -193,7 +230,7 @@ public class SingleInstanceGuard : IAsyncDisposable
                 try
                 {
                     await using var server = new NamedPipeServerStream(
-                        PipeName,
+                        _ipcNamespace.PipeName,
                         PipeDirection.In,
                         NamedPipeServerStream.MaxAllowedServerInstances,
                         PipeTransmissionMode.Byte,

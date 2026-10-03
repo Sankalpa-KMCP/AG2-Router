@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type {
   CanonicalModelDto,
   RouterConfigDto,
@@ -183,6 +185,30 @@ describe('AUD-103 API contract alignment & drift prevention', () => {
         if (res.restartRequired !== undefined) assert.equal(typeof res.restartRequired, 'boolean');
         if (res.reasonCode) assert.equal(typeof res.reasonCode, 'string');
       }
+    });
+  });
+
+  describe('Node.js engine compatibility contract (F06)', () => {
+    it('declares engine range matching locked build tooling reality', () => {
+      const packageJsonPath = path.resolve(process.cwd(), 'package.json');
+      const packageLockPath = path.resolve(process.cwd(), 'package-lock.json');
+      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+      const packageLock = JSON.parse(fs.readFileSync(packageLockPath, 'utf8'));
+
+      const rootEngine = packageJson.engines?.node;
+      const lockEngine = packageLock.packages?.['']?.engines?.node;
+
+      assert.equal(rootEngine, lockEngine);
+      assert.notEqual(rootEngine, undefined);
+
+      // Must not claim broad Node 20.0.0 support (broken by locked Vite and missing import.meta.dirname)
+      assert.doesNotMatch(rootEngine, />=20\.0\.0/);
+
+      // Must require at least Node 20.19+ for Node 20 line
+      assert.match(rootEngine, /20\.19/);
+
+      // Must require at least Node 22.12+ for Node 22 line
+      assert.match(rootEngine, /22\.12/);
     });
   });
 });

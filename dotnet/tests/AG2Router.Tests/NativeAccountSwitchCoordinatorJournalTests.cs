@@ -739,6 +739,30 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         Assert.Equal(futureSchema, await File.ReadAllTextAsync(_journal.JournalFilePath));
     }
 
+    // 16b. wrong property token kind in valid JSON (F05) -> classified as Corrupt, status Quarantined, recovery state NotResolvable, file bytes preserved
+    [Theory]
+    [InlineData("{\"magic\": \"AG2SWITCHJRNL\", \"schemaVersion\": \"1\", \"transactionId\": \"11111111-2222-3333-4444-555555555555\", \"state\": \"RECORDED\", \"updatedAt\": \"2026-09-27T12:00:00Z\", \"sourceAccountId\": \"acc-1\", \"targetAccountId\": \"acc-2\"}")]
+    [InlineData("{\"magic\": \"AG2SWITCHJRNL\", \"schemaVersion\": 1, \"transactionId\": \"11111111-2222-3333-4444-555555555555\", \"state\": \"RECORDED\", \"updatedAt\": 1234567890, \"sourceAccountId\": \"acc-1\", \"targetAccountId\": \"acc-2\"}")]
+    public async Task Reconciliation_16b_WrongPropertyTokenKind_ClassifiedAsCorruptAndQuarantined_WithNotResolvableState(string rawJournal)
+    {
+        await WriteRawJournalAsync(rawJournal);
+
+        var coordinator = CreateCoordinator();
+        var result = await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.Equal(StartupJournalReconciliationStatus.Quarantined, result.Status);
+        Assert.Contains("Corrupt switch journal found", result.Message);
+        Assert.True(_vault.IsQuarantined);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.Equal(rawJournal, await File.ReadAllTextAsync(_journal.JournalFilePath, Encoding.UTF8));
+
+        var status = coordinator.GetStatus();
+        Assert.Equal(JournalRecoveryStates.NotResolvable, status.JournalRecoveryState);
+
+        Assert.False(coordinator.CanAdmitSwitch(out var blockingReason));
+        Assert.Equal("Switch blocked: switch journal is not resolvable.", blockingReason);
+    }
+
     // 17. journal read I/O error -> NOT clean/absent; quarantine
     [Fact]
     public async Task Reconciliation_17_JournalReadIoError_Quarantines()

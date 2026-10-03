@@ -59,12 +59,14 @@ dotnet/src/
    - Creates a Start Menu shortcut: `AG2 Router`.
    - Registers an Add/Remove Programs entry in Windows Settings.
 
+*Channel Protection:* If an existing Inno Setup installation (`AG2Router-Setup-*.exe`) is detected, `install.ps1` refuses to overwrite it to prevent broken registrations. To switch from Inno Setup to the ZIP distribution, uninstall via Windows Settings > Installed Apps first.
+
 ### Uninstallation
 Run the uninstaller script or uninstall via Windows Settings > Installed Apps:
 ```powershell
 powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\AG2Router\uninstall.ps1"
 ```
-**Safety Guarantee:** The uninstaller removes only program binaries, shortcuts, and owned startup entries. It strictly preserves your account metadata, encrypted vault (`%LOCALAPPDATA%\AG2-Router`), and active Windows credentials (`gemini:antigravity`).
+**Safety Guarantee:** The uninstaller removes only owned program binaries, shortcuts, and startup entries. If an Inno Setup installation is detected, `uninstall.ps1` refuses removal and directs you to the registered Inno uninstaller. It strictly preserves your account metadata, encrypted vault (`%LOCALAPPDATA%\AG2-Router`), and active Windows credentials (`gemini:antigravity`).
 
 ---
 
@@ -96,7 +98,7 @@ The workload model expresses routing intent; AG2 Router does not automatically d
 
 ### Prerequisites
 * .NET SDK 10.0.x (x64)
-* Node.js 20+ / npm 9+ (for UI asset bundling and verification oracle)
+* Node.js 20.19+, 22.12+, or 24+ / npm 9+ (for UI asset bundling and verification oracle)
 
 ### Build Commands
 

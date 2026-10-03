@@ -28,6 +28,8 @@ INTENDED INVARIANT: default tests must not access or mutate:
 
 Use task-owned temporary directories, InMemoryAccountStore, InMemoryWinCredStore, FakeDpapiProvider, fake registry accessors, fake process inspectors/lifecycles, and synthetic RPC handlers.
 
+Single-instance tests use a unique SingleInstanceIpcNamespace for each test, passing the same paired mutex/pipe names to the guard and every command or shutdown helper. SingleInstanceTestIpc creates these synthetic names. The application retains the existing production namespace by default; ordinary tests must never open it or send commands to it.
+
 WindowsDpapiProvider round-trip tests may use synthetic bytes in an isolated temporary directory. That exercises the API under the current user but must not read production ciphertext or user vault paths.
 
 UpgradePreservationTests explicitly redirect data and use synthetic/fake inputs. Preserve that isolation when adding lanes.

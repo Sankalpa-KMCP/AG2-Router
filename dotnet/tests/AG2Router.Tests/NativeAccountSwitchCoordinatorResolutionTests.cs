@@ -157,6 +157,25 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
         Assert.Equal(JournalRecoveryStates.NotResolvable, coordinator.GetStatus().JournalRecoveryState);
     }
 
+    // 2b. ResolveQuarantinedJournal_WhenJournalHasWrongPropertyTokenKinds_ReturnsNotResolvable_AndPreservesFile (F05)
+    [Theory]
+    [InlineData("{\"magic\":\"AG2SWITCHJRNL\",\"schemaVersion\":\"1\",\"transactionId\":\"11111111-2222-3333-4444-555555555555\",\"state\":\"RECORDED\",\"updatedAt\":\"2026-09-27T12:00:00Z\",\"sourceAccountId\":\"acc-1\",\"targetAccountId\":\"acc-2\"}")]
+    [InlineData("{\"magic\":\"AG2SWITCHJRNL\",\"schemaVersion\":1,\"transactionId\":\"11111111-2222-3333-4444-555555555555\",\"state\":\"RECORDED\",\"updatedAt\":1234567890,\"sourceAccountId\":\"acc-1\",\"targetAccountId\":\"acc-2\"}")]
+    public async Task ResolveQuarantinedJournal_WhenJournalHasWrongPropertyTokenKinds_ReturnsNotResolvable_AndPreservesFile(string badTokenKindJournal)
+    {
+        await File.WriteAllTextAsync(_journal.JournalFilePath, badTokenKindJournal, Encoding.UTF8);
+
+        var coordinator = CreateCoordinator();
+        var result = await coordinator.ResolveQuarantinedJournalAsync();
+
+        Assert.Equal(JournalResolutionStatus.NotResolvable, result.Status);
+        Assert.Equal("CORRUPT_JOURNAL", result.ReasonCode);
+        Assert.False(result.RestartRequired);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+        Assert.Equal(badTokenKindJournal, await File.ReadAllTextAsync(_journal.JournalFilePath, Encoding.UTF8));
+        Assert.Equal(JournalRecoveryStates.NotResolvable, coordinator.GetStatus().JournalRecoveryState);
+    }
+
     // 3. ResolveQuarantinedJournal_WhenJournalUnsupportedVersion_ReturnsNotResolvable_AndPreservesFile
     [Fact]
     public async Task ResolveQuarantinedJournal_WhenJournalUnsupportedVersion_ReturnsNotResolvable_AndPreservesFile()

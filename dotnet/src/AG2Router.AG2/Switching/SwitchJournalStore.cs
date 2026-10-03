@@ -128,7 +128,9 @@ public sealed class SwitchJournalStore : ISwitchJournalStore
             }
 
             // 2. Validate SchemaVersion
-            if (!TryGetProperty(root, "schemaVersion", out var versionProp) || !versionProp.TryGetInt32(out int version))
+            if (!TryGetProperty(root, "schemaVersion", out var versionProp) ||
+                versionProp.ValueKind != JsonValueKind.Number ||
+                !versionProp.TryGetInt32(out int version))
             {
                 return SwitchJournalReadResult.Corrupt("Missing or invalid required property 'schemaVersion'.");
             }
@@ -171,7 +173,9 @@ public sealed class SwitchJournalStore : ISwitchJournalStore
             }
 
             // 5. Validate UpdatedAt
-            if (!TryGetProperty(root, "updatedAt", out var updatedAtProp) || !updatedAtProp.TryGetDateTimeOffset(out var updatedAt))
+            if (!TryGetProperty(root, "updatedAt", out var updatedAtProp) ||
+                updatedAtProp.ValueKind != JsonValueKind.String ||
+                !updatedAtProp.TryGetDateTimeOffset(out var updatedAt))
             {
                 return SwitchJournalReadResult.Corrupt("Missing or invalid required property 'updatedAt'.");
             }

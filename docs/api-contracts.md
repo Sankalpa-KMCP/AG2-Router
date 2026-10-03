@@ -98,6 +98,8 @@ Common meanings in current handlers:
 
 Native switch result codes are strings declared by SwitchResultCodes. HTTP status and result code serve different purposes and should both be tested.
 
+The dashboard switch client preserves NativeSwitchResult code, message, and manualRecoveryRequired on unsuccessful responses, including non-2xx results. The confirmation flow displays the native code/message and recovery guidance when required; unstructured or malformed errors retain a generic HTTP/network fallback. Every attempted switch revokes prior frontend safety authority and immediately refreshes authoritative state after the request settles, before allowing a subsequent lifecycle mutation. Switch result flags do not substitute for GET /api/switching/status recovery authority.
+
 After process transition begins, caller cancellation is detached; internally bounded forward completion and rollback determine the result. Transaction detail belongs in [persistence-and-concurrency.md](persistence-and-concurrency.md).
 
 ## Remaining contract limitation

@@ -2,7 +2,8 @@
 # Installs AG2 Router into %LOCALAPPDATA%\Programs\AG2Router without admin privileges.
 param(
     [string]$SourceDir = $PSScriptRoot,
-    [switch]$Force
+    [switch]$Force,
+    [hashtable]$RegistryOverride = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,20 +14,270 @@ $ProgramsFolder = [System.Environment]::GetFolderPath([System.Environment+Specia
 $ShortcutPath = Join-Path $ProgramsFolder "AG2 Router.lnk"
 $UninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AG2Router"
 
+function Get-AG2RouterRegistryValue {
+    param(
+        [string]$Path,
+        [hashtable]$RegistryOverride = $null
+    )
+    if ($RegistryOverride -and $RegistryOverride.ContainsKey($Path)) {
+        return $RegistryOverride[$Path]
+    }
+    if (Test-Path -LiteralPath $Path) {
+        return Get-ItemProperty -LiteralPath $Path -ErrorAction SilentlyContinue
+    }
+    return $null
+}
+
+function Test-AG2RouterInnoRegistrationMatch {
+    param(
+        $Properties,
+        [string]$TargetDir
+    )
+    if (-not $Properties) { return $false }
+
+    $displayName = $Properties.DisplayName
+    if (-not $displayName -or ($displayName -notmatch '(?i)^AG2\s+Router')) {
+        return $false
+    }
+
+    $publisher = $Properties.Publisher
+    if ($publisher -and ($publisher.ToString().Trim() -ne 'AG2')) {
+        return $false
+    }
+
+    $normTarget = [System.IO.Path]::GetFullPath($TargetDir).TrimEnd('\')
+
+    if ($Properties.InstallLocation) {
+        try {
+            $normLoc = [System.IO.Path]::GetFullPath($Properties.InstallLocation).TrimEnd('\')
+            if ($normLoc.Equals($normTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        } catch {}
+    }
+
+    $appPath = $Properties.'Inno Setup: App Path'
+    if ($appPath) {
+        try {
+            $normApp = [System.IO.Path]::GetFullPath($appPath).TrimEnd('\')
+            if ($normApp.Equals($normTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        } catch {}
+    }
+
+    if ($Properties.UninstallString) {
+        try {
+            $uninst = $Properties.UninstallString.ToString().Trim()
+            $exePath = $null
+            if ($uninst -match '^"(?<exe>[^"]+)"') {
+                $exePath = $Matches['exe']
+            } elseif ($uninst -match '^(?<exe>\S+\.exe)') {
+                $exePath = $Matches['exe']
+            }
+            if ($exePath) {
+                $exeDir = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($exePath)).TrimEnd('\')
+                if ($exeDir.Equals($normTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return $true
+                }
+            }
+        } catch {}
+    }
+
+    return $false
+}
+
+function Test-AG2RouterPowerShellRegistrationMatch {
+    param(
+        $Properties,
+        [string]$TargetDir
+    )
+    if (-not $Properties) { return $false }
+
+    $displayName = $Properties.DisplayName
+    if (-not $displayName -or $displayName.ToString().Trim() -ne 'AG2 Router') {
+        return $false
+    }
+
+    $publisher = $Properties.Publisher
+    if (-not $publisher -or $publisher.ToString().Trim() -ne 'AG2') {
+        return $false
+    }
+
+    $installLocation = $Properties.InstallLocation
+    if (-not $installLocation) {
+        return $false
+    }
+    try {
+        $normInstall = [System.IO.Path]::GetFullPath($installLocation).TrimEnd('\')
+        $normTarget = [System.IO.Path]::GetFullPath($TargetDir).TrimEnd('\')
+        if (-not $normInstall.Equals($normTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    } catch {
+        return $false
+    }
+
+    $uninstallString = $Properties.UninstallString
+    if (-not $uninstallString) {
+        return $false
+    }
+    $lowerUninst = $uninstallString.ToString().ToLowerInvariant()
+    if (-not $lowerUninst.Contains("uninstall.ps1") -and -not $lowerUninst.Contains("ag2router")) {
+        return $false
+    }
+
+    return $true
+}
+
+function Get-AG2RouterInstallationOwnership {
+    param(
+        [string]$TargetDir,
+        [hashtable]$RegistryOverride = $null
+    )
+
+    $InnoAppId = "{D37E7404-585A-4B6A-B7F9-5360980DF628}"
+    $InnoKeyName = "${InnoAppId}_is1"
+    $LegacyKeyName = "AG2Router"
+
+    $innoHives = @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$InnoKeyName",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$InnoKeyName",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$InnoKeyName"
+    )
+
+    $hasInnoReg = $false
+    $innoUninstallerCmd = $null
+    foreach ($innoPath in $innoHives) {
+        $props = Get-AG2RouterRegistryValue -Path $innoPath -RegistryOverride $RegistryOverride
+        if ($props -and (Test-AG2RouterInnoRegistrationMatch -Properties $props -TargetDir $TargetDir)) {
+            $hasInnoReg = $true
+            if ($props.UninstallString) {
+                $innoUninstallerCmd = $props.UninstallString.ToString().Trim()
+            }
+            break
+        }
+    }
+
+    $legacyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$LegacyKeyName"
+    $legacyProps = Get-AG2RouterRegistryValue -Path $legacyPath -RegistryOverride $RegistryOverride
+    $hasPsReg = ($legacyProps -and (Test-AG2RouterPowerShellRegistrationMatch -Properties $legacyProps -TargetDir $TargetDir))
+
+    $hasInnoFiles = $false
+    $hasAnyFiles = $false
+    if (Test-Path -LiteralPath $TargetDir) {
+        try {
+            $items = @(Get-ChildItem -LiteralPath $TargetDir -Force -ErrorAction SilentlyContinue)
+            if ($items.Count -gt 0) {
+                $hasAnyFiles = $true
+                foreach ($item in $items) {
+                    if ($item.Name -like "unins*.exe" -or $item.Name -like "unins*.dat") {
+                        $hasInnoFiles = $true
+                        if (-not $innoUninstallerCmd -and $item.Name -like "unins*.exe") {
+                            $innoUninstallerCmd = $item.FullName
+                        }
+                        break
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    $result = [PSCustomObject]@{
+        Status = "None"
+        InnoUninstaller = $innoUninstallerCmd
+        Detail = ""
+    }
+
+    if ($hasInnoReg -and $hasPsReg) {
+        $result.Status = "Ambiguous"
+        $result.Detail = "Conflicting registrations: Both Inno Setup ($InnoKeyName) and PowerShell ($LegacyKeyName) uninstall entries exist for '$TargetDir'."
+        return $result
+    }
+
+    if ($hasInnoReg) {
+        $result.Status = "InnoOwned"
+        $result.Detail = "Inno Setup installation detected (AppId: $InnoAppId)."
+        return $result
+    }
+
+    if ($hasPsReg) {
+        if ($hasInnoFiles) {
+            $result.Status = "Ambiguous"
+            $result.Detail = "Conflicting state: PowerShell uninstall registration exists, but Inno Setup uninstaller files ('unins*') are present in '$TargetDir'."
+            return $result
+        }
+        $result.Status = "PowerShellOwned"
+        $result.Detail = "PowerShell-managed installation detected."
+        return $result
+    }
+
+    # Neither registration exists
+    if ($hasInnoFiles) {
+        $result.Status = "Ambiguous"
+        $result.Detail = "Inno Setup uninstaller files were detected in '$TargetDir', but no matching registry registration was found."
+        return $result
+    }
+
+    if ($hasAnyFiles) {
+        $result.Status = "Ambiguous"
+        $result.Detail = "Target directory '$TargetDir' contains files, but no recognized installation registration was found."
+        return $result
+    }
+
+    $result.Status = "None"
+    $result.Detail = "No installation detected."
+    return $result
+}
+
 Write-Host "====================================================" -ForegroundColor Cyan
 Write-Host "AG2 Router - Per-User Installation" -ForegroundColor Cyan
 Write-Host "Target Directory: $InstallDir" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
-# 1. Graceful Shutdown of Existing Running Instance via Named Mutex and Process Check
-$sessionMutex = $null
-$mutexHeld = [System.Threading.Mutex]::TryOpenExisting("Local\AG2Router_Session_Mutex", [ref]$sessionMutex)
-if ($mutexHeld -and $sessionMutex) {
-    $sessionMutex.Dispose()
-}
-$runningProcesses = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
+# 0. Installation Ownership Verification
+$ownership = Get-AG2RouterInstallationOwnership -TargetDir $InstallDir -RegistryOverride $RegistryOverride
 
-if ($mutexHeld -or $runningProcesses) {
+if ($ownership.Status -eq "InnoOwned") {
+    $uninstMsg = if ($ownership.InnoUninstaller) { " To switch channels, uninstall AG2 Router first (`"$($ownership.InnoUninstaller)`" or Windows Settings > Installed Apps) before installing via PowerShell." } else { " To switch channels, uninstall AG2 Router first via Windows Settings > Installed Apps before installing via PowerShell." }
+    throw "Installation Channel Conflict: An Inno Setup installation of AG2 Router was detected at '$InstallDir' (AppId: {D37E7404-585A-4B6A-B7F9-5360980DF628}). The PowerShell installer cannot overwrite an Inno Setup installation. To upgrade, use the Inno Setup installer ('AG2Router-Setup-*.exe').$uninstMsg"
+}
+
+if ($ownership.Status -eq "Ambiguous") {
+    throw "Installation Channel Conflict: Ambiguous installation ownership detected for '$InstallDir': $($ownership.Detail) Refusing to replace application files. Resolve the conflicting installation state before proceeding."
+}
+
+# 1. Graceful Shutdown of Existing Running Instance via Named Mutex and Process Check
+if (-not (Get-Command "Get-AG2RouterProcessState" -ErrorAction SilentlyContinue -CommandType Function)) {
+    function Get-AG2RouterProcessState {
+        try {
+            $ag2Processes = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -eq 'AG2Router' })
+            if ($ag2Processes.Count -gt 0) { return 'RUNNING' }
+            return 'STOPPED'
+        } catch {
+            return 'UNKNOWN'
+        }
+    }
+}
+
+if (-not (Get-Command "Get-AG2RouterMutexState" -ErrorAction SilentlyContinue -CommandType Function)) {
+    function Get-AG2RouterMutexState {
+        try {
+            $sessionMutex = $null
+            $mutexHeld = [System.Threading.Mutex]::TryOpenExisting("Local\AG2Router_Session_Mutex", [ref]$sessionMutex)
+            if ($mutexHeld -and $sessionMutex) { $sessionMutex.Dispose() }
+            if ($mutexHeld) { return 'RUNNING' }
+            return 'STOPPED'
+        } catch {
+            return 'UNKNOWN'
+        }
+    }
+}
+
+$mutexState = Get-AG2RouterMutexState
+$processState = Get-AG2RouterProcessState
+
+if ($mutexState -eq 'RUNNING' -or $processState -eq 'RUNNING') {
     Write-Host "Detected running AG2 Router instance. Requesting graceful shutdown (--exit)..."
     if (-not (Test-Path $ExePath)) {
         throw "AG2 Router is running but its shutdown executable is missing at $ExePath. Installation aborted."
@@ -48,11 +299,9 @@ if ($mutexHeld -or $runningProcesses) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $stillRunning = $true
     while ($sw.ElapsedMilliseconds -lt 5000) {
-        $testMutex = $null
-        $mHeld = [System.Threading.Mutex]::TryOpenExisting("Local\AG2Router_Session_Mutex", [ref]$testMutex)
-        if ($mHeld -and $testMutex) { $testMutex.Dispose() }
-        $remaining = Get-Process -Name "AG2Router" -ErrorAction SilentlyContinue
-        if (-not $mHeld -and -not $remaining) {
+        $mState = Get-AG2RouterMutexState
+        $pState = Get-AG2RouterProcessState
+        if ($mState -eq 'STOPPED' -and $pState -eq 'STOPPED') {
             $stillRunning = $false
             break
         }
@@ -191,7 +440,7 @@ try {
                 $DisplayVersion = $vi.FileVersion
             }
         } catch {
-            Write-Warning "Could not read file version from $ExePath: $_"
+            Write-Warning "Could not read file version from ${ExePath}: $_"
         }
     }
     if (-not $DisplayVersion) {
