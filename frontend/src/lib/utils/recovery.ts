@@ -16,6 +16,12 @@ export function isValidJournalRecoveryState(val: unknown): val is JournalRecover
   return typeof val === 'string' && (KNOWN_JOURNAL_RECOVERY_STATES as readonly string[]).includes(val);
 }
 
+/**
+ * Validates a raw switching-status payload. Returns null unless every safety field is
+ * present and well-formed: a partial, stale, or malformed payload must never be shown
+ * as a safe state, so callers treat null as "safety authority revoked" and block
+ * lifecycle mutations.
+ */
 export function validateSwitchStatusDto(raw: unknown): SwitchStatusDto | null {
   if (!raw || typeof raw !== 'object') return null;
   const obj = raw as Record<string, unknown>;
@@ -34,6 +40,12 @@ export function validateSwitchStatusDto(raw: unknown): SwitchStatusDto | null {
   };
 }
 
+/**
+ * The dashboard-side mutation gate. Every field is revalidated here (not just checked
+ * for truthiness) so a partially populated or legacy payload can never widen permission.
+ * A mutation is allowed only when safety status is currently authoritative AND quarantine
+ * is inactive AND the journal recovery state is NONE — any other combination blocks.
+ */
 export function canExecuteLifecycleMutation(
   isSafetyAuthoritative: boolean,
   switchStatus: { quarantineActive?: boolean; journalRecoveryState?: string } | null | undefined

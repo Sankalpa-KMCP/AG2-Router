@@ -55,6 +55,9 @@ public static class AG2TelemetryNormalizer
                 : (!string.IsNullOrWhiteSpace(cfg.ModelOrTier) ? cfg.ModelOrTier.Trim() : "Unknown Model");
 
             var q = cfg.QuotaInfo;
+            // Unknown stays unknown: a missing or non-finite fraction is preserved as null so
+            // downstream ranking/routing can never mistake unobserved capacity for a healthy
+            // or exhausted value. Observed zero is real exhaustion and remains 0.0.
             double? fraction = q?.RemainingFraction is double f && double.IsFinite(f)
                 ? Math.Clamp(f, 0.0, 1.0)
                 : null;
@@ -74,6 +77,10 @@ public static class AG2TelemetryNormalizer
 
         if (u.PlanStatus is { } plan)
         {
+            // Used credits are derived only when both monthly and available values exist;
+            // a single-sided report stays unknown rather than being inferred. The clamp is
+            // defensive against upstream inconsistency (available > monthly) so a display
+            // value can never go negative.
             long? monthlyPrompt = plan.PlanInfo?.MonthlyPromptCredits;
             long? availPrompt = plan.AvailablePromptCredits;
             long? usedPrompt = (monthlyPrompt.HasValue && availPrompt.HasValue)
@@ -110,6 +117,12 @@ public static class AG2TelemetryNormalizer
 
     public static ActivityStatusDto NormalizeActivitySnapshot(RawTrajectoriesResponse? raw)
     {
+        // Classification is deliberately three-valued: a missing collection is UNKNOWN
+        // (absence of evidence is not evidence of idleness), an explicitly observed empty
+        // keyed collection is IDLE, and any unrecognized status leaves the snapshot UNKNOWN
+        // rather than being coerced to a safe-looking state. Switching admission treats
+        // UNKNOWN as blocking, so this classifier defaults to the blocking side unless
+        // idleness is explicitly observed.
         if (raw?.TrajectorySummaries == null)
         {
             return new ActivityStatusDto(
@@ -190,6 +203,10 @@ public static class AG2TelemetryNormalizer
         if (valid.Count == 0) return null;
         if (valid.Count == 1) return valid[0];
 
+        // The latest reset instant is the conservative display choice: earlier windows must
+        // not stand in for a pool that may still be constrained until the last one reopens.
+        // If any entry fails to parse, the instants are not provably comparable, so ordering
+        // falls back to a deterministic ordinal comparison instead of guessing semantics.
         var parsed = new List<(string Raw, DateTimeOffset Parsed)>();
         bool allParsed = true;
         foreach (var t in valid)
@@ -225,7 +242,10 @@ public static class AG2TelemetryNormalizer
         {
             var model = models[row];
             // Neither a presentation label, model/tier, nor matching reset instant
-            // proves that two source rows share one capacity pool.
+            // proves that two source rows share one capacity pool. Rows with equal
+            // tier keys therefore get unique group keys below and each group holds
+            // exactly one source row: aggregation across rows would fabricate a
+            // shared bucket that the upstream payload never asserted.
             string? tier = string.IsNullOrWhiteSpace(model.ModelOrTier)
                 ? null : model.ModelOrTier.Trim().ToLowerInvariant();
             string baseKey = tier != null ? $"tier:{tier}" : $"row:{row}";

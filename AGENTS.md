@@ -139,6 +139,12 @@ Never place secrets, credential payloads, live account identifiers, private loca
 - Keep persistent user data outside the install directory and out of release artifacts.
 - Add focused tests for machine-verifiable behavior. Do not rely on prose for executable guarantees.
 
+## Code comment policy
+
+- Comments explain intent, invariants, ownership, failure modes, and WHY — never narrate obvious syntax.
+- A comment must remain truthful when the code changes; changing behavior requires updating affected comments in the same task.
+- Generated output is never manually annotated; source, tests, and contracts outrank stale comments.
+
 ## Documentation maintenance
 
 - Put a rule in its single owning document and link to it elsewhere.

@@ -6,11 +6,18 @@ using AG2Router.Core.Models;
 namespace AG2Router.Windows.Security;
 
 /// <summary>
-/// Restricted Windows Credential Manager writer.
-/// Used strictly when applying credentials during authorized transactions.
+/// Restricted Windows Credential Manager writer. Within the shipped native application
+/// this is the sanctioned credential mutation path, called only by the switch
+/// coordinator's two transaction phases: applying a vaulted target session before
+/// process restart, and restoring the exactly-captured original credential during a
+/// conditional rollback. The paired reader's schema restrictions define what this
+/// writer may persist.
 /// </summary>
 public class WindowsWinCredWriter : IWinCredWriter
 {
+    // Windows' CRED_MAX_CREDENTIAL_BLOB_SIZE bound for generic credentials. The reader
+    // enforces the same bound, so the writer cannot persist a blob that the reader would
+    // later refuse to load.
     private const int MaxCredentialBlobSize = 2560;
     private const int MaxUserNameLength = 513;
     private const int MaxTargetNameLength = 32767;

@@ -42,6 +42,10 @@ public sealed class UsageAggregationService
             var byAccount = new Dictionary<string, UsageAccountBreakdownItem>(StringComparer.Ordinal);
             foreach (var call in all)
             {
+                // Unattributed calls keep a visible row of their own (null AccountId) so the
+                // per-account totals can legitimately sum to less than the global total —
+                // that remainder is an explicit feature of the attribution model, never an
+                // accounting gap to be smoothed over.
                 bool isUnattributed = call.AccountAttributionBasis == UsageAccountAttributionBasis.Unattributed;
                 string key = isUnattributed ? "__unattributed__" : call.AccountId ?? "__unattributed__";
                 if (!byAccount.TryGetValue(key, out var row))
@@ -87,6 +91,11 @@ public sealed class UsageAggregationService
         var nowUtc = generatedAtUtc;
 
         var calls = Filter(await _ledger.GetAllCallsAsync(cancellationToken).ConfigureAwait(false), scope);
+        // HistoricalUnknown calls are aggregated into the separate lifetime totals block
+        // but never enter the time series: upstream provides no per-call event time, so
+        // bucketing them by observation instant would fabricate event dates that never
+        // existed. The dashboard surfaces them through the explicit historical-unknown
+        // notice instead of the trend.
         var historicalUnknown = Aggregate(calls.Where(static call => call.TimeAttribution == UsageTimeAttribution.HistoricalUnknown));
 
         var observationTimeCalls = calls
@@ -207,11 +216,17 @@ public sealed class UsageAggregationService
                 }
                 if (call.CacheReadTokens.HasValue)
                 {
+                    // Cache reads are reported as their own counter and never folded into
+                    // the headline conversation tokens: the provider's own accounting treats
+                    // cached input as additive to uncached input, so merging them would
+                    // double-count what users read as "tokens used".
                     cacheRead += call.CacheReadTokens.Value;
                     cacheReported++;
                 }
                 else
                 {
+                    // Absence of a cache figure means "not reported", not zero — the split
+                    // counts preserve that distinction for display.
                     cacheUnknown++;
                 }
                 if (call.HasOutputComponentMismatch)

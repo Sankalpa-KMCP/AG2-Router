@@ -143,6 +143,9 @@ export class AppServer {
   }
 
   private applySecurityHeaders(res: http.ServerResponse): void {
+    // The Node reference server emits a Content-Security-Policy header that the shipped
+    // native server does not. This is a documented reference/native difference — check
+    // docs/api-contracts.md before changing either side.
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Cache-Control', 'no-store, max-age=0');

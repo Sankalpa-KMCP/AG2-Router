@@ -9,7 +9,10 @@ namespace AG2Router.AG2.Adapter;
 
 /// <summary>
 /// Live implementation of IAG2Adapter providing read-only process discovery,
-/// Connect-RPC telemetry retrieval, and data normalization.
+/// Connect-RPC telemetry retrieval, and data normalization. This adapter is the
+/// Antigravity trust boundary: discovered processes are untrusted until the detector's
+/// provenance validation accepts them, and discovered RPC material (ports, CSRF tokens)
+/// stays inside the adapter — callers receive only normalized DTOs, never session material.
 /// </summary>
 public class AG2LiveAdapter : IAG2Adapter
 {
@@ -114,6 +117,10 @@ public class AG2LiveAdapter : IAG2Adapter
     public async Task<AccountQuotaObservation> GetAccountQuotaObservationAsync(
         CancellationToken cancellationToken = default)
     {
+        // Identity and quota are normalized from ONE GetUserStatus response so that a
+        // caller can never mix telemetry observed under one account with identity observed
+        // under another (a mid-poll account change would otherwise create a chimera
+        // observation). Callers treat both halves as a single coherent snapshot.
         var session = await EnsureSessionAsync(cancellationToken).ConfigureAwait(false);
         if (session == null) return new AccountQuotaObservation(null, null);
 
@@ -137,6 +144,11 @@ public class AG2LiveAdapter : IAG2Adapter
     public async Task<RequestedModelObservation> GetRequestedModelAsync(
         CancellationToken cancellationToken = default)
     {
+        // The workload model is explicit user intent supplied via configuration — it is NOT
+        // observed from the IDE's model dropdown. The intent is bound here to the verified
+        // active identity so quota attribution and routing admission apply to the account
+        // that was actually verified. Any missing piece (no provider, blank key, unknown
+        // active identity) fails closed to an empty observation rather than guessing intent.
         if (_configuredModelProvider == null)
         {
             return new RequestedModelObservation(null, null);
@@ -202,6 +214,9 @@ public class AG2LiveAdapter : IAG2Adapter
 
     private async Task<CachedAG2Session?> EnsureSessionAsync(CancellationToken cancellationToken)
     {
+        // Telemetry failures degrade to null/error state instead of throwing: the polling
+        // loop treats an adapter exception as a cycle fault, while a returned null simply
+        // renders "not connected" — transient RPC loss must not look like a router failure.
         var session = _detector.GetCachedSession();
         if (session != null)
         {

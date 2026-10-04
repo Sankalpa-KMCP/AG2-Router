@@ -4,8 +4,18 @@ using AG2Router.Core.Models;
 
 namespace AG2Router.AG2.Routing;
 
+/// <summary>
+/// Pure candidate-selection policy for automatic routing. Selection here is advisory:
+/// the chosen plan is later revalidated against the same durable evidence, current
+/// configuration, identity, activity, and process provenance by the switch coordinator
+/// before any mutation. Unknown quota never fabricates eligibility — a candidate without
+/// observed capacity for the requested model stays ineligible.
+/// </summary>
 public static class CandidateSelector
 {
+    // Application-side freshness bound for inactive candidates' durable observations.
+    // This is an AG2 Router policy, not an upstream guarantee: no external contract
+    // promises quota validity for any particular duration.
     public static readonly TimeSpan InactiveCandidateEvidenceLifetime = TimeSpan.FromHours(2);
 
     public static string? CanonicalizeModelKey(string? raw) =>
@@ -109,6 +119,9 @@ public static class CandidateSelector
                     }
                     else
                     {
+                        // Display-only default: an unknown fraction is rejected below, so the
+                        // zero here never reaches eligibility logic — it only shapes the
+                        // diagnostics reported for ineligible candidates.
                         remainingFraction = obs.RemainingFraction ?? 0;
                         quotaPercent = (int)Math.Round(remainingFraction * 100.0);
 
@@ -129,6 +142,11 @@ public static class CandidateSelector
                         }
                         else if (obs.RemainingFraction <= 0.0)
                         {
+                            // Exhaustion never becomes eligible via its reset time: the reset
+                            // instant is descriptive evidence only. Before the instant, the
+                            // candidate is still exhausted; after it, the candidate is
+                            // "reset-provisional" — still ineligible until fresh live telemetry
+                            // proves the pool actually replenished.
                             isEligible = false;
                             if (!string.IsNullOrWhiteSpace(obs.ResetTime) &&
                                 DateTimeOffset.TryParse(obs.ResetTime, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var resetTimeUtc))
@@ -217,6 +235,10 @@ public static class CandidateSelector
                                 break;
                             }
 
+                            // Weakest-link evidence: every matching row must be valid and
+                            // known. One unknown or exhausted row blocks the whole key, so
+                            // a single healthy row can never hide an unhealthy sibling
+                            // sharing the same requested model key.
                             var validCandFractions = matchingModels
                                 .Where(m => m.RemainingFraction.HasValue && double.IsFinite(m.RemainingFraction.Value))
                                 .Select(m => m.RemainingFraction!.Value)
@@ -256,10 +278,9 @@ public static class CandidateSelector
                 }
             }
 
-            // Score calculation:
-            // Base: 0 to 100 based on remaining quota
-            // Standard account bonus: +50
-            // Priority bonus: up to 10 points based on priority (lower priority integer = higher preference)
+            // Score is an informational diagnostic only. Selection is decided solely by the
+            // deterministic comparator in step 4 below; the score's bonus arithmetic does
+            // not influence which candidate is chosen.
             double score = remainingFraction * 100.0;
             if (!account.IsReserve)
             {

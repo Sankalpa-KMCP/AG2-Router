@@ -10,8 +10,21 @@ public class InvalidStateTransitionException : Exception
     }
 }
 
+/// <summary>
+/// Owns the routing-progression state machine: idle → low-quota detection → pending →
+/// waiting-for-idle → switching → verification → cooldown/manual-recovery. This gate is
+/// deliberately separate from the switch-transaction state machine owned by
+/// NativeAccountSwitchCoordinator: the router decides whether and when to request a
+/// switch, while the coordinator owns the transaction itself. The two must not be
+/// collapsed or merged in code or UI.
+/// </summary>
 public class RoutingSafetyGate
 {
+    // The transition table is the safety contract, not convenience: an illegal transition
+    // throws instead of being coerced, so a logic error cannot silently skip a blocking
+    // state. Note the deliberate asymmetries — Cooldown and ManualRecoveryRequired can
+    // only exit to Idle (cooldown expiry / explicit operator reset), and there is no
+    // transition that bypasses Verification on the success path.
     private static readonly Dictionary<string, HashSet<string>> ValidTransitions = new(StringComparer.OrdinalIgnoreCase)
     {
         [RoutingSafetyGateState.Idle] = new(StringComparer.OrdinalIgnoreCase)
@@ -94,6 +107,9 @@ public class RoutingSafetyGate
     {
         lock (_gateLock)
         {
+            // Fail-closed: unavailable activity and UNKNOWN states look identical to this
+            // assessment — neither may ever be treated as IDLE. Only an explicitly observed
+            // IDLE state with zero running trajectories can authorize proceeding.
             if (activity == null)
             {
                 return new SafetyGateAssessment(
@@ -133,6 +149,11 @@ public class RoutingSafetyGate
         }
     }
 
+    /// <summary>
+    /// Transitions the gate to <paramref name="to"/>, throwing
+    /// <see cref="InvalidStateTransitionException"/> if the move is not in the table.
+    /// The last transition reason is retained for diagnostics and dashboard display.
+    /// </summary>
     public void Transition(string to, string reason, string? targetAccountId = null)
     {
         lock (_gateLock)
@@ -148,6 +169,8 @@ public class RoutingSafetyGate
             {
                 _targetAccountId = targetAccountId;
             }
+            // Returning to Idle clears the target binding so a stale account id can never
+            // be read as the gate's current intent after the routing cycle completes.
             if (string.Equals(to, RoutingSafetyGateState.Idle, StringComparison.OrdinalIgnoreCase))
             {
                 _targetAccountId = null;
@@ -155,6 +178,14 @@ public class RoutingSafetyGate
         }
     }
 
+    /// <summary>
+    /// Bypasses the transition table and returns this gate to Idle. Reset is used for flow
+    /// teardown (for example, auto-switch being disabled by configuration or a manual switch
+    /// superseding a pending plan), for outcome handling that defers persistent blocking to
+    /// the router-level manual-recovery state, and by the operator reset-recovery flow.
+    /// Persistent manual-recovery blocking is enforced by the router's recovery state, not
+    /// by this gate alone.
+    /// </summary>
     public void Reset(string reason = "Reset to IDLE")
     {
         lock (_gateLock)
