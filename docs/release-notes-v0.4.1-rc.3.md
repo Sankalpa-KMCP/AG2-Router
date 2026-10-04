@@ -1,6 +1,6 @@
-# AG2 Router v0.4.1-rc.2
+# AG2 Router v0.4.1-rc.3
 
-**Version:** 0.4.1-rc.2
+**Version:** 0.4.1-rc.3
 **Release channel:** Prerelease for supervised user testing
 **Packaged target:** Windows x64
 
@@ -30,7 +30,7 @@ This candidate packages the completed AG2 Router remediation and conversation us
 
 ## Installation and Testing
 
-Download `AG2Router-Setup-v0.4.1-rc.2-win-x64.exe` for the per-user installer, or `AG2Router-v0.4.1-rc.2-win-x64.zip` for the archive installation path. Verify downloaded files against `SHA256SUMS.txt`.
+Download `AG2Router-Setup-v0.4.1-rc.3-win-x64.exe` for the per-user installer, or `AG2Router-v0.4.1-rc.3-win-x64.zip` for the archive installation path. Verify downloaded files against `SHA256SUMS.txt`.
 
 - The application and installer are unsigned; Windows may display an unknown-publisher warning.
 - The dashboard requires Microsoft Edge WebView2 Runtime.

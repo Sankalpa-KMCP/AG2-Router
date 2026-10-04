@@ -650,7 +650,7 @@ try {
         }
     }
     if (-not $DisplayVersion) {
-        $DisplayVersion = "0.4.1-rc.2"
+        $DisplayVersion = "0.4.1-rc.3"
     }
 
     Invoke-AG2RouterEnvironment 'SetRegistry' @{ Path = $UninstallKey; Name = 'DisplayName'; Value = "AG2 Router" }

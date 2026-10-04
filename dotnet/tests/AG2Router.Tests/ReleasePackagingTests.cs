@@ -874,7 +874,11 @@ public class ReleasePackagingTests
     [Fact]
     public async Task InstallationOwnership_PowerShellInstall_SucceedsForFreshInstall()
     {
-        using var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        string repoRoot = FindRepositoryRoot();
+        string propsContent = File.ReadAllText(Path.Combine(repoRoot, "dotnet", "Directory.Build.props"));
+        string canonicalVersion = Regex.Match(propsContent, @"<Version>(?<ver>[^<]+)</Version>").Groups["ver"].Value.Trim();
+
+        using var environment = new SyntheticInstallationTestEnvironment(repoRoot);
         using var result = await environment.RunAsync("install");
         Assert.True(result.ExitCode == 0, result.Output);
         Assert.Equal("fresh-payload", File.ReadAllText(environment.Exe));
@@ -882,7 +886,7 @@ public class ReleasePackagingTests
         Assert.Equal("AG2 Router", registration.GetProperty("DisplayName").GetString());
         Assert.Equal("AG2", registration.GetProperty("Publisher").GetString());
         Assert.Equal(environment.Target, registration.GetProperty("InstallLocation").GetString());
-        Assert.Equal("0.4.0", registration.GetProperty("DisplayVersion").GetString());
+        Assert.Equal(canonicalVersion, registration.GetProperty("DisplayVersion").GetString());
         Assert.Equal(1, registration.GetProperty("NoModify").GetInt32());
         Assert.Equal(1, registration.GetProperty("NoRepair").GetInt32());
         Assert.True(File.Exists(environment.StartMenuShortcut));
