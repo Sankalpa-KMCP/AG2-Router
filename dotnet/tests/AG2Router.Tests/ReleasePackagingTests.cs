@@ -390,10 +390,15 @@ public class ReleasePackagingTests
         Assert.Contains($"$DisplayVersion = \"{canonicalVersion}\"", installScript);
         Assert.Contains("FileVersionInfo]::GetVersionInfo", installScript);
 
-        // 6. User-facing documentation consistency
+        // 6. User-facing documentation consistency: the README documents the release asset
+        // naming convention with <version> placeholders (build-and-release.md: release
+        // names agree at release time, and copied literals are not independent version
+        // authorities), so it must not pin the canonical version itself.
         string readme = File.ReadAllText(Path.Combine(repoRoot, "README.md"));
-        Assert.Contains($"AG2Router-v{canonicalVersion}-win-x64.zip", readme);
-        Assert.Contains($"AG2Router-Setup-v{canonicalVersion}-win-x64.exe", readme);
+        Assert.Contains("AG2Router-Setup-<version>-win-x64.exe", readme);
+        Assert.Contains("AG2Router-<version>-win-x64.zip", readme);
+        Assert.Contains("SHA256SUMS.txt", readme);
+        Assert.DoesNotContain($"AG2Router-v{canonicalVersion}-win-x64", readme);
 
         string releaseNotesPath = Path.Combine(repoRoot, "docs", $"release-notes-v{canonicalVersion}.md");
         Assert.True(File.Exists(releaseNotesPath), $"Release notes for v{canonicalVersion} must exist at {releaseNotesPath}");

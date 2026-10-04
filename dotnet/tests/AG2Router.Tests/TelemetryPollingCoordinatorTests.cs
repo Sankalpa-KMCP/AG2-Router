@@ -105,6 +105,13 @@ public class MockAutoRouter : INativeAutoRouter
 
 public class TelemetryPollingCoordinatorTests
 {
+    // Deadlock guard for the disposal test's signal-driven awaits. Correctness comes
+    // from awaiting observable completion signals, not from this value; the guard only
+    // converts a stalled run into a diagnosable failure, so it must comfortably exceed
+    // worst-case scheduler delay under parallel-suite load instead of measuring
+    // normal completion time.
+    private static readonly TimeSpan DisposalSignalGuard = TimeSpan.FromSeconds(10);
+
     [Theory]
     [InlineData("IDLE")]
     [InlineData("HEALTHY")]
@@ -202,12 +209,17 @@ public class TelemetryPollingCoordinatorTests
         int publications = 0;
         coordinator.StatusUpdated += _ => publications++;
         var poll = coordinator.PollAsync();
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await entered.Task.WaitAsync(DisposalSignalGuard);
 
-        await coordinator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
-        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        await poll.WaitAsync(TimeSpan.FromSeconds(2));
-        await coordinator.DisposalCompletion;
+        // DisposeAsync's public wait is internally bounded: under load it may return
+        // while the owned drain is still finishing in the background. Every step below
+        // observes progress through completion signals — the adapter's cancellation
+        // registration, the poll task itself, and DisposalCompletion — and never
+        // through a deadline racing the background drain.
+        await coordinator.DisposeAsync().AsTask().WaitAsync(DisposalSignalGuard);
+        await cancellationObserved.Task.WaitAsync(DisposalSignalGuard);
+        await poll.WaitAsync(DisposalSignalGuard);
+        await coordinator.DisposalCompletion.WaitAsync(DisposalSignalGuard);
         await coordinator.DisposeAsync();
         await coordinator.PollAsync();
         coordinator.Start();
