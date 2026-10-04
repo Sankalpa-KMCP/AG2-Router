@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest an improvement to AG2 Router
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Proposed outcome
+      description: What should AG2 Router do instead? Concrete behavior beats implementation ideas.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, workarounds, or existing features you tried.
+  - type: textarea
+    id: benefit
+    attributes:
+      label: Why it benefits AG2 Router
+      description: How it fits the product's purpose — quota-aware routing, account safety, local privacy.

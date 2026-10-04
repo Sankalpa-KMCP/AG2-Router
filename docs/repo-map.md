@@ -7,7 +7,10 @@ Navigation aid: answer "where do I look for X?" fast. Orientation context is in 
 | Path | Purpose | Status |
 | --- | --- | --- |
 | AGENTS.md | Agent routing index and repository-wide safety policy | Authoritative entry point |
-| README.md | Product overview, user install/usage, build commands | Current |
+| README.md | Human-facing product overview, install/usage, project status | Current |
+| SECURITY.md | Security reporting policy and scope (channel verification pending public visibility) | Current |
+| CONTRIBUTING.md | Contribution guidance; defers to AGENTS.md and the governance gates | Current |
+| LICENSE | MIT license for the repository (ADR-004) | Authoritative grant |
 | dotnet/ | Shipped .NET 10 Windows application and its tests | Authoritative (shipped behavior) |
 | frontend/ | Authored Svelte 5 + TypeScript dashboard source | Authoritative (UI source) |
 | src/ | Node/TypeScript reference implementation; contains generated `src/ui` | Reference + generated output |
@@ -15,7 +18,7 @@ Navigation aid: answer "where do I look for X?" fast. Orientation context is in 
 | test/ | Node/TypeScript reference test suite | Reference/CI oracle |
 | scripts/ | Build, packaging, install/uninstall automation | Authoritative for its purpose |
 | installer/AG2Router.iss | Inno Setup installer definition | Authoritative |
-| .github/workflows/ | ci.yml, dotnet-ci.yml, release.yml | Enforced CI/release entry points |
+| .github/ | ci.yml, dotnet-ci.yml, release.yml workflows; issue templates (bug report, feature request); pull-request template | Enforced CI/release entry points and community templates |
 | docs/ | Durable documentation (subject owners + this understanding layer) | See AGENTS.md table |
 | dist/, node_modules/, publish/, graphify-out/ | Local build output / dependencies / derived graph | Ignored; never commit |
 | dotnet/Directory.Build.props | Canonical version + shared compile settings | Authoritative version source |

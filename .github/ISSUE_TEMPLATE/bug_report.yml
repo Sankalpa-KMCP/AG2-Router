@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a problem with AG2 Router
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem.
+
+        **Never include credential material, vault contents, tokens, or prompt transcripts in this report.** Redact log excerpts before pasting.
+  - type: input
+    id: version
+    attributes:
+      label: AG2 Router version
+      description: Exact version, e.g. from the release asset name or the dashboard footer.
+    validations:
+      required: true
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: Install type
+      options:
+        - Inno Setup installer (Setup .exe)
+        - Portable ZIP (install.ps1)
+        - Development build (from source)
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: e.g. Windows 11 23H2, Windows 10 22H2.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: What did you do, and what happened? Include relevant redacted excerpts from %LOCALAPPDATA%\AG2-Router\app.log if available.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

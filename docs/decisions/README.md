@@ -35,6 +35,7 @@ Current records:
 | [ADR-001](ADR-001-switch-transaction-journal.md) | Durable switch transaction journal and startup reconciliation | Accepted (implemented) |
 | [ADR-002](ADR-002-native-dotnet-runtime.md) | Adopt native .NET/WPF runtime instead of Electron or a Node daemon | Accepted |
 | [ADR-003](ADR-003-documentation-governance.md) | Documentation governance — understanding layer, mandatory gates, and decision records | Accepted |
+| [ADR-004](ADR-004-use-mit-license.md) | Use MIT License for AG2 Router | Accepted |
 
 When adding an ADR, add its row to this table in the same change.
 
