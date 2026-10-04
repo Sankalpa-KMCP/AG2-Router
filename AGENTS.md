@@ -21,6 +21,7 @@ Each subject has one documentation owner:
 | Durable state, transactions, locks, and recovery | docs/persistence-and-concurrency.md |
 | Test layers, fidelity, and isolation | docs/testing.md |
 | UI build, packaging, installation, and release | docs/build-and-release.md |
+| Usage accounting domain and durable call ledger | docs/usage-accounting.md |
 | Current evidence-backed gaps | docs/known-limitations.md |
 | Historical decision rationale | docs/decisions/README.md |
 

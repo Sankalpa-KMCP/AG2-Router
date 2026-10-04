@@ -104,6 +104,26 @@ public static class ProcessProvenanceValidator
             $"Verified Antigravity 2 process (PID {selected.ProcessId})");
     }
 
+    /// <summary>
+    /// Returns every genuine Antigravity language-server candidate for multi-instance usage
+    /// collection, deduplicated by process id and ordered deterministically. Applies the same
+    /// provenance rules as <see cref="Validate"/> without the single-process ambiguity policy:
+    /// usage collection must enumerate all validated instances, not select one.
+    /// </summary>
+    public static IReadOnlyList<DiscoveredProcessRaw> ValidateAll(IReadOnlyList<DiscoveredProcessRaw> processes)
+    {
+        if (processes is null || processes.Count == 0)
+            return Array.Empty<DiscoveredProcessRaw>();
+
+        return processes
+            .Where(IsLanguageServerCandidate)
+            .Where(HasAntigravityProvenance)
+            .GroupBy(static process => process.ProcessId)
+            .Select(static group => group.First())
+            .OrderBy(static process => process.ProcessId)
+            .ToList();
+    }
+
     public static bool IsLanguageServerCandidate(DiscoveredProcessRaw proc)
     {
         var name = proc.Name ?? string.Empty;

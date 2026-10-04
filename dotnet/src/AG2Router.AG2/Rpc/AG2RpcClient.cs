@@ -1,6 +1,7 @@
 using System.Net.Http;
 using System.Net.Security;
 using System.Text;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AG2Router.AG2.Security;
@@ -11,7 +12,7 @@ namespace AG2Router.AG2.Rpc;
 /// Native C# client for Antigravity 2 Connect-RPC service over loopback.
 /// Implements unary Connect-RPC JSON protocol version 1 with loopback-scoped TLS bypass.
 /// </summary>
-public class AG2RpcClient : IAG2RpcClient, IDisposable
+public class AG2RpcClient : IAG2RpcClient, IUsageRpcClient, IDisposable
 {
     private const string StandardMetadataJson = "{\"metadata\":{\"ideName\":\"antigravity\",\"extensionName\":\"antigravity\"}}";
     private const string ServicePrefix = "/exa.language_server_pb.LanguageServerService";
@@ -91,6 +92,50 @@ public class AG2RpcClient : IAG2RpcClient, IDisposable
     {
         var url = $"{protocol}://127.0.0.1:{port}{ServicePrefix}/GetAllCascadeTrajectories";
         return await CallRpcAsync<RawTrajectoriesResponse>(url, csrfToken, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<RawGeneratorMetadataEntry>> GetCascadeTrajectoryGeneratorMetadataAsync(
+        int port, string protocol, string csrfToken, string cascadeId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(cascadeId);
+        var url = $"{protocol}://127.0.0.1:{port}{ServicePrefix}/GetCascadeTrajectoryGeneratorMetadata";
+        string requestBody = JsonSerializer.Serialize(new GeneratorMetadataRequest { CascadeId = cascadeId });
+
+        using var request = CreateConnectRpcRequest(HttpMethod.Post, url, csrfToken, requestBody);
+        HttpResponseMessage response;
+        try
+        {
+            response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"RPC transport error: {AG2Security.SanitizeError(ex)}", ex);
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+            {
+                // Body is intentionally not read or logged: generator metadata can embed
+                // prompt-adjacent content. Only the status code reaches diagnostics.
+                throw new HttpRequestException(
+                    $"Connect-RPC call failed with HTTP {(int)response.StatusCode}.", null, response.StatusCode);
+            }
+
+            var content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return UsageRpcPayloads.ExtractEntries(JsonDocument.Parse(content));
+            }
+            catch (JsonException ex)
+            {
+                throw new InvalidOperationException("Failed to deserialize Connect-RPC JSON payload.", ex);
+            }
+        }
     }
 
     private async Task<T?> CallRpcAsync<T>(string url, string csrfToken, CancellationToken cancellationToken) where T : class

@@ -82,7 +82,9 @@ export class AppServer {
       });
 
       this.server.listen(this.config.port, this.config.host, () => {
-        resolve({ host: this.config.host, port: this.config.port });
+        const address = this.server?.address();
+        const port = typeof address === 'object' && address !== null ? address.port : this.config.port;
+        resolve({ host: this.config.host, port });
       });
     });
   }
@@ -541,6 +543,13 @@ export class AppServer {
         vaultRecordDeleted = await this.sessionVault.removeSession(id);
       }
       this.sendJson(res, 200, { success: true, removedId: id, vaultRecordDeleted });
+      return;
+    }
+
+    // GET /api/usage/* - Explicit capability difference (not implemented on the Node oracle).
+    // The reference server must never synthesize usage data that could look real.
+    if (pathname.startsWith('/api/usage')) {
+      this.sendJson(res, 501, { error: 'Usage accounting is not supported by the Node reference server.' });
       return;
     }
 

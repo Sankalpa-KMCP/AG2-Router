@@ -4,9 +4,11 @@ using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Adapter;
 using AG2Router.AG2.Discovery;
 using AG2Router.AG2.Persistence;
+using AG2Router.AG2.Rpc;
 using AG2Router.AG2.Routing;
 using AG2Router.AG2.Security;
 using AG2Router.AG2.Switching;
+using AG2Router.AG2.Usage;
 using AG2Router.AG2.Vault;
 using AG2Router.App.Diagnostics;
 using AG2Router.App.Lifecycle;
@@ -51,6 +53,10 @@ public partial class App : System.Windows.Application
     private NativeAccountSwitchCoordinator? _switchCoordinator;
     private NativeAutoRouter? _autoRouter;
     private DurableQuotaObservationStore? _quotaObservationStore;
+    private DurableUsageCallLedger? _usageLedger;
+    private UsageCollectorStateStore? _usageCollectorState;
+    private UsageCollectionService? _usageCollector;
+    private UsageAggregationService? _usageAggregation;
     private IAutostartService? _autostartService;
     private bool _isShuttingDown;
 
@@ -154,6 +160,18 @@ public partial class App : System.Windows.Application
             var switchJournalStore = new SwitchJournalStore(journalPath);
             string observationsPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "quota-observations.json");
             _quotaObservationStore = new DurableQuotaObservationStore(observationsPath);
+            string usageLedgerDirectory = System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "usage");
+            _usageLedger = new DurableUsageCallLedger(usageLedgerDirectory);
+            _usageCollectorState = new UsageCollectorStateStore(usageLedgerDirectory);
+            _usageAggregation = new UsageAggregationService(_usageLedger);
+            _usageCollector = new UsageCollectionService(
+                _usageLedger,
+                _usageCollectorState,
+                new UsageInstanceDiscovery(new WindowsProcessInspector()),
+                new AG2RpcClient(),
+                _accountStore,
+                log: Log);
             _switchCoordinator = new NativeAccountSwitchCoordinator(
                 _accountStore,
                 _sessionVault,
@@ -192,7 +210,9 @@ public partial class App : System.Windows.Application
                 switchCoordinator: _switchCoordinator,
                 autoRouter: _autoRouter,
                 autostartService: _autostartService,
-                onPollingIntervalChangedWithGeneration: (interval, gen) => _telemetryCoordinator?.UpdateInterval(interval, gen));
+                onPollingIntervalChangedWithGeneration: (interval, gen) => _telemetryCoordinator?.UpdateInterval(interval, gen),
+                usageAggregation: _usageAggregation,
+                usageCollectorStatusProvider: () => _usageCollector?.CurrentDiagnostics);
 
             var dashboardUrl = $"{_loopbackServer.BoundUrl}/index.html";
             Log($"Loopback server bound to: {dashboardUrl}");
@@ -224,6 +244,9 @@ public partial class App : System.Windows.Application
                 onOpenDashboard: OpenDashboard,
                 onExitRequested: ExitApplication
             );
+
+            Log("Starting usage collection service...");
+            _usageCollector.Start();
 
             Log("Tray-first startup completed. Application active in system tray.");
 
@@ -343,6 +366,19 @@ public partial class App : System.Windows.Application
         _dashboardManager = null;
 
         _switchCoordinator = null;
+
+        // Stop usage collection before the loopback host so no cycle outlives its dependencies.
+        if (_usageCollector != null)
+        {
+            try
+            {
+                using var usageShutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await _usageCollector.StopAsync(usageShutdownCts.Token);
+                await _usageCollector.DisposeAsync();
+            }
+            catch { }
+            _usageCollector = null;
+        }
 
         // Stop in-process loopback host gracefully
         if (_loopbackServer != null)

@@ -115,6 +115,11 @@ After process transition begins, caller cancellation is detached; internally bou
 
 There is no generated/shared schema or browser end-to-end contract gate. Backend DTO serialization and server tests define the wire; frontend types are maintained alongside them. See [known-limitations.md](known-limitations.md).
 
+## Usage routes
+
+Native read-only GET endpoints: `/api/usage/summary?scope=all|unattributed|account:{id}`, `/api/usage/timeseries?range=24h|7d|30d|all&scope=...`, `/api/usage/models?scope=...`. Responses are aggregate counters and internal account ids only — never cascade/response identifiers, prompt content, ports, or process details. Ledger integrity failures return 503 with a fixed sanitized message. The Node reference server returns 501 for every `/api/usage/*` route; the dashboard surfaces this as an explicit unsupported-backend state. See usage-accounting.md for the accounting semantics.
+
+
 ## Evidence and enforcement
 
 - Server tests: LoopbackServerTests, LoopbackServerAccountApiTests, LoopbackSwitchApiTests, and LoopbackRouterApiTests.

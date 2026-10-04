@@ -166,3 +166,99 @@ export interface JournalResolutionResult {
 export interface ResolveQuarantineRequest {
   confirm: boolean;
 }
+
+
+// ---- Usage accounting (conversation calls) ----
+
+export interface UsageTokenTotals {
+  calls: number;
+  conversationTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  responseOutputTokens: number;
+  responseOutputCalls: number;
+  thinkingOutputTokens: number;
+  thinkingOutputCalls: number;
+  cacheReadTokens: number;
+  cacheReportedCalls: number;
+  cacheUnknownCalls: number;
+  outputMismatchCalls: number;
+}
+
+export type UsageScopeQuery = 'all' | 'unattributed' | `account:${string}`;
+
+export interface UsageCollectorStatus {
+  baselineEstablished: boolean;
+  lastCollectionAttemptAtUtc: string | null;
+  lastSuccessfulCollectionAtUtc: string | null;
+  lastError: string | null;
+  instancesDiscovered: number;
+  instancesHealthy: number;
+  integrityAvailable: boolean;
+}
+
+export interface UsageAccountBreakdownItem {
+  accountId: string | null;
+  isUnattributed: boolean;
+  calls: number;
+  conversationTokens: number;
+}
+
+export interface UsageSummary {
+  scope: { kind: string; accountId: string | null };
+  totals: UsageTokenTotals;
+  historicalUnknown: UsageTokenTotals;
+  unattributed: UsageTokenTotals | null;
+  accounts: UsageAccountBreakdownItem[];
+  generatedAtUtc: string;
+}
+
+export interface UsageSummaryResponse {
+  summary: UsageSummary;
+  collector?: UsageCollectorStatus | null;
+}
+
+export interface UsageTimeBucket {
+  bucketStartUtc: string;
+  calls: number;
+  conversationTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
+export interface UsageTimeSeries {
+  range: string;
+  buckets: UsageTimeBucket[];
+  historicalUnknown: UsageTokenTotals;
+  generatedAtUtc: string;
+}
+
+export interface UsageTimeSeriesResponse {
+  timeseries: UsageTimeSeries;
+}
+
+export interface UsageModelBreakdownItem {
+  modelKey: string | null;
+  isUnknownModel: boolean;
+  calls: number;
+  conversationTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  thinkingOutputTokens: number;
+  cacheReadTokens: number;
+}
+
+export interface UsageModelBreakdown {
+  scope: { kind: string; accountId: string | null };
+  models: UsageModelBreakdownItem[];
+  generatedAtUtc: string;
+}
+
+export interface UsageModelBreakdownResponse {
+  models: UsageModelBreakdown;
+}
+
+export type UsageRange = '24h' | '7d' | '30d' | 'all';
+
+export const USAGE_RANGES: readonly UsageRange[] = ['24h', '7d', '30d', 'all'];

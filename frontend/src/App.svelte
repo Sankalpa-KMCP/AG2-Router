@@ -8,6 +8,7 @@
   import AccountsTable from './lib/components/AccountsTable.svelte';
   import RoutingConfigSection from './lib/components/RoutingConfigSection.svelte';
   import ActivityLogSection from './lib/components/ActivityLogSection.svelte';
+  import UsageSection from './lib/components/UsageSection.svelte';
   import ConnectAccountModal from './lib/components/ConnectAccountModal.svelte';
   import DeleteAccountModal from './lib/components/DeleteAccountModal.svelte';
   import ExecuteSwitchConfirmModal from './lib/components/ExecuteSwitchConfirmModal.svelte';
@@ -53,7 +54,7 @@
   }
   let activityLogs = $state<LogEntry[]>([]);
 
-  let activeTab = $state<'overview' | 'accounts' | 'telemetry' | 'routing' | 'activity'>('overview');
+  let activeTab = $state<'overview' | 'accounts' | 'telemetry' | 'routing' | 'usage' | 'activity'>('overview');
   let isInitialLoading = $state<boolean>(true);
   let isRefreshing = $state<boolean>(false);
   let isSavingCurrent = $state<boolean>(false);
@@ -450,7 +451,7 @@
         <div>
           <span class="page-eyebrow">Command center</span>
           <h2>{activeTab === 'overview' ? 'Overview' : activeTab === 'accounts' ? 'Accounts' : activeTab === 'telemetry' ? 'Telemetry & quotas' : activeTab === 'routing' ? 'Settings' : 'Activity & safety'}</h2>
-          <p>{activeTab === 'overview' ? 'Account health and model capacity at a glance.' : activeTab === 'accounts' ? 'Manage saved identities and account access.' : activeTab === 'telemetry' ? 'Inspect individual model observations and reset windows.' : activeTab === 'routing' ? 'Configure routing and switch thresholds.' : 'Review recent dashboard activity and router state.'}</p>
+          <p>{activeTab === 'overview' ? 'Account health and model capacity at a glance.' : activeTab === 'accounts' ? 'Manage saved identities and account access.' : activeTab === 'telemetry' ? 'Inspect individual model observations and reset windows.' : activeTab === 'routing' ? 'Configure routing and switch thresholds.' : activeTab === 'usage' ? 'Provider-reported conversation token usage across detected Antigravity instances.' : 'Review recent dashboard activity and router state.'}</p>
         </div>
         <span class="sync-indicator"><span aria-hidden="true"></span>{isRefreshing ? 'Syncing' : `Last sync ${lastPollTime}`}</span>
       </div>
@@ -508,6 +509,14 @@
           onclick={() => (activeTab = 'routing')}
         >
           Settings
+        </button>
+        <button
+          type="button"
+          class="nav-tab {activeTab === 'usage' ? 'active' : ''}"
+          aria-current={activeTab === 'usage' ? 'page' : undefined}
+          onclick={() => (activeTab = 'usage')}
+        >
+          Usage
         </button>
         <button
           type="button"
@@ -569,6 +578,8 @@
           routingReason={status?.router?.lastDecisionReason ?? null}
           onSaveConfig={handleSaveConfig}
         />
+      {:else if activeTab === 'usage'}
+        <UsageSection {accounts} />
       {:else if activeTab === 'activity'}
         <ActivityLogSection
           gateState={status?.router?.state || 'IDLE'}

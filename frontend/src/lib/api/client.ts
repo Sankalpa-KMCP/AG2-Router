@@ -8,8 +8,22 @@ import type {
   RouterConfigUpdate,
   CandidateEvidenceStatusDto,
   JournalResolutionResult,
-  JournalResolutionStatus
+  JournalResolutionStatus,
+  UsageSummaryResponse,
+  UsageTimeSeriesResponse,
+  UsageModelBreakdownResponse,
+  UsageScopeQuery,
+  UsageRange
 } from './types.js';
+import { USAGE_RANGES } from './types.js';
+
+/** Raised when the connected backend does not implement usage accounting (Node reference server). */
+export class UsageUnavailableError extends Error {
+  constructor(public readonly httpStatus: number) {
+    super('Usage accounting is not available on this backend.');
+    this.name = 'UsageUnavailableError';
+  }
+}
 
 export class SwitchRequestError extends Error {
   constructor(public readonly result: SwitchResultDto, public readonly httpStatus: number) {
@@ -323,6 +337,35 @@ export class ApiClient {
       method: 'POST',
       body: JSON.stringify(config)
     });
+  }
+
+  private async getUsageJson<T>(url: string): Promise<T> {
+    const res = await fetch(url);
+    if (res.status === 501) throw new UsageUnavailableError(501);
+    if (!res.ok) {
+      let errorMsg = `HTTP ${res.status}`;
+      try {
+        const errorJson = (await res.json()) as Record<string, unknown> | null;
+        if (errorJson && typeof errorJson.error === 'string') errorMsg = errorJson.error;
+      } catch {
+        errorMsg = res.statusText || errorMsg;
+      }
+      throw new Error(errorMsg);
+    }
+    return await res.json() as T;
+  }
+
+  public async getUsageSummary(scope: UsageScopeQuery = 'all'): Promise<UsageSummaryResponse> {
+    return this.getUsageJson<UsageSummaryResponse>(`/api/usage/summary?scope=${encodeURIComponent(scope)}`);
+  }
+
+  public async getUsageTimeSeries(range: UsageRange, scope: UsageScopeQuery = 'all'): Promise<UsageTimeSeriesResponse> {
+    if (!USAGE_RANGES.includes(range)) throw new Error('The usage time range is invalid.');
+    return this.getUsageJson<UsageTimeSeriesResponse>(`/api/usage/timeseries?range=${encodeURIComponent(range)}&scope=${encodeURIComponent(scope)}`);
+  }
+
+  public async getUsageModels(scope: UsageScopeQuery = 'all'): Promise<UsageModelBreakdownResponse> {
+    return this.getUsageJson<UsageModelBreakdownResponse>(`/api/usage/models?scope=${encodeURIComponent(scope)}`);
   }
 }
 

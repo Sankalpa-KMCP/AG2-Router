@@ -3,6 +3,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using AG2Router.AG2.Accounts;
+using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Security;
 using AG2Router.Core.Contracts;
 using AG2Router.Core.Models;
@@ -42,6 +43,8 @@ public class LoopbackServer : IAsyncDisposable
         INativeAccountSwitchCoordinator? switchCoordinator = null,
         INativeAutoRouter? autoRouter = null,
         IAutostartService? autostartService = null,
+        AG2Router.AG2.Usage.UsageAggregationService? usageAggregation = null,
+        Func<UsageCollectorDiagnostics?>? usageCollectorStatusProvider = null,
         Action<TimeSpan>? onPollingIntervalChanged = null,
         Action<TimeSpan, long>? onPollingIntervalChangedWithGeneration = null,
         Func<TimeSpan, long, Task>? onPollingIntervalChangedAsync = null,
@@ -728,6 +731,73 @@ public class LoopbackServer : IAsyncDisposable
             return Results.Ok(new { success = true, router = autoRouter.GetStatus() });
         });
 
+        // GET /api/usage/summary?scope=all|unattributed|account:{id}
+        _app.MapGet("/api/usage/summary", async (HttpContext context) =>
+        {
+            if (usageAggregation == null)
+                return Results.Json(new { error = "Usage accounting is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            if (!TryParseUsageScope(context, out var scope, out var scopeError))
+                return Results.Json(new { error = scopeError }, statusCode: StatusCodes.Status400BadRequest);
+            try
+            {
+                var summary = await usageAggregation.GetSummaryAsync(scope, context.RequestAborted);
+                return Results.Ok(new { summary, collector = usageCollectorStatusProvider?.Invoke() });
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { throw; }
+            catch (UsageLedgerException)
+            {
+                return Results.Json(new { error = "Usage history is temporarily unavailable due to an integrity issue." },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+        });
+
+        // GET /api/usage/timeseries?range=24h|7d|30d|all&scope=...
+        _app.MapGet("/api/usage/timeseries", async (HttpContext context) =>
+        {
+            if (usageAggregation == null)
+                return Results.Json(new { error = "Usage accounting is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            if (!TryParseUsageScope(context, out var scope, out var scopeError))
+                return Results.Json(new { error = scopeError }, statusCode: StatusCodes.Status400BadRequest);
+            var range = context.Request.Query["range"].ToString();
+            if (!AG2Router.AG2.Usage.UsageAggregationService.SupportedRanges.Contains(range, StringComparer.Ordinal))
+                return Results.Json(new { error = "The usage time range is invalid. Supported ranges: 24h, 7d, 30d, all." }, statusCode: StatusCodes.Status400BadRequest);
+            try
+            {
+                var timeseries = await usageAggregation.GetTimeSeriesAsync(scope, range, context.RequestAborted);
+                return Results.Ok(new { timeseries });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.Json(new { error = AG2Security.RedactSensitiveText(ex.Message) }, statusCode: StatusCodes.Status400BadRequest);
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { throw; }
+            catch (UsageLedgerException)
+            {
+                return Results.Json(new { error = "Usage history is temporarily unavailable due to an integrity issue." },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+        });
+
+        // GET /api/usage/models?scope=...
+        _app.MapGet("/api/usage/models", async (HttpContext context) =>
+        {
+            if (usageAggregation == null)
+                return Results.Json(new { error = "Usage accounting is not configured." }, statusCode: StatusCodes.Status501NotImplemented);
+            if (!TryParseUsageScope(context, out var scope, out var scopeError))
+                return Results.Json(new { error = scopeError }, statusCode: StatusCodes.Status400BadRequest);
+            try
+            {
+                var models = await usageAggregation.GetModelBreakdownAsync(scope, context.RequestAborted);
+                return Results.Ok(new { models });
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { throw; }
+            catch (UsageLedgerException)
+            {
+                return Results.Json(new { error = "Usage history is temporarily unavailable due to an integrity issue." },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+        });
+
         // GET /api/settings/autostart
         _app.MapGet("/api/settings/autostart", () =>
         {
@@ -783,6 +853,33 @@ public class LoopbackServer : IAsyncDisposable
             _boundPort = requestedPort;
             _boundUrl = $"http://127.0.0.1:{_boundPort}";
         }
+    }
+
+    private static bool TryParseUsageScope(HttpContext context, out UsageScope scope, out string? error)
+    {
+        scope = UsageScope.All;
+        error = null;
+        string raw = context.Request.Query["scope"].ToString().Trim();
+        if (raw.Length == 0 || string.Equals(raw, "all", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (string.Equals(raw, "unattributed", StringComparison.OrdinalIgnoreCase))
+        {
+            scope = UsageScope.Unattributed;
+            return true;
+        }
+        if (raw.StartsWith("account:", StringComparison.OrdinalIgnoreCase))
+        {
+            string accountId = raw["account:".Length..].Trim();
+            if (accountId.Length == 0 || accountId.Length > 64 || accountId.Contains('/') || accountId.Contains('\\'))
+            {
+                error = "The usage account scope is invalid.";
+                return false;
+            }
+            scope = UsageScope.ForAccount(accountId);
+            return true;
+        }
+        error = "The usage scope is invalid. Supported scopes: all, unattributed, account:{id}.";
+        return false;
     }
 
     private static bool FixedTimeEquals(string supplied, string expected)
