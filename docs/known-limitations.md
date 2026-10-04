@@ -43,13 +43,6 @@ Loopback binding reduces exposure but is not user authentication. See [security-
 
 Durable state and lifecycle sequencing: [persistence-and-concurrency.md](persistence-and-concurrency.md).
 
-## Documentation drift
-
-- docs/architecture.md describes an earlier Node foundation and staged native work rather than the shipped topology.
-- docs/dotnet-migration.md is migration-era history and includes obsolete staging language.
-- docs/security-model.md says WinCred access is strictly read-only, while the native switch coordinator performs controlled writes and conditional rollback through WindowsWinCredWriter.
-- docs/security.md and docs/security-model.md overlap. This foundation leaves both unchanged to preserve history; security-and-trust-model.md is the current subject owner.
-
 ## Generated UI freshness
 
 - frontend/ is authored source and Vite writes committed assets to src/ui.

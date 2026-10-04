@@ -50,9 +50,9 @@ WinCred is the live Antigravity credential boundary. The current native runtime 
 - Switching performs controlled writes to apply a vaulted target session.
 - Rollback may write the prior credential only after checking that current state still matches the transaction-applied credential.
 
-Therefore, older documentation that calls all WinCred access strictly read-only is stale for the shipped native switching path.
+Therefore, WinCred access is not read-only in the shipped product: the native switch coordinator performs controlled writes and conditional rollback through WindowsWinCredWriter, bounded by the transaction rules in [persistence-and-concurrency.md](persistence-and-concurrency.md).
 
-The session vault encrypts each framed account payload through Windows DPAPI CurrentUser. Framing binds the plaintext to account ID, target, and version; mismatches fail closed. DPAPI protects stored bytes but does not prove that an account/process transition is correct—that proof belongs to the transaction and telemetry checks.
+The session vault encrypts each framed account payload through Windows DPAPI CurrentUser. Framing binds the plaintext to account ID, target, and version; mismatches fail closed. Envelope records store individually encrypted payloads and deliberately add no outer encryption layer, keeping corruption detection and atomic updates simple and robust. DPAPI protects stored bytes but does not prove that an account/process transition is correct—that proof belongs to the transaction and telemetry checks.
 
 Account API hasVaultedSession is derived from successful vault decryption and framing validation, not a metadata flag or ciphertext-record presence. Temporary returned byte buffers are zeroed after this availability check; complete managed-memory erasure remains outside this guarantee.
 

@@ -10,6 +10,7 @@ Source and tests remain authoritative. The intended contract below is separated 
 - Allowed Host values are 127.0.0.1 and localhost.
 - JSON uses ASP.NET web defaults: public C# record properties serialize as camelCase unless JsonPropertyName specifies otherwise.
 - API responses are not cacheable. Common response headers include X-Content-Type-Options: nosniff, X-Frame-Options: DENY, and Cache-Control: no-store.
+- The Node reference server additionally emits `Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'` on its API and static responses; the native server does not emit a CSP header.
 - Error bodies generally use { "error": "safe message" }. Callers must also use the HTTP status; error text is not a stable machine code.
 - API browser mutation endpoints reject foreign Origin and Sec-Fetch-Site: cross-site before body parsing or state mutation. A missing Origin remains accepted for same-user native clients.
 - DTO additions may be tolerated by JavaScript, but renames, type changes, nullability changes, and enum/result-code changes are wire-contract changes.

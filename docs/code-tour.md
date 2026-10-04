@@ -34,7 +34,7 @@ AG2_Router/
 │   ├── server/                           # Reference loopback HTTP server
 │   ├── ui/                               # Generated compiled UI output (Vite build target; DO NOT EDIT)
 │   └── vault/                            # Reference session vault
-├── test/                                 # Node/TypeScript reference test suite (vitest)
+├── test/                                 # Node/TypeScript reference test suite (node:test)
 ├── scripts/                              # Build, copy, install, and uninstall automation
 └── installer/                            # Inno Setup packaging definitions
 ```
@@ -95,13 +95,7 @@ The dashboard UI is authored with modern Svelte 5 (runes) and TypeScript.
 1. **Compilation:** Running `npm run build:ui` (or `npm run build`) invokes Vite with `frontend/vite.config.ts`.
 2. **Output:** Vite bundles and minifies the Svelte application directly into `src/ui/`.
 3. **Node Distribution:** Running `npm run build:server` invokes `scripts/copy-ui.mjs`, which copies `src/ui/` into `dist/src/ui/` for the Node reference server.
-4. **.NET Native Linking:** In `dotnet/src/AG2Router.App/AG2Router.App.csproj`, an MSBuild item group links files from `..\..\..\src\ui\**` into the build output directory under `wwwroot/`:
-   ```xml
-   <Content Include="..\..\..\src\ui\**">
-     <Link>wwwroot\%(RecursiveDir)%(Filename)%(Extension)</Link>
-     <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-   </Content>
-   ```
+4. **.NET Native Linking:** The App project file (`dotnet/src/AG2Router.App/AG2Router.App.csproj`) includes the generated `src/ui/` assets as packaged content and stages them into the build/publish output under `wwwroot/`.
 5. **Runtime Serving:** At runtime, `LoopbackServer.cs` serves files directly from the `wwwroot` directory on its loopback port.
 
 ---
@@ -336,8 +330,8 @@ The PowerShell installer and uninstaller (`scripts/install.ps1`, `scripts/uninst
 The repository features comprehensive test coverage across both .NET and TypeScript stacks, designed to run deterministically without requiring live external services.
 
 ### Test Matrix
-- **Node/Vitest Suite (`test/`):** 366 unit and integration tests covering enrollment coherence, session vault encryption, telemetry normalization, loopback HTTP security, and frontend wire contracts.
-- **.NET xUnit Suite (`dotnet/tests/AG2Router.Tests/`):** 1034 unit and integration tests covering auto-routing policies, switch coordinator transactions, process lifecycle, WinCred, telemetry sequence filtering, and packaging.
+- **Node test suite (`test/`):** unit and integration tests executed with Node's built-in test runner (via `scripts/run-tests.mjs` after `npm run build`) covering enrollment coherence, session vault encryption, telemetry normalization, loopback HTTP security, and frontend wire contracts.
+- **.NET xUnit Suite (`dotnet/tests/AG2Router.Tests/`):** unit and integration tests covering auto-routing policies, switch coordinator transactions, process lifecycle, WinCred, telemetry sequence filtering, and packaging.
 
 ### Synthetic Isolation (`SyntheticInstallationTestEnvironment.cs` & `.ps1`)
 - Packaging tests execute `install.ps1` and `uninstall.ps1` inside a locked-down, synthetic sandbox.
@@ -371,7 +365,7 @@ The complete build, packaging, and release verification pipeline is automated th
 [dotnet publish (AG2Router.App)] ──► [Release Staging Directory]
                                               │
                                               ▼
-[installer/installer.iss] ──────────► [Inno Setup Compiler (ISCC)]
+[installer/AG2Router.iss] ──────────► [Inno Setup Compiler (ISCC)]
                                               │
                                               ▼
                                      [AG2Router-Setup-vX.Y.Z.exe]

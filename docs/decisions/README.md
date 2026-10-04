@@ -2,13 +2,11 @@
 
 This directory stores durable historical rationale for consequential project decisions. ADRs answer why a choice was made; they do not replace current source, tests, or the authoritative subject documents in docs/.
 
-No ADR is created as part of the documentation foundation. Existing migration-era documents remain preserved and can be used as evidence when a later task reconstructs a decision.
-
 ## When to create an ADR
 
-Create one when a decision is expensive to reverse, crosses multiple components, constrains future design, or resolves a recurring ambiguity. Examples include changing the shipped runtime, selecting a persistence format, altering the credential trust model, or establishing a compatibility policy.
+Create one when a decision is expensive to reverse, crosses multiple components, constrains future design, or resolves a recurring ambiguity. Examples include changing the shipped runtime, selecting a persistence format, altering the credential trust model, or establishing a compatibility policy. The `AGENTS.md` "Decision documentation gate" makes this mandatory for consequential decisions.
 
-Do not create an ADR for routine implementation detail, temporary workarounds, task progress, individual bug fixes, release notes, or facts already clear from source and tests.
+Do not create an ADR for routine implementation detail, temporary workarounds, task progress, individual bug fixes, release notes, formatting, naming, mechanically equivalent cleanup, or facts already clear from source and tests.
 
 ## Naming
 
@@ -16,36 +14,32 @@ Use:
 
     ADR-NNN-short-kebab-title.md
 
-Assign the next number by inspecting committed ADRs at the time of creation. Do not reserve numbers in advance. Renames should be rare because other records may link to them.
+Assign the next number by inspecting committed ADRs at the time of creation. Do not reserve numbers in advance. Renames should be rare because other records may link to them. Start from [ADR-TEMPLATE.md](ADR-TEMPLATE.md).
 
-## Template
+## Statuses and supersession
 
-Each ADR should contain:
+Statuses: `PROPOSED`, `ACCEPTED`, `SUPERSEDED`, `REJECTED`. An accepted ADR records the decision rationale as of its date; it is history, not a living contract. Update a status only as follows:
 
-    # ADR-NNN: Decision title
+- `PROPOSED` → `ACCEPTED` when the decision is adopted.
+- `ACCEPTED` → `SUPERSEDED` only via a new ADR that links back, with the old record linking forward (`Superseded by:`). Never silently rewrite an accepted ADR to reflect a later decision.
+- A considered-and-rejected direction is recorded with status `REJECTED` so the same dead end is not re-explored blindly.
 
-    Status: Proposed | Accepted | Superseded by ADR-NNN
-    Date: YYYY-MM-DD
+This project is solo-maintained: past decisions create no compatibility obligation by themselves, and any decision may be superseded when a better design is justified. Improving a decision is welcome; erasing the reasoning behind it is not.
 
-    ## Context
-    The durable problem, constraints, and evidence.
+## Index
 
-    ## Decision
-    The selected approach and its scope.
+Current records:
 
-    ## Alternatives considered
-    Material alternatives and why they were not selected.
+| ADR | Title | Status |
+| --- | --- | --- |
+| [ADR-001](ADR-001-switch-transaction-journal.md) | Durable switch transaction journal and startup reconciliation | Accepted (implemented) |
+| [ADR-002](ADR-002-native-dotnet-runtime.md) | Adopt native .NET/WPF runtime instead of Electron or a Node daemon | Accepted |
+| [ADR-003](ADR-003-documentation-governance.md) | Documentation governance — understanding layer, mandatory gates, and decision records | Accepted |
 
-    ## Consequences
-    Benefits, costs, risks, and migration/compatibility effects.
-
-    ## Evidence
-    Repository-relative source, test, issue, or stable review references.
+When adding an ADR, add its row to this table in the same change.
 
 ## Authority rules
 
-- An accepted ADR records the decision rationale as of its date.
 - Current operational truth remains in source/tests and the owning subject document, such as [runtime architecture](../runtime-architecture.md) or [security and trust](../security-and-trust-model.md).
-- When direction changes, add a new ADR and mark the old one superseded; do not rewrite history to make the old decision appear different.
 - Historical documents may be linked as evidence but should be labeled historical.
 - Never include secrets, live account data, transcripts, prompt IDs, temporary branch/commit state, authorization state, or ephemeral work progress.

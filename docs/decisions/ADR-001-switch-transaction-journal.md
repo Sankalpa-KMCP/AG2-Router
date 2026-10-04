@@ -1,6 +1,6 @@
 # ADR-001: Durable Switch Transaction Journal and Startup Reconciliation
 
-Status: Proposed
+Status: Accepted (implemented; current behavior is owned by the subject documents below)
 Date: 2026-09-27
 
 Historical design proposal: the context and proposed API names below describe the pre-journal implementation. The journal and startup reconciliation are now implemented; current behavior is owned by [persistence-and-concurrency.md](../persistence-and-concurrency.md#interrupted-switch-consistency) and [runtime-architecture.md](../runtime-architecture.md). This record preserves original rationale and proposal metadata, not a current operational gap or release-verification claim.
@@ -440,19 +440,19 @@ Future implementation must verify the following scenarios using synthetic fixtur
 ## Evidence
 
 The architectural decisions in this record are grounded in the following executable repository sources, contracts, and documentation:
-- **Switch Coordinator & Rollback**: [`dotnet/src/AG2Router.AG2/Switching/NativeAccountSwitchCoordinator.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.AG2/Switching/NativeAccountSwitchCoordinator.cs) (`SwitchCoreAsync`, `QuiesceForRollbackAsync`, `SwitchGate`).
-- **Account Metadata Storage & Path Resolution**: [`dotnet/src/AG2Router.AG2/Accounts/LocalMetadataAccountStore.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.AG2/Accounts/LocalMetadataAccountStore.cs) (`GetFilePath()`, `ResolveDefaultFilePath`, `TryFinalizeSwitchAsync`).
-- **Core Account Store Contract**: [`dotnet/src/AG2Router.Core/Contracts/Contracts.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.Core/Contracts/Contracts.cs) (`IAccountStore`, `ISessionVault`).
-- **Durable File Persistence & Locking**: [`dotnet/src/AG2Router.AG2/Persistence/DurableFileWriter.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.AG2/Persistence/DurableFileWriter.cs) (`DurableFileWriter`, `PathLockRegistry`, `CrossProcessFileLease`).
-- **Recovery Quarantine Primitives**: [`dotnet/src/AG2Router.AG2/Persistence/RecoveryQuarantine.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.AG2/Persistence/RecoveryQuarantine.cs) (`RecoveryQuarantine`, `RecoveryQuarantineRegistry`).
-- **Session Vault & Quarantine Propagation**: [`dotnet/src/AG2Router.AG2/Vault/SessionVault.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.AG2/Vault/SessionVault.cs) (`GetVaultPath`, `QuarantineUnresolvedMutation`, `IsQuarantined`).
-- **Enrollment & Removal Lifecycle Gates**: [`dotnet/src/AG2Router.AG2/Accounts/AccountEnrollmentService.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.AG2/Accounts/AccountEnrollmentService.cs) (`AccountEnrollmentService`, `AccountRemovalService`, lifecycle `.switch` resource gating).
-- **Session-Scoped Single-Instance Guard**: [`dotnet/src/AG2Router.Windows/Lifecycle/SingleInstanceGuard.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.Windows/Lifecycle/SingleInstanceGuard.cs) (`Local\AG2Router_Session_Mutex`).
-- **Application Startup Composition**: [`dotnet/src/AG2Router.App/App.xaml.cs`](file:///d:/AG2-Router/dotnet/src/AG2Router.App/App.xaml.cs) (`OnStartup`, service initialization ordering).
-- **Persistence & Concurrency Contract**: [`docs/persistence-and-concurrency.md`](file:///d:/AG2-Router/docs/persistence-and-concurrency.md) ("Interrupted switch consistency").
-- **Domain Identity Invariants**: [`docs/domain-rules.md`](file:///d:/AG2-Router/docs/domain-rules.md) ("Account identity", live-only identity proof).
-- **Known Limitations Baseline**: [`docs/known-limitations.md`](file:///d:/AG2-Router/docs/known-limitations.md) ("Switch transaction continuity").
-- **ADR Standards & Template**: [`docs/decisions/README.md`](file:///d:/AG2-Router/docs/decisions/README.md).
+- **Switch Coordinator & Rollback**: [`dotnet/src/AG2Router.AG2/Switching/NativeAccountSwitchCoordinator.cs`](../../dotnet/src/AG2Router.AG2/Switching/NativeAccountSwitchCoordinator.cs) (`SwitchCoreAsync`, `QuiesceForRollbackAsync`, `SwitchGate`).
+- **Account Metadata Storage & Path Resolution**: [`dotnet/src/AG2Router.AG2/Accounts/LocalMetadataAccountStore.cs`](../../dotnet/src/AG2Router.AG2/Accounts/LocalMetadataAccountStore.cs) (`GetFilePath()`, `ResolveDefaultFilePath`, `TryFinalizeSwitchAsync`).
+- **Core Account Store Contract**: [`dotnet/src/AG2Router.Core/Contracts/Contracts.cs`](../../dotnet/src/AG2Router.Core/Contracts/Contracts.cs) (`IAccountStore`, `ISessionVault`).
+- **Durable File Persistence & Locking**: [`dotnet/src/AG2Router.AG2/Persistence/DurableFileWriter.cs`](../../dotnet/src/AG2Router.AG2/Persistence/DurableFileWriter.cs) (`DurableFileWriter`, `PathLockRegistry`, `CrossProcessFileLease`).
+- **Recovery Quarantine Primitives**: [`dotnet/src/AG2Router.AG2/Persistence/RecoveryQuarantine.cs`](../../dotnet/src/AG2Router.AG2/Persistence/RecoveryQuarantine.cs) (`RecoveryQuarantine`, `RecoveryQuarantineRegistry`).
+- **Session Vault & Quarantine Propagation**: [`dotnet/src/AG2Router.AG2/Vault/SessionVault.cs`](../../dotnet/src/AG2Router.AG2/Vault/SessionVault.cs) (`GetVaultPath`, `QuarantineUnresolvedMutation`, `IsQuarantined`).
+- **Enrollment & Removal Lifecycle Gates**: [`dotnet/src/AG2Router.AG2/Accounts/AccountEnrollmentService.cs`](../../dotnet/src/AG2Router.AG2/Accounts/AccountEnrollmentService.cs) (`AccountEnrollmentService`, `AccountRemovalService`, lifecycle `.switch` resource gating).
+- **Session-Scoped Single-Instance Guard**: [`dotnet/src/AG2Router.Windows/Lifecycle/SingleInstanceGuard.cs`](../../dotnet/src/AG2Router.Windows/Lifecycle/SingleInstanceGuard.cs) (`Local\AG2Router_Session_Mutex`).
+- **Application Startup Composition**: [`dotnet/src/AG2Router.App/App.xaml.cs`](../../dotnet/src/AG2Router.App/App.xaml.cs) (`OnStartup`, service initialization ordering).
+- **Persistence & Concurrency Contract**: [`docs/persistence-and-concurrency.md`](../../docs/persistence-and-concurrency.md) ("Interrupted switch consistency").
+- **Domain Identity Invariants**: [`docs/domain-rules.md`](../../docs/domain-rules.md) ("Account identity", live-only identity proof).
+- **Known Limitations Baseline**: [`docs/known-limitations.md`](../../docs/known-limitations.md) ("Switch transaction continuity").
+- **ADR Standards & Template**: [`docs/decisions/README.md`](../../docs/decisions/README.md).
 
 *(Note: These references establish the repository architecture and constraints as inspected; they do not themselves substitute for dynamic test verification of new runtime capabilities).*
 

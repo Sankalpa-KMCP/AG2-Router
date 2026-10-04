@@ -25,6 +25,40 @@ Each subject has one documentation owner:
 | Current evidence-backed gaps | docs/known-limitations.md |
 | Historical decision rationale | docs/decisions/README.md |
 
+A project-understanding layer orients agents before they descend into subject documents:
+
+| Document | Role |
+| --- | --- |
+| docs/architecture.md | Current system overview: components, process boundaries, data flow, release path |
+| docs/repo-map.md | Navigation: where each subsystem lives, generated-artifact map, common task routes |
+| docs/invariants.md | Consolidated cross-domain rules a change must preserve, linked to their owners |
+
+These are orientation and navigation aids, never substitutes for the owning subject documents, source, or tests.
+
+When sources disagree, use this precedence:
+
+1. Explicit current user requirement.
+2. The authoritative subject contract for its subject (what the contract is).
+3. Current source, configuration, tests, and runtime evidence (what the behavior actually is).
+4. Other validated evidence from direct inspection.
+5. The project-understanding layer and docs/code-tour.md.
+6. Historical material (release notes, ADRs, migration documents).
+7. Inference.
+
+Rule 3 outranks rule 2 for behavior: if a subject document conflicts with current source or tests, follow rule 3 of "Truth and authority" — do not let prose win by assertion.
+
+## Required orientation
+
+Before non-trivial project work (anything beyond a localized, self-evident fix):
+
+1. Inspect current Git state (branch, HEAD, working tree) and preserve unrelated work.
+2. Read the relevant portions of docs/architecture.md, docs/repo-map.md, and docs/invariants.md.
+3. Read the owning subject document for the affected subject.
+4. Inspect the relevant source, configuration, and tests. Nested AGENTS.md files, when present, apply to their area.
+5. Use runtime evidence when behavior cannot be established statically.
+
+Trivial or strictly local tasks do not require reading every document; keep orientation proportionate to the change's blast radius.
+
 ## Repository roles
 
 - dotnet/src/AG2Router.Core: platform-neutral models and interfaces.
@@ -51,6 +85,7 @@ For every task:
 
 Common routes:
 
+- New to the codebase: docs/architecture.md, then docs/repo-map.md and docs/code-tour.md.
 - Dashboard or endpoint work: api-contracts.md, then LoopbackServer, Core DTOs, frontend API types/client, and loopback tests.
 - Quota or AutoRouter work: domain-rules.md, then normalization/routing source and tests.
 - Enrollment, vault, switching, or race work: persistence-and-concurrency.md and security-and-trust-model.md.
@@ -115,6 +150,48 @@ Never place secrets, credential payloads, live account identifiers, private loca
 - Update documentation in the same change when a boundary, contract, invariant, persistence format, or release procedure changes.
 
 Do not store prompt numbers, agent transcripts, temporary commit or branch state, current authorization state, review status, transient test counts, incident scratch notes, or ephemeral work progress in repository documentation.
+
+### Documentation maintenance gate
+
+Every coding agent is responsible for keeping the project-understanding documents (docs/architecture.md, docs/repo-map.md, docs/invariants.md) and the owning subject documents accurate. Before reporting a material repository task complete, answer:
+
+1. Did this change architecture (components, boundaries, flows)?
+2. Did this change file or directory responsibility/ownership?
+3. Did this change a source-of-truth or generated-artifact relationship?
+4. Did this change a public/API/data contract?
+5. Did this change a critical invariant?
+6. Did this change build, test, run, or release commands or the version mechanism?
+7. Was a consequential decision made?
+
+If yes to 1–6: update the affected current-state document(s) in the same task, before completion. If yes to 7: create or update a decision record under docs/decisions/ (see the decision documentation gate below). A task may require both. If no to all: leave the documentation unchanged; do not edit docs merely to touch them.
+
+Every final report for a material task must state:
+
+    Documentation impact:
+    - UPDATED: <files and why>
+    or
+    Documentation impact:
+    - NONE: <brief reason>
+
+    Decision impact:
+    - RECORDED: <ADR path>
+    or
+    Decision impact:
+    - NONE: no consequential decision made
+
+Prohibited: knowingly leaving architecture/map/invariant documentation stale; speculative updates unsupported by source; documentation-only wording churn unrelated to the task. This gate is mandatory, not optional.
+
+### Decision documentation gate
+
+Every agent making a consequential technical or product decision must record it as an ADR in docs/decisions/, capturing what was decided, why, the alternatives considered and why they were rejected, the consequences/tradeoffs, and what existing behavior or decision it replaces (if any). Start from [docs/decisions/ADR-TEMPLATE.md](docs/decisions/ADR-TEMPLATE.md) and follow [docs/decisions/README.md](docs/decisions/README.md) for naming, statuses, and supersession.
+
+A consequential decision includes changes to: architecture; process boundaries; subsystem ownership; APIs/contracts; persistence/data models; concurrency/lifecycle behavior; security/privacy boundaries; generated/source-of-truth relationships; dependencies with architectural impact; release/version strategy; important UX/product semantics; compatibility behavior; removal or replacement of a major mechanism.
+
+Do not create ADRs for local variable names, formatting, obvious refactors, typo fixes, or mechanically equivalent cleanup. This gate is mandatory, not optional.
+
+### Solo project
+
+This is a solo-maintained project. Historical implementation choices and previous architectural decisions create no compatibility obligation by themselves; when the task authorizes a change, prefer the better design and optimize for correctness, simplicity, maintainability, clarity, security, and performance where relevant rather than preserving historical code for its own sake. Do not erase reasoning history: reverse a documented decision through a new ADR that marks the old record SUPERSEDED and links both directions (see docs/decisions/README.md), never by silently rewriting the old record as though the prior decision never existed.
 
 ## Verification baseline
 

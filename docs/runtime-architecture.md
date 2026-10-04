@@ -66,7 +66,7 @@ Telemetry polling shutdown closes snapshot publication and cancels admitted work
 
 The Node/TypeScript implementation under src/ and its tests under test/ remain build and CI inputs. They are useful reference and parity evidence, but the released Windows executable is composed from dotnet/src/ and the built frontend assets. A TypeScript behavior must not be assumed to exist in the native application without corresponding .NET source, composition, and tests.
 
-Historical documents such as architecture.md and dotnet-migration.md describe earlier stages. They do not supersede this current topology or executable evidence.
+docs/architecture.md is the orientation-level overview of the current system; this document remains the owner of runtime topology and component boundaries. Decision rationale lives in docs/decisions/. Neither the overview nor decision records supersede this current topology or executable evidence.
 
 ## Evidence map
 

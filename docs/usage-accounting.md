@@ -1,6 +1,6 @@
 # Usage accounting
 
-Authoritative document for the usage-accounting domain and its durable ledger. Current implementation covers only the domain model and persistence (stage U1). The Antigravity collector (U2), aggregation and HTTP API (U3), and dashboard views (U4) are **not yet implemented**; nothing in this document describes live collection or an HTTP surface.
+Authoritative document for the usage-accounting domain and its durable ledger. The complete native feature is implemented — durable ledger (U1/U1A), multi-instance collection (U2), attribution continuity (U2A), aggregation and the native HTTP API (U3), and the dashboard Usage tab (U4/U4A) — with integrated verification (U5). Live runtime validation against a real Antigravity installation was NOT_EXECUTED_PROTECTED_RESOURCE_BOUNDARY; see the stage boundary at the end of this document.
 
 ## Source scope
 

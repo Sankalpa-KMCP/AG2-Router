@@ -1,105 +1,119 @@
-# AG2 Router &bull; Architecture Specification
+# AG2 Router architecture
 
-## 1. Overview & Core Philosophy
+This is the orientation-level overview of the current system. It explains what the components are and how they fit together; it is navigation, not authority. Each subject has one owning document (see the table in [AGENTS.md](../AGENTS.md)), and source and tests outrank all prose. Where this summary and a subject document disagree, the subject document wins; where any document and current source/tests disagree, source and tests win.
 
-**AG2 Router** is a minimal, lightweight local Windows application and service designed to monitor quota across multiple Antigravity 2 accounts, present a clear local dashboard, and enable safe, automated account switching when quota drops below configured thresholds.
+## Purpose
 
-### Guiding Principles
+AG2 Router is a per-user Windows desktop application for a local Antigravity ("AG2") installation. It:
 
-1. **Lightweight First:** Zero runtime external dependencies. Built entirely on modern Node.js (20+) standard library primitives (`node:http`, `node:fs`, `node:crypto`, `node:test`). No Electron, no Chromium background instance, no database engine.
-2. **Strict Isolation:** Unofficial and version-sensitive Antigravity 2 integration details remain strictly encapsulated behind an AG2 adapter boundary. Core routing, account management, and UI layers never touch Windows processes or Connect-RPC internals directly.
-3. **Safety & Zero Work Disruption:** Under no circumstance will the router switch accounts while an active agent cascade run / trajectory is in progress. The safety gate strictly enforces confirmation of IDLE status before any transition.
-4. **Truthful Telemetry:** The system represents state honestly. No fake accounts, mock quotas, or misleading combined numbers are displayed.
+- polls the active Antigravity session for per-model quota telemetry;
+- keeps DPAPI-encrypted sessions for multiple enrolled Antigravity accounts;
+- switches the active account automatically when the explicitly configured workload model runs low — only while Antigravity is verifiably idle — and safely under manual control;
+- records a privacy-minimal, durable ledger of conversation-model token usage;
+- exposes everything through a tray-first UX and a loopback WebView2 dashboard.
 
----
+Unknown, stale, ambiguous, or unsafe evidence fails closed: the application refuses mutation rather than guessing.
 
-## 2. Module Responsibilities & System Boundaries
+## High-level system
 
-The application is structured into clearly separated architectural domains:
+Everything shipped runs in one Windows process per user session. Antigravity is external; the dashboard browser engine is embedded.
 
 ```
-src/
-├── ag2/         # Antigravity 2 integration layer (Adapter boundary)
-├── accounts/    # Account metadata domain models & storage abstractions
-├── router/      # Quota assessment, candidate selection, & idle safety gate
-├── server/      # Lightweight loopback HTTP server & API surface
-├── ui/          # Minimal vanilla HTML/CSS/JS dashboard
-├── config/      # Runtime configuration & environment overrides
-└── index.ts     # Process entrypoint, bootstrap, & graceful shutdown
+Windows session (single AG2Router.exe instance)
+|
+AG2Router.App (WPF host, composition root: App.xaml.cs)
+  |-- TelemetryPollingCoordinator -- Connect-RPC over loopback --> Antigravity language server(s)
+  |     \-- AG2ProcessDetector / AG2LiveAdapter / AG2TelemetryNormalizer
+  |-- NativeAutoRouter + NativeAccountSwitchCoordinator   (routing decisions + switch transactions)
+  |-- UsageCollectionService / UsageAggregationService    (usage ledger ingest + read models)
+  |-- LoopbackServer (Kestrel, 127.0.0.1, ephemeral port)
+  |     \-- serves wwwroot = generated Svelte dashboard (src/ui) + /api/* JSON
+  |-- DashboardLifecycleManager -> MainWindow (WebView2, lazy) -> loads the loopback dashboard URL
+  |-- TrayIconManager + QuickStatusWindow                 (tray-first interaction)
+  \-- Durable state under %LOCALAPPDATA%\AG2-Router  +  WinCred `gemini:antigravity`  +  registry autostart
+
+External: Antigravity processes (discovered locally, provenance-verified). There is no cloud service and no second backend process.
 ```
 
-### 2.1 AG2 Integration Boundary (`src/ag2/`)
+The Node/TypeScript implementation under `src/` is a reference/parity oracle, not a shipped component (see [Further detail](#further-detail)).
 
-All Antigravity 2 daemon communication is isolated behind the `IAG2Adapter` interface:
+## Runtime and process boundaries
 
-* `discover()`: Detects running `language_server.exe` processes and resolves active dynamic ports.
-* `getCurrentAccount()`: Retrieves currently signed-in account identity via Connect-RPC `GetUserStatus`.
-* `getQuota()`: Retrieves per-model quota allocations and prompt/flow credit pools.
-* `getActivityState()`: Inspects cascade trajectory runs to determine whether AG2 is `IDLE` or `BUSY`.
-* `switchAccount()`: Initiates session activation (staged for subsequent security/switch layer).
-* `verifyAccount()`: Confirms that the target session is actively recognized by the daemon.
+- **Single instance per session.** `SingleInstanceGuard` (dotnet/src/AG2Router.Windows/Lifecycle) holds the session mutex `Local\AG2Router_Session_Mutex`; secondary launches forward `ACTIVATE`/`CLOSE`/`EXIT` over a session-qualified named pipe with `PipeOptions.CurrentUserOnly`. Details: [runtime-architecture.md](runtime-architecture.md).
+- **Upstream access is in-process.** `AG2ProcessDetector` discovers candidate language-server processes; `ProcessProvenanceValidator` proves executable identity/generation before use; `AG2RpcClient` speaks Connect-RPC over loopback ports; `AG2TelemetryNormalizer` maps raw payloads into Core DTOs. The app never talks to Antigravity through files or the UI.
+- **Dashboard boundary.** WebView2 loads `http://127.0.0.1:<ephemeral>` served by the in-process `LoopbackServer`. All dashboard state flows through the HTTP API; there is no direct WebView2-to-native bridge beyond navigation.
+- **Trust boundaries.** Loopback binding plus remote-address/Host checks block remote exposure, but loopback reachability is not authentication. Browser-mutation endpoints enforce `Origin`/`Sec-Fetch-Site` before body parsing; explicit switching additionally requires a per-process switch-intent token plus `confirm: true`. Credential storage relies on Windows user-scoped facilities (DPAPI `CurrentUser`, Credential Manager). Details and limits: [security-and-trust-model.md](security-and-trust-model.md).
 
-In this foundation stage, `AG2AdapterFoundation` enforces the interface contract while explicitly marking mutation methods as `NotImplementedError`, ensuring unsupported operations fail explicitly rather than feigning success.
+## Major subsystems
 
-### 2.2 Accounts Layer (`src/accounts/`)
+| Subsystem | Responsibility | Primary source | Owning document |
+| --- | --- | --- | --- |
+| Antigravity boundary | Process discovery, provenance, Connect-RPC, telemetry normalization | dotnet/src/AG2Router.AG2 (Discovery, Rpc, Adapter, Normalization) | [runtime-architecture.md](runtime-architecture.md), [domain-rules.md](domain-rules.md) |
+| Accounts & enrollment | Metadata store, active-account selection, verified enrollment/removal transactions | dotnet/src/AG2Router.AG2/Accounts | [persistence-and-concurrency.md](persistence-and-concurrency.md) |
+| Vault & credentials | DPAPI session vault; WinCred read/write; redaction | dotnet/src/AG2Router.AG2/Vault, dotnet/src/AG2Router.Windows/Security | [security-and-trust-model.md](security-and-trust-model.md) |
+| Routing | Workload-model pressure, durable candidate evidence, eligibility/ranking, safety gate | dotnet/src/AG2Router.AG2/Routing | [domain-rules.md](domain-rules.md) |
+| Switch transactions | Verified stop → credential swap → restart → identity/target-quota verification → guarded commit/rollback; journal recovery | dotnet/src/AG2Router.AG2/Switching | [persistence-and-concurrency.md](persistence-and-concurrency.md) |
+| Polling & app host | Composition root, single-instance, tray, polling loop, WebView2 lifecycle | dotnet/src/AG2Router.App | [runtime-architecture.md](runtime-architecture.md) |
+| Loopback API | HTTP wire contract, static dashboard hosting, trust checks | dotnet/src/AG2Router.App/Server/LoopbackServer.cs | [api-contracts.md](api-contracts.md) |
+| Usage accounting | Conversation-call ledger, multi-instance collection, aggregation, usage API | dotnet/src/AG2Router.AG2/Usage + Persistence | [usage-accounting.md](usage-accounting.md) |
+| Persistence primitives | Atomic writes, path locks, cross-process leases | dotnet/src/AG2Router.AG2/Persistence (DurableFileWriter.cs and siblings) | [persistence-and-concurrency.md](persistence-and-concurrency.md) |
+| Windows integration | WinCred, DPAPI, registry autostart, single-instance primitives, taskbar | dotnet/src/AG2Router.Windows | [security-and-trust-model.md](security-and-trust-model.md) |
 
-The accounts module manages registered account records:
+Tests for every subsystem live in dotnet/tests/AG2Router.Tests and, for the reference implementation, test/. The evidence map at the end of [runtime-architecture.md](runtime-architecture.md) and [docs/testing.md](testing.md) map contracts to concrete test suites.
 
-* **Separation of Concerns:** Contains strictly **non-secret metadata** (email, priority, standard vs. reserve flag, validation status).
-* **Zero Secrets in Storage:** OAuth access tokens, refresh tokens, and passwords are never stored in metadata files. Secret storage is deferred to a future bounded DPAPI/WinCred security stage.
-* **Storage Abstraction:** `IAccountStore` supports both in-memory and local filesystem persistence (`LocalMetadataAccountStore`) using atomic file write patterns (`.tmp` write followed by `fs.rename`).
+## Data and persistence
 
-### 2.3 Router & Quota Engine (`src/router/`)
+All durable application state lives outside the install directory, by default under `%LOCALAPPDATA%\AG2-Router` (`DATA_DIR` override exists only in the Node reference server):
 
-The routing engine evaluates account capacity and orchestrates safe transitions:
+| State | Location | Nature |
+| --- | --- | --- |
+| Account metadata + active account | `data/accounts.json` | Durable JSON, atomic writes |
+| Router configuration | `config.json` (beside accounts.json) | Durable, validated at load (fail-closed startup) |
+| Candidate quota observations | `quota-observations.json` | Durable, versioned, per account/model |
+| Switch journal | `switch-journal.json` | Durable, zero-secret recovery record |
+| Vaulted sessions | `vault/sessions.dat` | Versioned envelope of DPAPI ciphertext |
+| Usage ledger | `data/usage/usage-calls-YYYY-MM.json` | Monthly segments, versioned schema |
+| WebView2 profile | `webview2/` | WebView2-managed |
+| Autostart preference | `HKCU\...\Run\AG2Router` | Per-user registry |
+| Live Antigravity credential | Windows Credential Manager `gemini:antigravity` | External OS-managed |
 
-* **Deterministic Candidate Selection (`selector.ts`):**
-  * Evaluates current account quota against `lowQuotaThresholdPercent` (default: 15%).
-  * Filters candidate accounts against `minimumCandidateQuotaPercent` (default: 30%).
-  * Respects reserve account rules: standard accounts are strictly preferred; reserve accounts are only considered when all standard accounts are exhausted.
-  * Deterministic tie-breaking: highest remaining quota fraction $\to$ lowest integer priority number $\to$ alphabetical account ID.
-* **Idle Safety Gate (`safety-gate.ts`):**
-  * State lifecycle: `LOW QUOTA → SWITCH PENDING → WAIT FOR IDLE → SWITCH → VERIFY`.
-  * If Antigravity 2 has $\ge 1$ running trajectory or reports `BUSY`, switching is prohibited and the system transitions to `WAITING_FOR_IDLE`.
+Writes go through `DurableFileWriter` (temp file → flush → atomic replace) with path locks plus cross-process leases for read-modify-write mutation. Malformed or unsupported persisted data fails closed and is never silently overwritten. Ownership, locking order, and recovery semantics: [persistence-and-concurrency.md](persistence-and-concurrency.md). These paths are application contracts, not permission to inspect live user data.
 
-### 2.4 Server & API Surface (`src/server/`)
+## Frontend/native relationship
 
-A minimal HTTP server running on native `node:http`:
+`frontend/` is the only authored dashboard source (Svelte 5 + TypeScript). The Vite build (frontend/vite.config.ts) emits the generated bundle to `src/ui/`, which must never be hand-edited. `AG2Router.App.csproj` links `src/ui/**` into `wwwroot` at build/publish time; `LoopbackServer` serves it; WebView2 navigates to the loopback URL. The Node reference server stages the same `src/ui` output into `dist/src/ui` via scripts/copy-ui.mjs. Frontend API types (frontend/src/lib/api/types.ts) and the .NET DTOs form one wire contract owned by [api-contracts.md](api-contracts.md). Build chain detail: [build-and-release.md](build-and-release.md).
 
-* Binds strictly to `127.0.0.1` (loopback only).
-* Rejects non-loopback connections.
-* Enforces strict path traversal prevention on static asset requests.
-* Provides REST endpoints:
-  * `GET /api/status`: Overall system health, AG2 discovery status, router state, and telemetry.
-  * `GET /api/accounts`: List of registered accounts with active session indicator.
-  * `POST /api/accounts`: Register new non-secret account metadata.
-  * `DELETE /api/accounts/:id`: Remove registered account metadata.
-  * `GET /api/config`: Retrieve router configuration.
-  * `POST /api/config`: Update threshold and auto-switch settings.
+## Usage subsystem
 
-### 2.5 Dashboard (`src/ui/`)
+The ledger stores exactly one record per observed conversation-model call, identified by a salted SHA-256 of the length-prefixed `(cascadeId, responseId)` pair; raw cascade/response IDs, prompt content, and credential material never enter storage. `UsageCollectionService` discovers every validated language-server instance, applies change-gated fetching and per-endpoint attribution continuity, and ingests idempotent batches under a fixed lock order. `UsageAggregationService` provides read-only scopes (`all`, `account:{id}`, `unattributed`) over observation-time series plus explicit `HistoricalUnknown` totals. Attribution is immutable after first persistence. Full semantics: [usage-accounting.md](usage-accounting.md).
 
-A vanilla HTML5/CSS3/JavaScript client application:
+## Release and build architecture
 
-* Adheres to professional UI standards: restrained neutral typography, generous spacing, subtle borders, no gratuitous animations or card soup.
-* Automatically adapts to system light and dark color schemes.
-* Truthfully displays empty states (`--%`, `Not connected`, `Waiting for Antigravity 2`).
+```
+frontend/ (authored Svelte)
+   -> Vite build -> src/ui/ (generated, committed)
+   -> AG2Router.App links it as wwwroot
+   -> dotnet publish win-x64 (self-contained)
+   -> scripts/package-release.ps1
+   -> dist/ ZIP + SHA256SUMS.txt (+ optional Inno Setup installer from installer/AG2Router.iss)
+```
 
----
+dotnet/Directory.Build.props is the canonical release-version input; the release workflow derives the version from it and requires the git tag to match `v<Version>`. CI entry points: .github/workflows/ci.yml (Node matrix), dotnet-ci.yml (.NET build/test + installer compile gate), release.yml (packaging + artifact upload). Commands and packaging boundaries: [build-and-release.md](build-and-release.md).
 
-## 3. Quota Accounting Rules
+## Architectural boundaries
 
-1. **Credit Segregation:** Prompt credits and Flow credits originate from distinct resource pools. They are tracked separately and **must never be aggregated into a single combined balance**.
-2. **Model Pool Precision:** Quotas are tracked per model (e.g. `Gemini 3.8 Flash (High)`, `Claude Sonnet 4.6 (Thinking)`). Model percentages are never averaged across different accounts.
+What must not cross boundaries (full table in [runtime-architecture.md](runtime-architecture.md)):
 
----
+- AG2Router.Core: no Win32, WPF, HTTP hosting, or concrete persistence — DTOs, records, interfaces, validation only.
+- AG2Router.AG2: no WPF presentation or application composition — domain behavior only.
+- AG2Router.Windows: Windows primitives only — no domain routing policy.
+- AG2Router.App: composition, host UX, polling, loopback hosting only — no duplicated domain or storage implementations.
+- frontend/: no server-side authority, no secret handling; authored code must not import from src/ (enforced by test/frontend-boundary.test.ts).
+- src/ and test/: reference implementation and CI oracle only — a TypeScript behavior must not be assumed to exist in the shipped native application without corresponding .NET source, composition, and tests.
 
-## 4. Implementation Phasing
+## Further detail
 
-| Phase | Description | Status |
-| :--- | :--- | :--- |
-| **Phase 1: Foundation & Setup** | Repository initialization, TypeScript architecture, contracts, selector, safety gate, local loopback server, UI shell, test suite | **COMPLETE** |
-| **Phase 2: Discovery & Telemetry** | Native Windows process detection (`language_server.exe`), Connect-RPC client, live telemetry ingestion | Staged |
-| **Phase 3: Secure Session Vault** | Windows DPAPI encryption, WinCred `gemini:antigravity` target management, session capture | Staged |
-| **Phase 4: Cold Switch Execution** | Process termination, WinCred swap, daemon respawn, post-switch verification | Staged |
-| **Phase 5: Automated Routing** | End-to-end autonomous switching on low quota with safety gate enforcement | Staged |
+- [repo-map.md](repo-map.md) — where to find each file, generated-artifact map, common task routes.
+- [invariants.md](invariants.md) — consolidated rules changes must preserve.
+- [code-tour.md](code-tour.md) — deeper narrative tour of startup, transactions, and security mechanics.
+- Subject documents listed in [AGENTS.md](../AGENTS.md) own their domains; release notes under docs/ and decision records under docs/decisions/ are historical by design.
