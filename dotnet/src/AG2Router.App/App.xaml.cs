@@ -70,7 +70,7 @@ public partial class App : System.Windows.Application
                 "app.log"
             );
             System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(logPath)!);
-            System.IO.File.AppendAllText(logPath, $"[{DateTime.UtcNow:O}] [PID {Environment.ProcessId}] {msg}\n");
+            System.IO.File.AppendAllText(logPath, $"[{DateTime.UtcNow:O}] [PID {Environment.ProcessId}] {SanitizeLogText(msg)}\n");
         }
         catch { }
     }
@@ -407,6 +407,16 @@ public partial class App : System.Windows.Application
         _trayIconManager?.Dispose();
         base.OnExit(e);
     }
+
+    /// <summary>
+    /// Applies the app's existing sanitization chain to one diagnostic line before it is
+    /// persisted to app.log: router-configuration paths, command-line tokens, and
+    /// credential-adjacent key/value material are reduced exactly as they are in
+    /// user-facing reports, while stack frames and error classification are preserved
+    /// for diagnostics.
+    /// </summary>
+    internal static string SanitizeLogText(string message) =>
+        AG2Security.RedactSensitiveText(AG2Security.SanitizeCommandLine(SanitizeConfigPath(message)));
 
     /// <summary>
     /// Formats an actionable startup error message preserving the high-level context and appending inner validation details

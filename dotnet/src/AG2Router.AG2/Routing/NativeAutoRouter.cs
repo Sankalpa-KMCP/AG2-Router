@@ -622,14 +622,20 @@ public class NativeAutoRouter : INativeAutoRouter
                 return new SelectionResult(false, ag2Status.Message ?? "Antigravity offline or not detected.", _lastActiveAccountId, null, null, Array.Empty<CandidateEvaluation>());
             }
 
-            // Clean expired candidate cooldowns
-            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
-            var expiredKeys = _candidateCooldowns.Where(kvp => kvp.Value <= nowUtc).Select(kvp => kvp.Key).ToList();
-            foreach (var key in expiredKeys)
+            // Clean expired candidate cooldowns. Access is synchronized with the
+            // switch-completion writer under the router state lock; no awaits occur
+            // inside, so the documented lock hierarchy is unchanged.
+            HashSet<string> activeCooldownIds;
+            lock (_stateLock)
             {
-                _candidateCooldowns.Remove(key);
+                var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                var expiredKeys = _candidateCooldowns.Where(kvp => kvp.Value <= nowUtc).Select(kvp => kvp.Key).ToList();
+                foreach (var key in expiredKeys)
+                {
+                    _candidateCooldowns.Remove(key);
+                }
+                activeCooldownIds = _candidateCooldowns.Keys.ToHashSet(StringComparer.Ordinal);
             }
-            var activeCooldownIds = _candidateCooldowns.Keys.ToHashSet(StringComparer.Ordinal);
 
             // Fetch accounts and telemetry
             var activeAccountId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);

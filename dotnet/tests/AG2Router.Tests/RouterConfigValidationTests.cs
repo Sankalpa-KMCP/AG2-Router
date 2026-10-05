@@ -604,6 +604,26 @@ public sealed class RouterConfigValidationTests : IAsyncDisposable
     }
 
     [Fact]
+    public void SanitizeLogText_ReducesConfigPathsTokensAndSecrets_BeforeLogPersistence()
+    {
+        const string userLocalPath = @"C:\Users\someone\AppData\Local\AG2-Router\data\config.json";
+        const string rawLine =
+            "Startup failed with exception: Router configuration file '" + userLocalPath + "' is malformed." +
+            " --csrf_token=abcdef1234567890 --password=hunter2secret and token: bearer-secret-token";
+
+        var sanitized = AppHost.SanitizeLogText(rawLine);
+
+        Assert.DoesNotContain(@"C:\Users\someone", sanitized);
+        Assert.DoesNotContain(@"AppData\Local", sanitized);
+        Assert.Contains("config.json", sanitized);
+        Assert.DoesNotContain("abcdef1234567890", sanitized);
+        Assert.DoesNotContain("hunter2secret", sanitized);
+        Assert.DoesNotContain("bearer-secret-token", sanitized);
+        Assert.Contains("[REDACTED]", sanitized);
+        Assert.Contains("is malformed.", sanitized);
+    }
+
+    [Fact]
     public void FormatStartupErrorMessage_WithApostropheInPath_SanitizesConfigPathWithoutLeakingApostropheOrTail()
     {
         const string fullPath = @"C:\Users\O'Connor\AppData\Local\AG2-Router\data\config.json";

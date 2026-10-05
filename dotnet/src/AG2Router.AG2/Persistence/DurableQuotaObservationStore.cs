@@ -25,7 +25,6 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
     private readonly string _filePath;
     private readonly SemaphoreSlim _pathLock;
     private readonly IDurableFileWriter _fileWriter;
-    private List<AccountModelQuotaObservation>? _cache;
 
     public DurableQuotaObservationStore(string? filePath = null)
         : this(filePath, new DurableFileWriter())
@@ -76,7 +75,6 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         try
         {
             var items = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
-            _cache = items;
             return items.AsReadOnly();
         }
         finally
@@ -95,7 +93,6 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         try
         {
             var items = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
-            _cache = items;
             return items.Where(o => string.Equals(o.AccountId, accountId.Trim(), StringComparison.Ordinal)).ToList().AsReadOnly();
         }
         finally
@@ -117,7 +114,6 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         try
         {
             var items = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
-            _cache = items;
             return items.FirstOrDefault(o =>
                 string.Equals(o.AccountId, accountId.Trim(), StringComparison.Ordinal) &&
                 string.Equals(o.ModelKey, canonicalKey, StringComparison.OrdinalIgnoreCase));
@@ -236,9 +232,6 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
 
             string json = JsonSerializer.Serialize(doc, JsonOptions);
             await _fileWriter.WriteAtomicAsync(_filePath, json, cancellationToken).ConfigureAwait(false);
-
-            // In-memory cache is updated only after atomic file write completes
-            _cache = mergedList;
         }
         finally
         {
@@ -324,7 +317,6 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
                 invalidatedAtUtc < expected.ObservedAtUtc ? expected.ObservedAtUtc : invalidatedAtUtc, "LiveTargetVerificationRejected");
             var document = new QuotaObservationsDocument(CurrentSchemaVersion, invalidatedAtUtc, items);
             await _fileWriter.WriteAtomicAsync(_filePath, JsonSerializer.Serialize(document, JsonOptions), cancellationToken).ConfigureAwait(false);
-            _cache = items;
         }
         finally { _pathLock.Release(); }
     }
