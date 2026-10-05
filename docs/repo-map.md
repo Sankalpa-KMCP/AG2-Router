@@ -8,7 +8,7 @@ Navigation aid: answer "where do I look for X?" fast. Orientation context is in 
 | --- | --- | --- |
 | AGENTS.md | Agent routing index and repository-wide safety policy | Authoritative entry point |
 | README.md | Human-facing product overview, install/usage, project status | Current |
-| SECURITY.md | Security reporting policy and scope (channel verification pending public visibility) | Current |
+| SECURITY.md | Security reporting policy and scope (GitHub private vulnerability reporting, verified active) | Current |
 | CONTRIBUTING.md | Contribution guidance; defers to AGENTS.md and the governance gates | Current |
 | LICENSE | MIT license for the repository (ADR-004) | Authoritative grant |
 | dotnet/ | Shipped .NET 10 Windows application and its tests | Authoritative (shipped behavior) |

@@ -92,7 +92,7 @@ Active solo project, early stage. Stable releases and clearly marked release-can
 
 ## Security
 
-Please do not open public issues for suspected vulnerabilities. The intended reporting channel is GitHub private vulnerability reporting once it is verified for the public repository — see [SECURITY.md](SECURITY.md) for the current status.
+Please do not open public issues for suspected vulnerabilities. Report them privately through GitHub Security → "Report a vulnerability" — see [SECURITY.md](SECURITY.md) for scope and reporting guidance.
 
 ## License
 

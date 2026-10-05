@@ -6,9 +6,9 @@ AG2 Router handles Antigravity credentials, a local loopback API, and persistent
 
 Do not disclose suspected vulnerabilities through public issues, and do not exploit them against live accounts.
 
-The intended reporting channel is GitHub's private vulnerability reporting ("Report a vulnerability" on the repository's Security tab). Private vulnerability reporting is available for public repositories; because this repository is currently private, the public reporting flow cannot yet be verified and its availability is unknown.
+Report suspected vulnerabilities privately through GitHub's private vulnerability reporting: open the repository's Security tab and use "Report a vulnerability". The repository is public and this channel is verified active; reports submitted there reach the maintainer privately and are not publicly visible.
 
-After the repository's visibility is changed to PUBLIC, the owner must immediately enable Private vulnerability reporting in the repository's security settings and verify that "Report a vulnerability" is available before announcing or sharing the repository. Until that verification is complete, no private reporting channel should be treated as operational; none is invented here, and no personal contact details are published.
+No other private channel is offered, and no personal contact details are published.
 
 ## Scope
 

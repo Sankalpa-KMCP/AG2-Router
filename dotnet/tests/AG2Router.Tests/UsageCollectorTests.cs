@@ -53,6 +53,9 @@ public class UsageCollectorTests
         public int GeneratorMetadataCalls { get; private set; }
         public List<string> RequestedCascades { get; } = new();
 
+        /// <summary>Test-only fault injection: the named cascade's metadata fetch throws once scheduled.</summary>
+        public string? FailMetadataForCascade { get; set; }
+
         public EndpointState Endpoint(int port) =>
             Endpoints.TryGetValue(port, out var state)
                 ? state
@@ -88,6 +91,8 @@ public class UsageCollectorTests
             var state = Endpoint(port);
             GeneratorMetadataCalls++;
             RequestedCascades.Add(cascadeId);
+            if (FailMetadataForCascade == cascadeId)
+                throw new InvalidOperationException("synthetic transient metadata fetch failure");
             if (state.Gate is not null) await state.Gate(cancellationToken).ConfigureAwait(false);
             if (!state.GeneratorMetadataRawJson.TryGetValue(cascadeId, out var rawJson))
                 return [];
@@ -188,6 +193,49 @@ public class UsageCollectorTests
         var all = await ledger.GetAllCallsAsync();
         return Assert.Single(all);
     }
+
+    #region Transient per-cascade metadata fetch retry (F4)
+
+    [Fact]
+    public async Task F4_TransientMetadataFetchFailure_IsRetriedNextCycle_AndRecordedExactlyOnce()
+    {
+        using var harness = new Harness();
+        await harness.Accounts.AddAccountAsync(new CreateAccountInput("user@example.com"));
+        var endpoint = harness.Rpc.Endpoint(40010);
+        endpoint.IdentityEmail = "user@example.com";
+        endpoint.Trajectories["cascade-f4"] = Summary("cascade-f4", "ACTIVE", steps: 3, modified: "2026-10-04T10:00:00Z");
+        endpoint.GeneratorMetadataRawJson["cascade-f4"] = "[" + EntryJson("cascade-f4", "resp-f4-1", "10", "5") + "]";
+        var ledger = harness.CreateLedger();
+        var service = harness.CreateService(ledger: ledger);
+
+        // Cycle 1: the trajectory signature is new, but the per-cascade metadata fetch fails.
+        harness.Rpc.FailMetadataForCascade = "cascade-f4";
+        var failedCycle = await service.RunCollectionCycleAsync();
+        Assert.Empty(await ledger.GetAllCallsAsync());
+        Assert.Equal("One or more conversations could not be inspected.", failedCycle.LastError);
+
+        // Cycle 2: the SAME signature must be retried and, on success, recorded exactly once.
+        harness.Rpc.FailMetadataForCascade = null;
+        await service.RunCollectionCycleAsync();
+        var record = await SingleCallAsync(ledger);
+        Assert.Equal(10, record.InputTokens);
+        Assert.Equal(5, record.OutputTokens);
+
+        // Cycle 3: the unchanged signature is not fetched again — no repeated RPC, no duplicates.
+        int fetchesAfterRecovery = harness.Rpc.GeneratorMetadataCalls;
+        await service.RunCollectionCycleAsync();
+        Assert.Equal(fetchesAfterRecovery, harness.Rpc.GeneratorMetadataCalls);
+        Assert.Single(await ledger.GetAllCallsAsync());
+
+        // Cycle 4: a genuinely changed signature is still fetched (change gating intact).
+        endpoint.Trajectories["cascade-f4"] = Summary("cascade-f4", "ACTIVE", steps: 4, modified: "2026-10-04T10:05:00Z");
+        endpoint.GeneratorMetadataRawJson["cascade-f4"] = "[" + EntryJson("cascade-f4", "resp-f4-2", "20", "8") + "]";
+        await service.RunCollectionCycleAsync();
+        Assert.Equal(fetchesAfterRecovery + 1, harness.Rpc.GeneratorMetadataCalls);
+        Assert.Equal(2, (await ledger.GetAllCallsAsync()).Count);
+    }
+
+    #endregion
 
     #region Attribution continuity (J1–J10)
 

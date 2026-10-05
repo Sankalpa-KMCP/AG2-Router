@@ -460,6 +460,10 @@ public sealed class UsageCollectionService : IAsyncDisposable
                         // One broken cascade or instance must not erase other results.
                         lastError = "One or more conversations could not be inspected.";
                         _log?.Invoke($"Usage metadata fetch failed for a conversation: {Sanitize(ex)}");
+                        // The cursor must not retain a signature whose metadata was never
+                        // fetched: reverting it makes the next cycle re-detect the change and
+                        // retry, so a transient failure cannot permanently suppress the call.
+                        RevertCursorForFailedFetch(endpointKey, cascadeId);
                         continue;
                     }
 
@@ -710,6 +714,20 @@ public sealed class UsageCollectionService : IAsyncDisposable
                 cursor.Remove(staleKey);
             _changeCursors[endpointKey] = cursor;
             return changed;
+        }
+    }
+
+    /// <summary>
+    /// Removes a failed cascade's signature from the endpoint's change cursor so the next
+    /// cycle re-detects it as changed and retries the metadata fetch. A cursor entry may
+    /// only record a signature whose metadata fetch completed.
+    /// </summary>
+    private void RevertCursorForFailedFetch(string endpointKey, string cascadeId)
+    {
+        lock (_stateLock)
+        {
+            if (_changeCursors.TryGetValue(endpointKey, out var cursor))
+                cursor.Remove(cascadeId);
         }
     }
 

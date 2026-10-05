@@ -474,6 +474,53 @@ public sealed class NativeAccountSwitchCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task CancellationDuringContendedLockWaitReturnsCancelledAndRetiresCleanly()
+    {
+        await SeedAccountsAsync();
+        var coordinator = Coordinator();
+        var journalStore = new SwitchJournalStore(Path.Combine(_tempDir, "switch-journal.json"));
+        string switchResource = _vault.GetVaultPath() + ".switch";
+        var switchLock = PathLockRegistry.Get(switchResource);
+        Assert.True(await switchLock.WaitAsync(TimeSpan.FromSeconds(5)));
+        try
+        {
+            // SwitchAsync synchronously reaches the contended lock wait before returning to
+            // the caller, so cancelling afterwards deterministically interrupts the wait.
+            using var cts = new CancellationTokenSource();
+            Task<NativeSwitchResult> manual = coordinator.SwitchAsync(_target!.Id, cts.Token);
+            cts.Cancel();
+            var manualResult = await manual.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(SwitchResultCodes.Cancelled, manualResult.Code);
+            Assert.False(manualResult.ManualRecoveryRequired);
+            Assert.Equal(0, _credentials.WriteCount);
+            Assert.Equal(0, _process.StopCount);
+            Assert.Equal(SwitchJournalReadStatus.Absent, (await journalStore.ReadAsync()).Status);
+            Assert.Equal(NativeSwitchStates.Idle, coordinator.GetStatus().CurrentState);
+            Assert.False(coordinator.GetStatus().QuarantineActive);
+            Assert.Equal(JournalRecoveryStates.None, coordinator.GetStatus().JournalRecoveryState);
+            Assert.True(coordinator.CanAdmitSwitch(out _));
+
+            // The automatic entry point shares the same pre-mutation wait and must retire
+            // identically instead of surfacing an uncertain outcome to the router.
+            using var autoCts = new CancellationTokenSource();
+            Task<NativeSwitchResult> automatic = coordinator.SwitchAutomaticallyAsync(
+                _target.Id, _source!.Id, () => true, autoCts.Token);
+            autoCts.Cancel();
+            var automaticResult = await automatic.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(SwitchResultCodes.Cancelled, automaticResult.Code);
+            Assert.False(automaticResult.ManualRecoveryRequired);
+            Assert.Equal(NativeSwitchStates.Idle, coordinator.GetStatus().CurrentState);
+            Assert.True(coordinator.CanAdmitSwitch(out _));
+        }
+        finally
+        {
+            switchLock.Release();
+        }
+    }
+
+    [Fact]
     public async Task CancellationDuringUncertainCredentialWriteStillRollsBack()
     {
         await SeedAccountsAsync();

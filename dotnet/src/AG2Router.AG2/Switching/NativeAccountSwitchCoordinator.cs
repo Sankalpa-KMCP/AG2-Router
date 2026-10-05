@@ -937,7 +937,38 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
             string switchResource = _sessionVault.GetVaultPath() + ".switch";
             var switchLock = PathLockRegistry.Get(switchResource);
-            if (!await switchLock.WaitAsync(_transactionTimeout, cancellationToken).ConfigureAwait(false))
+            bool lockAcquired;
+            try
+            {
+                lockAcquired = await switchLock.WaitAsync(_transactionTimeout, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Caller cancellation during the contended pre-mutation wait is an ordinary
+                // cancelled request: no journal, lease, credential, or metadata mutation has
+                // begun. Retire the transaction through the same terminal path the post-terminal
+                // cleanup uses; an escaping exception here would be misread by callers as an
+                // uncertain outcome and would demand manual recovery before any mutation.
+                var result = Terminal(transactionId, false, SwitchResultCodes.Cancelled,
+                    NativeSwitchStates.Failed, requestedId, null, null, null,
+                    "Switch request was cancelled before credential mutation.", stages, now);
+                bool journalProvenAbsent = await ProveTransactionReusableAsync(transactionId).ConfigureAwait(false);
+                lock (_statusLock)
+                {
+                    if (journalProvenAbsent &&
+                        _lastResult?.TransactionId == transactionId &&
+                        !_lastResult.ManualRecoveryRequired &&
+                        _journalRecoveryState == JournalRecoveryStates.None &&
+                        !IsQuarantinedOrRecoveryUnresolved() &&
+                        _currentState is NativeSwitchStates.Failed)
+                    {
+                        _currentState = NativeSwitchStates.Idle;
+                    }
+                }
+                return result;
+            }
+
+            if (!lockAcquired)
             {
                 _recoveryQuarantine.Mark();
                 var uncertain = RecoveryUncertain(requestedId);
