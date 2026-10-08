@@ -63,14 +63,18 @@ Tests for every subsystem live in dotnet/tests/AG2Router.Tests and, for the refe
 
 ## Data and persistence
 
-All durable application state lives outside the install directory, by default under `%LOCALAPPDATA%\AG2-Router` (`DATA_DIR` override exists only in the Node reference server):
+All durable application state lives outside the install directory, by default under `%LOCALAPPDATA%\AG2-Router`. An optional `DATA_DIR` environment variable can override file-based storage roots for development and test harnesses:
+- In the Node reference server, `DATA_DIR` overrides the root storage directory for accounts and mock runtime state.
+- In .NET, `LocalMetadataAccountStore`, `DurableQuotaObservationStore`, and `UsageCallLedger` honor `DATA_DIR` (or explicit constructor arguments) to redirect `accounts.json`, `quota-observations.json`, and `data/usage/` segments.
+- Other .NET file paths derive from their configured stores (e.g. `switch-journal.json` and `config.json` resolve beside the accounts file), while the session vault defaults to `%LOCALAPPDATA%\AG2-Router\vault\sessions.dat`.
+- `DATA_DIR` does **not** provide full Windows application-state isolation: external resources—including Windows Credential Manager (`gemini:antigravity`), DPAPI (`CurrentUser`), per-user registry (`HKCU`), IPC named pipes/mutexes, the WebView2 profile directory, and live Antigravity processes—remain bound to their respective OS, user, and session boundaries.
 
 | State | Location | Nature |
 | --- | --- | --- |
 | Account metadata + active account | `data/accounts.json` | Durable JSON, atomic writes |
 | Router configuration | `config.json` (beside accounts.json) | Durable, validated at load (fail-closed startup) |
 | Candidate quota observations | `quota-observations.json` | Durable, versioned, per account/model |
-| Switch journal | `switch-journal.json` | Durable, zero-secret recovery record |
+| Switch recovery evidence | `switch-journal.json` + `switch-journal.json.transition` | Durable, zero-secret canonical record and transition sidecar; one recovery unit |
 | Vaulted sessions | `vault/sessions.dat` | Versioned envelope of DPAPI ciphertext |
 | Usage ledger | `data/usage/usage-calls-YYYY-MM.json` | Monthly segments, versioned schema |
 | WebView2 profile | `webview2/` | WebView2-managed |

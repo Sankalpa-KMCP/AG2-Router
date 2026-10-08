@@ -4,6 +4,7 @@ import type {
   SystemStatusDto,
   SwitchStatusDto,
   SwitchResultDto,
+  SwitchPlanResultDto,
   RouterConfigDto,
   RouterConfigUpdate,
   CandidateEvidenceStatusDto,
@@ -200,6 +201,12 @@ export class ApiClient {
     await this.request<{ ready: boolean }>('/api/switching/intent', {
       method: 'POST',
       headers: { 'X-AG2-Intent-Request': '1' }
+    });
+  }
+
+  public async getSwitchPlan(id: string): Promise<SwitchPlanResultDto> {
+    return this.request<SwitchPlanResultDto>(`/api/accounts/${encodeURIComponent(id)}/switch-plan`, {
+      method: 'POST'
     });
   }
 

@@ -161,9 +161,9 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         Assert.Equal(SwitchJournalState.CREDENTIAL_APPLYING, _journal.RecordedEntries[1].State);
         Assert.Equal(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _journal.RecordedEntries[2].State);
 
-        // Verify journal deletion was called after precommit
+        // Verify journal deletion was called after precommit (exact-entry conditional cleanup)
         Assert.Equal(1, _journal.DeleteCount);
-        Assert.Contains("JOURNAL_DELETE", _globalTimeline);
+        Assert.Contains("JOURNAL_DELETE_CONDITIONAL", _globalTimeline);
 
         // Verify UUID transaction ID consistency across all entries
         string txId = _journal.RecordedEntries[0].TransactionId;
@@ -247,7 +247,7 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         Assert.Equal(1, _process.RestoreCount);
 
         // Journal deleted upon verified rollback completion
-        int deleteIdx = _globalTimeline.IndexOf("JOURNAL_DELETE");
+        int deleteIdx = _globalTimeline.IndexOf("JOURNAL_DELETE_CONDITIONAL");
         Assert.True(deleteIdx > rollingBackIdx, "Journal must be deleted after rollback completion");
 
         var readResult = await _journal.ReadAsync();
@@ -281,7 +281,7 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
 
         // Rollback succeeded and deleted journal
         Assert.Equal(1, _process.RestoreCount);
-        Assert.Contains("JOURNAL_DELETE", _globalTimeline);
+        Assert.Contains("JOURNAL_DELETE_CONDITIONAL", _globalTimeline);
     }
 
     // 5. Target Identity Verification failure: target identity verification fails, ROLLING_BACK written before QuiesceForRollbackAsync, previous creds restored, rollback succeeds, journal deleted
@@ -311,7 +311,7 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
         Assert.True(quiesceRollbackIdx < wincredRestoreIdx, "QuiesceForRollbackAsync must precede credential restore");
 
         // Journal deleted upon verified rollback completion
-        Assert.Contains("JOURNAL_DELETE", _globalTimeline);
+        Assert.Contains("JOURNAL_DELETE_CONDITIONAL", _globalTimeline);
         Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
     }
 
@@ -342,7 +342,7 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
 
         // Rollback verified and journal deleted
         Assert.Equal(1, _process.RestoreCount);
-        Assert.Contains("JOURNAL_DELETE", _globalTimeline);
+        Assert.Contains("JOURNAL_DELETE_CONDITIONAL", _globalTimeline);
     }
 
     // 7. Metadata Finalization failure: TryFinalizeSwitchAsync fails -> triggers rollback or quarantine per design
@@ -364,7 +364,7 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
 
         // Previous account verified and journal deleted
         Assert.Equal(_source!.Id, await _accounts.GetActiveAccountIdAsync());
-        Assert.Contains("JOURNAL_DELETE", _globalTimeline);
+        Assert.Contains("JOURNAL_DELETE_CONDITIONAL", _globalTimeline);
     }
 
     // 8. Journal Deletion failure on commit: TryFinalizeSwitchAsync succeeds, DeleteAsync throws ->
@@ -923,16 +923,36 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
     }
 
     // 25. ordinary reconciliation makes zero live identity/RPC calls
-    [Fact]
-    public async Task Reconciliation_25_OrdinaryReconciliation_MakesZeroLiveIdentityOrRpcCalls()
+    [Theory]
+    [InlineData(SwitchJournalState.CREDENTIAL_APPLYING)]
+    [InlineData(SwitchJournalState.ROLLING_BACK)]
+    [InlineData(SwitchJournalState.QUARANTINED)]
+    public async Task Reconciliation_25_OrdinaryReconciliation_MakesZeroLiveIdentityOrRpcCalls(
+        SwitchJournalState journalState)
     {
         await SeedAccountsAsync();
-        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+        await SeedJournalAsync(journalState, _source!.Id, _target!.Id);
 
         var coordinator = CreateCoordinator();
         await coordinator.ReconcileStartupJournalAsync();
 
         Assert.Equal(0, _adapter.CallCount);
+    }
+
+    [Fact]
+    public async Task Reconciliation_25b_RecordedRecovery_ProbesSourceRuntimeWithinBoundedProof()
+    {
+        // RECORDED is the one state whose cleanup decision requires live evidence: a crash
+        // after the journal write may have stopped the source runtime. Its recovery probes
+        // telemetry within a bounded deadline; every ordinary path stays offline-safe.
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+
+        var coordinator = CreateCoordinator();
+        var result = await coordinator.ReconcileStartupJournalAsync();
+
+        Assert.True(_adapter.CallCount > 0);
+        Assert.Equal(StartupJournalReconciliationStatus.Clean, result.Status);
     }
 
     // 26. coordinator requires a journal dependency at construction (ArgumentNullException when null)
@@ -1133,6 +1153,34 @@ public sealed class NativeAccountSwitchCoordinatorJournalTests : IDisposable
             }
 
             return await _underlying.DeleteIfUnchangedAsync(expectedEntry, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<SwitchJournalWriteResult> CreateIfAbsentAsync(SwitchJournalEntry nextEntry, CancellationToken cancellationToken = default)
+        {
+            _timeline.Add($"JOURNAL_WRITE:{nextEntry.State}");
+            Operations.Add($"CREATE:{nextEntry.State}");
+            RecordedEntries.Add(nextEntry);
+
+            if (FailOnState == nextEntry.State)
+            {
+                throw new IOException($"Simulated journal write failure for state {nextEntry.State}");
+            }
+
+            return await _underlying.CreateIfAbsentAsync(nextEntry, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<SwitchJournalWriteResult> ReplaceIfUnchangedAsync(SwitchJournalEntry expectedEntry, SwitchJournalEntry nextEntry, CancellationToken cancellationToken = default)
+        {
+            _timeline.Add($"JOURNAL_WRITE:{nextEntry.State}");
+            Operations.Add($"REPLACE:{nextEntry.State}");
+            RecordedEntries.Add(nextEntry);
+
+            if (FailOnState == nextEntry.State)
+            {
+                throw new IOException($"Simulated journal write failure for state {nextEntry.State}");
+            }
+
+            return await _underlying.ReplaceIfUnchangedAsync(expectedEntry, nextEntry, cancellationToken).ConfigureAwait(false);
         }
     }
 

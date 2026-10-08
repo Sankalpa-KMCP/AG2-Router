@@ -10,7 +10,7 @@ Source and tests remain authoritative. The intended contract below is separated 
 - Allowed Host values are 127.0.0.1 and localhost.
 - JSON uses ASP.NET web defaults: public C# record properties serialize as camelCase unless JsonPropertyName specifies otherwise.
 - API responses are not cacheable. Common response headers include X-Content-Type-Options: nosniff, X-Frame-Options: DENY, and Cache-Control: no-store.
-- The Node reference server additionally emits `Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'` on its API and static responses; the native server does not emit a CSP header.
+- Both the shipped native server and the Node reference server emit `Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'` on API and static UI responses.
 - Error bodies generally use { "error": "safe message" }. Callers must also use the HTTP status; error text is not a stable machine code.
 - API browser mutation endpoints reject foreign Origin and Sec-Fetch-Site: cross-site before body parsing or state mutation. A missing Origin remains accepted for same-user native clients.
 - DTO additions may be tolerated by JavaScript, but renames, type changes, nullability changes, and enum/result-code changes are wire-contract changes.
@@ -23,7 +23,7 @@ Trust checks and their limits are defined in [security-and-trust-model.md](secur
 
 | Method and path | Request | Success response | Current notes |
 | --- | --- | --- | --- |
-| GET /api/status | none | SystemStatusDto | Direct object containing status, ag2, router, and nullable telemetry |
+| GET /api/status | none | SystemStatusDto | Direct object containing status, ag2, router, and nullable telemetry; router/poolStatus dynamically verified against authoritative router state |
 | GET /api/accounts | none | AccountsListDto | accounts, totalCount, activeAccountId; each account is enriched with active/vault flags |
 | POST /api/accounts | CreateAccountInput | 201 with { account } | Metadata registration; does not itself capture a live session |
 | POST /api/accounts/enroll-current | optional EnrollmentOptions | { success, account, isNew, message } | Enrolls observed active identity and credential |
@@ -31,7 +31,7 @@ Trust checks and their limits are defined in [security-and-trust-model.md](secur
 | DELETE /api/accounts/{id} | none | { success, removedId, vaultRecordDeleted } | Shared switch ownership; vault-first removal with compensation on metadata failure |
 | GET /api/switching/status | none | { status } | Does not return the switch-intent token |
 | POST /api/switching/intent | X-AG2-Intent-Request: 1 | { ready: true } and X-AG2-Switch-Token header | Same-origin browser bootstrap; foreign Origin/cross-site requests rejected |
-| POST /api/accounts/{id}/switch-plan | none | 501 | Unsupported legacy endpoint; no dashboard Plan Switch workflow |
+| POST /api/accounts/{id}/switch-plan | none | SwitchPlanResultDto | Read-only dry-run switch plan evaluating admissibility, gates, and quota without mutating credentials, sessions, or processes; unknown target returns 404 |
 | POST /api/accounts/{id}/switch | { confirm: true } plus switch token header | NativeSwitchResult | Status depends on stable string result code |
 | POST /api/switching/resolve-quarantine | { confirm: true } plus switch token header | JournalResolutionResult | Proof-based resolution; successful resolution may require restart |
 | GET /api/config | none | { config: RouterConfigDto } | Persisted configuration loaded at startup |
@@ -42,16 +42,17 @@ Trust checks and their limits are defined in [security-and-trust-model.md](secur
 | GET /api/settings/autostart | none | { enabled, supported } | Native registry-backed capability when configured |
 | POST /api/settings/autostart | { enabled: boolean } | { enabled, supported } | Changes per-user autostart state |
 
-The Svelte client calls status, account, enrollment, alias, deletion, switching status/intent/switch, journal resolution, candidate evidence, and config routes. Other public loopback contracts still require server tests even when not called by the dashboard.
+The Svelte client calls status, account, enrollment, alias, deletion, switching status/intent/switch, switch-plan, journal resolution, candidate evidence, and config routes. Other public loopback contracts still require server tests even when not called by the dashboard.
 
 ## Core shapes
 
 The following C# records define the backend serialization surface:
 
 - SystemStatusDto, Ag2StatusDto, RouterStatusDto, RouterConfigDto, TelemetryDto, QuotaSnapshotDto, ModelQuotaDto, and CanonicalModelQuotaDto in dotnet/src/AG2Router.Core/Models/AppStatus.cs.
+- CandidatePoolStatusDto and CandidatePoolReasonCodes in dotnet/src/AG2Router.Core/Models/RoutingModels.cs.
 - AccountMetadata and AccountsListDto in AccountMetadata.cs.
 - CreateAccountInput, UpdateAccountInput, EnrollmentOptions, and EnrollmentResult in AccountModels.cs.
-- NativeSwitchResult, NativeSwitchStatus, ExplicitSwitchRequest, and SwitchResultCodes in SwitchModels.cs.
+- NativeSwitchResult, NativeSwitchStatus, ExplicitSwitchRequest, SwitchResultCodes, SwitchPlanResultDto, and SwitchPlanReasonCodes in SwitchModels.cs.
 - CandidateEvidenceStatusDto and CandidateQuotaStatusDto in AppStatus.cs; JournalResolutionResult and ResolveQuarantineRequest in SwitchModels.cs.
 
 Account objects must not expose credential blobs, DPAPI ciphertext, WinCred payloads, RPC tokens, or raw process command lines.
@@ -103,7 +104,7 @@ Common meanings in current handlers:
 - 408: the CANCELLED switch result, including cancellation before process mutation, is mapped to request timeout.
 - 409: switch conflict such as busy, already active, missing vaulted target, unsafe process, or switch already in progress.
 - 500: failed switch/rollback categories not mapped more specifically.
-- 501: required service is absent or the unsupported legacy switch planner route is called.
+- 501: required service is absent.
 - 503: switch telemetry unavailable, unavailable live identity proof during resolution, or unavailable candidate-evidence reads.
 
 Native switch result codes are strings declared by SwitchResultCodes. HTTP status and result code serve different purposes and should both be tested.

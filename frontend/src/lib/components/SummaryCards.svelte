@@ -1,6 +1,7 @@
 <script lang="ts">
   import ProgressRing from './ProgressRing.svelte';
   import { derivePoolsStatusSummary, type LowestQuotaSummary } from '../utils/helpers.js';
+  import type { CandidatePoolStatusDto } from '../api/types.js';
 
   interface Props {
     totalAccounts: number;
@@ -12,6 +13,7 @@
     unknownModelsCount?: number;
     autoSwitchEnabled: boolean;
     lowThresholdPercent: number;
+    poolStatus?: CandidatePoolStatusDto | null;
   }
 
   let {
@@ -23,7 +25,8 @@
     activeModelsCount = 0,
     unknownModelsCount = 0,
     autoSwitchEnabled = false,
-    lowThresholdPercent = 15
+    lowThresholdPercent = 15,
+    poolStatus = null
   }: Props = $props();
 
   const poolsSummary = $derived(derivePoolsStatusSummary(activeModelsCount, exhaustedCount, unknownModelsCount));
@@ -115,17 +118,41 @@
   <div class="card metric-card">
     <div class="metric-top">
       <span class="metric-label">Auto Switch</span>
-      <span class="badge {autoSwitchEnabled ? 'badge-healthy' : 'badge-neutral'}">
-        {autoSwitchEnabled ? 'Enabled' : 'Disabled'}
-      </span>
+      {#if autoSwitchEnabled && poolStatus && !poolStatus.hasUsableCandidate}
+        <span
+          class="badge {poolStatus.reasonCode === 'ALL_EXHAUSTED' || poolStatus.reasonCode === 'QUOTA_DEPLETED' ? 'badge-danger' : 'badge-warning'}"
+          title={poolStatus.message}
+        >
+          {poolStatus.reasonCode === 'ALL_EXHAUSTED' || poolStatus.reasonCode === 'QUOTA_DEPLETED' ? 'Exhausted' :
+           poolStatus.reasonCode === 'ALL_IN_COOLDOWN' ? 'Cooldown' :
+           poolStatus.reasonCode === 'EVIDENCE_STALE_OR_UNKNOWN' ? 'Stale Quota' :
+           poolStatus.reasonCode === 'RESERVE_ONLY' ? 'Reserve Only' : 'No Candidates'}
+        </span>
+      {:else}
+        <span class="badge {autoSwitchEnabled ? 'badge-healthy' : 'badge-neutral'}">
+          {autoSwitchEnabled ? 'Enabled' : 'Disabled'}
+        </span>
+      {/if}
     </div>
     <div class="metric-body">
-      <span class="metric-value-medium {autoSwitchEnabled ? 'text-primary' : 'text-muted'}">
-        {autoSwitchEnabled ? 'Automatic' : 'Manual only'}
-      </span>
-      <span class="metric-subtext">
-        Trigger quota &le; {lowThresholdPercent}%
-      </span>
+      {#if autoSwitchEnabled && poolStatus && !poolStatus.hasUsableCandidate}
+        <span class="metric-value-medium text-warning" title={poolStatus.message}>
+          {poolStatus.reasonCode === 'ALL_EXHAUSTED' || poolStatus.reasonCode === 'QUOTA_DEPLETED' ? 'Pool exhausted' :
+           poolStatus.reasonCode === 'ALL_IN_COOLDOWN' ? 'In cooldown' :
+           poolStatus.reasonCode === 'EVIDENCE_STALE_OR_UNKNOWN' ? 'No fresh evidence' :
+           'No candidates'}
+        </span>
+        <span class="metric-subtext" title={poolStatus.message}>
+          {poolStatus.earliestResetTime ? `Reset: ${poolStatus.earliestResetTime}` : poolStatus.message}
+        </span>
+      {:else}
+        <span class="metric-value-medium {autoSwitchEnabled ? 'text-primary' : 'text-muted'}">
+          {autoSwitchEnabled ? 'Automatic' : 'Manual only'}
+        </span>
+        <span class="metric-subtext">
+          Trigger quota &le; {lowThresholdPercent}%
+        </span>
+      {/if}
     </div>
   </div>
 </section>

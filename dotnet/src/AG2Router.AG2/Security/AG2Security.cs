@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace AG2Router.AG2.Security;
@@ -24,17 +25,10 @@ public static class AG2Security
         @"--password(?:=|\s+)([^\s""']+)",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-    private static readonly Regex SensitiveHeadersRegex = new(
-        @"(x-codeium-csrf-token:\s*)([^\r\n]+)",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
-    private static readonly Regex AuthorizationHeaderRegex = new(
-        @"(authorization:\s*Bearer\s*)([^\r\n]+)",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
-    private static readonly Regex GenericKeyValueSecretRegex = new(
-        @"(\b(?:token|password|secret|key|bearer)\b\s*[:=]\s*)([^\s"",;]+)",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex SecretKeyPrefixRegex = new(
+        @"(?<prefix>(?:(?<keyquote>[""'])(?<key>(?:x[_-](?:codeium[_-])?)?csrf[_-]?token|host[_-]?bridge[_-]?token|(?:access|refresh|auth|session)[_-]?token|api[_-]?key|client[_-]?secret|secret[_-]?key|token|password|secret|key|bearer|authorization)\k<keyquote>\s*[:=]\s*|\b(?<key>(?:x[_-](?:codeium[_-])?)?csrf[_-]?token|host[_-]?bridge[_-]?token|(?:access|refresh|auth|session)[_-]?token|api[_-]?key|client[_-]?secret|secret[_-]?key|token|password|secret|key|bearer|authorization)\b[ \t]*[:=][ \t]*))",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(2));
 
     /// <summary>
     /// Masks a sensitive token string (e.g. "fb541fbe...16bb" or "[REDACTED]").
@@ -86,7 +80,9 @@ public static class AG2Security
     }
 
     /// <summary>
-    /// Redacts sensitive headers and key-value secret pairs from diagnostic text or error messages.
+    /// Redacts sensitive headers, JSON secret fields, and key-value secret pairs from diagnostic text or error messages.
+    /// Preserves surrounding JSON and ordinary diagnostic structures while eliminating secret values.
+    /// Handles delimiter-aware quoted strings (mixed quotes, escapes, raw newlines) and unquoted credentials across schemes.
     /// </summary>
     public static string RedactSensitiveText(string? text)
     {
@@ -95,10 +91,125 @@ public static class AG2Security
             return string.Empty;
         }
 
-        var redacted = SensitiveHeadersRegex.Replace(text, "$1[REDACTED]");
-        redacted = AuthorizationHeaderRegex.Replace(redacted, "$1[REDACTED]");
-        redacted = GenericKeyValueSecretRegex.Replace(redacted, "$1[REDACTED]");
-        return redacted;
+        try
+        {
+            var sb = new StringBuilder(text.Length);
+            int cursor = 0;
+
+            while (cursor < text.Length)
+            {
+                var match = SecretKeyPrefixRegex.Match(text, cursor);
+                if (!match.Success)
+                {
+                    sb.Append(text.AsSpan(cursor));
+                    break;
+                }
+
+                sb.Append(text.AsSpan(cursor, match.Index - cursor));
+                sb.Append(match.Value);
+
+                int valStart = match.Index + match.Length;
+                if (valStart >= text.Length)
+                {
+                    sb.Append("[REDACTED]");
+                    break;
+                }
+
+                char firstChar = text[valStart];
+                int valEnd;
+                string replacement;
+
+                if (firstChar == '"')
+                {
+                    int idx = valStart + 1;
+                    while (idx < text.Length)
+                    {
+                        char c = text[idx];
+                        if (c == '\\')
+                        {
+                            idx += 2;
+                        }
+                        else if (c == '"')
+                        {
+                            idx++;
+                            break;
+                        }
+                        else
+                        {
+                            idx++;
+                        }
+                    }
+
+                    valEnd = Math.Min(idx, text.Length);
+                    replacement = "\"[REDACTED]\"";
+                }
+                else if (firstChar == '\'')
+                {
+                    int idx = valStart + 1;
+                    while (idx < text.Length)
+                    {
+                        char c = text[idx];
+                        if (c == '\\')
+                        {
+                            idx += 2;
+                        }
+                        else if (c == '\'')
+                        {
+                            idx++;
+                            break;
+                        }
+                        else
+                        {
+                            idx++;
+                        }
+                    }
+
+                    valEnd = Math.Min(idx, text.Length);
+                    replacement = "'[REDACTED]'";
+                }
+                else
+                {
+                    var key = match.Groups["key"].Value;
+                    int idx = valStart;
+                    if (key.Equals("authorization", StringComparison.OrdinalIgnoreCase))
+                    {
+                        while (idx < text.Length)
+                        {
+                            char c = text[idx];
+                            if (c == '\r' || c == '\n')
+                            {
+                                break;
+                            }
+                            idx++;
+                        }
+                    }
+                    else
+                    {
+                        while (idx < text.Length)
+                        {
+                            char c = text[idx];
+                            if (char.IsWhiteSpace(c) || c == ',' || c == ';' || c == '&' || c == '}' || c == ']')
+                            {
+                                break;
+                            }
+                            idx++;
+                        }
+                    }
+
+                    valEnd = idx;
+                    replacement = "[REDACTED]";
+                }
+
+                sb.Append(replacement);
+                cursor = Math.Max(valEnd, valStart);
+            }
+
+            return sb.ToString();
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            return "[REDACTED_DIAGNOSTIC_FAILURE]";
+        }
     }
 
     /// <summary>
@@ -106,6 +217,7 @@ public static class AG2Security
     /// </summary>
     public static string SanitizeError(Exception ex)
     {
+        if (ex == null) return string.Empty;
         var msg = ex.Message;
         return RedactSensitiveText(SanitizeCommandLine(msg));
     }

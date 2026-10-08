@@ -474,6 +474,7 @@
         {activeModelsCount}
         {autoSwitchEnabled}
         {lowThresholdPercent}
+        poolStatus={status?.router ? status.router.poolStatus : null}
       />
 
       <!-- Navigation Tabs -->
@@ -611,6 +612,7 @@
   {isSwitching}
   onClose={() => (switchModalOpen = false)}
   onConfirm={handleConfirmSwitch}
+  onGetPlan={(id) => api.getSwitchPlan(id)}
 />
 
 <DeleteAccountModal

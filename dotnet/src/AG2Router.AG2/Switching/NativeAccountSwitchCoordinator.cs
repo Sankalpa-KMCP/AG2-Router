@@ -144,6 +144,184 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         return result;
     }
 
+    /// <summary>
+    /// Maps a conditional startup-cleanup deletion to its reconciliation outcome. Cleanup
+    /// ownership is bound to the proved entry: a successful proof authorizes removing only
+    /// that exact journal entry. Absence under recovery ownership has no provable owner and
+    /// fails closed; a mismatch means a replacement was written during the proof and must
+    /// survive for its own reconciliation — recovery stays blocked rather than reporting a
+    /// clean result derived from the old proof. Deleting the proved entry is additionally
+    /// not by itself proof of path clearance (the comparison/disposition window admits a
+    /// replacement), so a Deleted outcome re-reads the canonical path and only a genuinely
+    /// absent journal publishes clean.
+    /// </summary>
+    private async Task<StartupJournalReconciliationResult> RecordStartupConditionalCleanup(
+        SwitchJournalEntry provedEntry,
+        SwitchJournalDeleteResult deleteResult,
+        string cleanMessage,
+        SwitchTransitionMarkerEntry? cleanupMarker = null)
+    {
+        if (deleteResult.Status == SwitchJournalDeleteStatus.Deleted)
+        {
+            if (cleanupMarker != null)
+            {
+                var markerDelete = await _journalStore
+                    .DeleteTransitionMarkerIfUnchangedAsync(cleanupMarker, CancellationToken.None)
+                    .ConfigureAwait(false);
+                if (markerDelete.Status != SwitchTransitionMarkerDeleteStatus.Deleted &&
+                    markerDelete.Status != SwitchTransitionMarkerDeleteStatus.Absent)
+                {
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                        StartupJournalReconciliationStatus.Degraded,
+                        "The exact transition marker could not be removed after the journal cleanup; it must be reconciled before switching resumes.",
+                        RetainedEntry: provedEntry),
+                        JournalRecoveryStates.ActionRequired);
+                }
+            }
+
+            SwitchJournalReadResult postCleanup;
+            try
+            {
+                postCleanup = await _journalStore.ReadAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                postCleanup = SwitchJournalReadResult.IoError(ex);
+            }
+
+            if (postCleanup.Status == SwitchJournalReadStatus.Absent)
+            {
+                if (await IsTransitionMarkerAbsentAfterCleanupAsync().ConfigureAwait(false))
+                {
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                        StartupJournalReconciliationStatus.Clean, cleanMessage, RetainedEntry: null),
+                        JournalRecoveryStates.None);
+                }
+
+                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                    StartupJournalReconciliationStatus.Degraded,
+                    "An unresolved transition marker remains after the journal cleanup; it must be reconciled before switching resumes.",
+                    RetainedEntry: provedEntry),
+                    JournalRecoveryStates.ActionRequired);
+            }
+
+            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                StartupJournalReconciliationStatus.Degraded,
+                "A replacement or unreadable journal appeared at the canonical journal path during cleanup; it must be reconciled before switching resumes.",
+                RetainedEntry: provedEntry),
+                JournalRecoveryStates.ActionRequired);
+        }
+
+        return deleteResult.Status switch
+        {
+            SwitchJournalDeleteStatus.Absent => RecordStartupReconciliationResult(
+                new StartupJournalReconciliationResult(
+                    StartupJournalReconciliationStatus.Degraded,
+                    "Switch journal disappeared during recovery proof; the removal could not be attributed to this recovery, so manual reconciliation is required.",
+                    RetainedEntry: provedEntry),
+                JournalRecoveryStates.ActionRequired),
+            SwitchJournalDeleteStatus.NotMatched => RecordStartupReconciliationResult(
+                new StartupJournalReconciliationResult(
+                    StartupJournalReconciliationStatus.Degraded,
+                    "Switch journal changed during recovery proof; cleanup is bound to the proved entry, so the current journal must be reconciled (restart or resolve) before switching resumes.",
+                    RetainedEntry: provedEntry),
+                JournalRecoveryStates.ActionRequired),
+            SwitchJournalDeleteStatus.UnsupportedPlatform => RecordStartupReconciliationResult(
+                new StartupJournalReconciliationResult(
+                    StartupJournalReconciliationStatus.Degraded,
+                    "Conditional switch journal deletion is not supported on this platform.",
+                    RetainedEntry: provedEntry),
+                JournalRecoveryStates.ActionRequired),
+            _ => RecordStartupReconciliationResult(
+                new StartupJournalReconciliationResult(
+                    StartupJournalReconciliationStatus.Degraded,
+                    $"Failed to delete the switch journal conditionally: {deleteResult.Message}",
+                    RetainedEntry: provedEntry),
+                JournalRecoveryStates.ActionRequired),
+        };
+    }
+
+    /// <summary>
+    /// Startup recovery for the absent-canonical marker gap of the RECORDED ->
+    /// CREDENTIAL_APPLYING pair — the one gap that can ever publish clean. The durable
+    /// marker proves a transaction was in flight and the credential writer, which is
+    /// invoked strictly after the CREDENTIAL_APPLYING journal lands, was never reached;
+    /// the only uncertainty is the source runtime, which the ADR-006 RECORDED proof
+    /// resolves. Proven coherence authorizes removing the exact marker and publishing
+    /// clean only when both recovery paths are genuinely clear; every failure retains the
+    /// marker and blocks. Never called for any other pair.
+    /// </summary>
+    private async Task<StartupJournalReconciliationResult> ReconcileRecordedMarkerGapAsync(
+        SwitchTransitionMarkerEntry marker,
+        CancellationToken cancellationToken)
+    {
+        var durableSource = await VerifyDurableSourceCoherenceAsync(
+            marker.Expected.SourceAccountId, cancellationToken).ConfigureAwait(false);
+        if (!durableSource.Proven)
+        {
+            // The source metadata state is incoherent, which RECORDED transactions cannot
+            // have caused themselves; treat the environment as uncertain and quarantine.
+            _sessionVault.QuarantineUnresolvedMutation();
+            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                StartupJournalReconciliationStatus.Quarantined,
+                $"Transition marker retained: {durableSource.Message}", RetainedEntry: marker.Expected),
+                JournalRecoveryStates.ActionRequired);
+        }
+
+        var runtime = await ProveSourceRuntimeCoherenceAsync(
+            marker.Expected.SourceAccountId, durableSource.SourceEmail!, cancellationToken).ConfigureAwait(false);
+        if (!runtime.Proven)
+        {
+            // Credentials are provably intact; only the source runtime state is unproven.
+            // Retain the marker and block switching until coherence is established.
+            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                StartupJournalReconciliationStatus.Degraded,
+                $"Transition marker retained: {runtime.Message} Start Antigravity and resolve the journal.",
+                RetainedEntry: marker.Expected),
+                JournalRecoveryStates.ActionRequired);
+        }
+
+        try
+        {
+            var markerDelete = await _journalStore
+                .DeleteTransitionMarkerIfUnchangedAsync(marker, cancellationToken)
+                .ConfigureAwait(false);
+            if (markerDelete.Status != SwitchTransitionMarkerDeleteStatus.Deleted)
+            {
+                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                    StartupJournalReconciliationStatus.Degraded,
+                    "The exact transition marker could not be removed after the source-runtime proof; recovery must reconcile it before switching resumes.",
+                    RetainedEntry: marker.Expected),
+                    JournalRecoveryStates.ActionRequired);
+            }
+
+            var canonicalAfterCleanup = await _journalStore.ReadAsync(CancellationToken.None).ConfigureAwait(false);
+            if (canonicalAfterCleanup.Status == SwitchJournalReadStatus.Absent &&
+                await IsTransitionMarkerAbsentAfterCleanupAsync().ConfigureAwait(false))
+            {
+                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                    StartupJournalReconciliationStatus.Clean,
+                    "RECORDED transition marker cleaned up; source runtime proven coherent.",
+                    RetainedEntry: null),
+                    JournalRecoveryStates.None);
+            }
+
+            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                StartupJournalReconciliationStatus.Degraded,
+                "Replacement or unresolved recovery evidence appeared during cleanup; it must be reconciled before switching resumes.",
+                RetainedEntry: marker.Expected),
+                JournalRecoveryStates.ActionRequired);
+        }
+        catch (Exception ex)
+        {
+            // Proven coherent underlying state. Do NOT quarantine!
+            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                StartupJournalReconciliationStatus.Degraded,
+                $"Failed to delete the transition marker: {ex.Message}", RetainedEntry: marker.Expected),
+                JournalRecoveryStates.ActionRequired);
+        }
+    }
+
     public async Task<StartupJournalReconciliationResult> ReconcileStartupJournalAsync(CancellationToken cancellationToken = default)
     {
         await SwitchGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -181,8 +359,59 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"I/O error reading switch journal: {ex.Message}"), JournalRecoveryStates.Unknown);
                 }
 
+                // Startup classifies the canonical journal and its transition marker
+                // together: throughout every journal transition at least one of the two
+                // files must exist, so neither may be read in isolation.
+                SwitchTransitionMarkerReadResult markerRead;
+                try
+                {
+                    markerRead = await _journalStore.ReadTransitionMarkerAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    markerRead = SwitchTransitionMarkerReadResult.IoError(ex);
+                }
+
+                // A corrupt or unsupported marker is recovery evidence whose staleness
+                // cannot be proven: fail closed and preserve it, even when the canonical
+                // journal looks valid, and never delete unreadable marker bytes.
+                if (markerRead.Status is SwitchTransitionMarkerReadStatus.Corrupt or SwitchTransitionMarkerReadStatus.UnsupportedVersion)
+                {
+                    _sessionVault.QuarantineUnresolvedMutation();
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"Unresolved transition marker found: {markerRead.ErrorMessage}"), JournalRecoveryStates.NotResolvable);
+                }
+
+                if (markerRead.Status == SwitchTransitionMarkerReadStatus.IoError)
+                {
+                    _sessionVault.QuarantineUnresolvedMutation();
+                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Quarantined, $"I/O error reading switch transition marker: {markerRead.ErrorMessage}"), JournalRecoveryStates.Unknown);
+                }
+
                 if (readResult.Status == SwitchJournalReadStatus.Absent)
                 {
+                    if (markerRead.Status == SwitchTransitionMarkerReadStatus.Valid)
+                    {
+                        var gapMarker = markerRead.Marker!;
+                        if (gapMarker.Expected.State == SwitchJournalState.RECORDED &&
+                            gapMarker.Next.State == SwitchJournalState.CREDENTIAL_APPLYING)
+                        {
+                            // The D1 crash shape for the one pair that provably crossed no
+                            // target boundary: the credential writer is invoked strictly
+                            // after the CREDENTIAL_APPLYING journal lands, so an unpublished
+                            // successor proves the target credential was never touched.
+                            // Recovery is RECORDED-level: source-runtime coherence gates any
+                            // cleanup, and absence is never ordinary Clean here.
+                            return await ReconcileRecordedMarkerGapAsync(gapMarker, cancellationToken).ConfigureAwait(false);
+                        }
+
+                        _sessionVault.QuarantineUnresolvedMutation();
+                        return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                            StartupJournalReconciliationStatus.Quarantined,
+                            $"The canonical switch journal is absent while transition marker '{gapMarker.Expected.State}' -> '{gapMarker.Next.State}' remains; the interrupted transaction may be incomplete.",
+                            RetainedEntry: gapMarker.Expected),
+                            JournalRecoveryStates.ActionRequired);
+                    }
+
                     return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "No switch journal present."), JournalRecoveryStates.None);
                 }
 
@@ -207,18 +436,128 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 if (readResult.Status == SwitchJournalReadStatus.Valid)
                 {
                     var entry = readResult.Entry!;
+                    SwitchTransitionMarkerEntry? retainedCleanupMarker = null;
+
+                    // Marker-aware reconciliation for a canonical journal that coexists
+                    // with a transition marker. The successor-published and foreign cases
+                    // are decided here; the only pair that continues into per-state
+                    // cleanup with its marker is the pre-credential RECORDED pair.
+                    if (markerRead.Status == SwitchTransitionMarkerReadStatus.Valid)
+                    {
+                        var marker = markerRead.Marker!;
+                        if (SwitchJournalStore.EntriesMatch(entry, marker.Next))
+                        {
+                            // The successor was published but the marker's exact cleanup
+                            // did not complete. The exact match proves the marker stale;
+                            // remove it, then reconcile the successor per its own state.
+                            var staleDelete = await _journalStore
+                                .DeleteTransitionMarkerWhileCanonicalGuardedAsync(entry, marker, cancellationToken)
+                                .ConfigureAwait(false);
+                            if (staleDelete.Status != GuardedMarkerDeleteStatus.Deleted)
+                            {
+                                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                                    StartupJournalReconciliationStatus.Degraded,
+                                    "The durable successor journal matches its transition marker, but the exact marker could not be removed; recovery must reconcile it before switching resumes.",
+                                    RetainedEntry: entry),
+                                    JournalRecoveryStates.ActionRequired);
+                            }
+                        }
+                        else if (SwitchJournalStore.EntriesMatch(entry, marker.Expected))
+                        {
+                            if (marker.Expected.State != SwitchJournalState.RECORDED)
+                            {
+                                // The predecessor is still present, but the marker's pair
+                                // is one whose window may already include target or rollback
+                                // side effects: retain both artifacts and quarantine.
+                                _sessionVault.QuarantineUnresolvedMutation();
+                                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                                    StartupJournalReconciliationStatus.Quarantined,
+                                    $"Transition marker '{marker.Expected.State}' -> '{marker.Next.State}' retained with its predecessor journal; the interrupted transaction may be incomplete.",
+                                    RetainedEntry: entry),
+                                    JournalRecoveryStates.ActionRequired);
+                            }
+
+                            // RECORDED-origin marker with its predecessor present: the
+                            // durable state is provably pre-credential (the credential
+                            // writer is gated on the CREDENTIAL_APPLYING journal landing),
+                            // so reconciliation continues with the existing RECORDED proof
+                            // and cleans both artifacts only after that proof.
+                            retainedCleanupMarker = marker;
+                        }
+                        else
+                        {
+                            // A canonical journal unrelated to the marker: fail closed and
+                            // preserve both — neither may be adopted or destroyed here.
+                            _sessionVault.QuarantineUnresolvedMutation();
+                            return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                                StartupJournalReconciliationStatus.Quarantined,
+                                "A canonical switch journal unrelated to the transition marker occupies the canonical path; manual reconciliation is required.",
+                                RetainedEntry: entry),
+                                JournalRecoveryStates.ActionRequired);
+                        }
+                    }
+
                     switch (entry.State)
                     {
                         case SwitchJournalState.RECORDED:
-                            try
                             {
-                                await _journalStore.DeleteAsync(cancellationToken).ConfigureAwait(false);
-                                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "RECORDED journal cleaned up.", RetainedEntry: null), JournalRecoveryStates.None);
-                            }
-                            catch (Exception ex)
-                            {
-                                // Proven clean underlying state. Do NOT quarantine!
-                                return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Degraded, $"Failed to delete RECORDED journal: {ex.Message}", RetainedEntry: entry), JournalRecoveryStates.ActionRequired);
+                                // NOT_ATTEMPTED provenance proves the target credential boundary
+                                // was never crossed, but RECORDED is written BEFORE the source
+                                // process stop: the crash may have left the source runtime
+                                // stopped. Cleanup therefore requires source coherence, not
+                                // merely journal absence.
+                                var durableSource = await VerifyDurableSourceCoherenceAsync(
+                                    entry.SourceAccountId, cancellationToken).ConfigureAwait(false);
+                                if (!durableSource.Proven)
+                                {
+                                    // The source metadata/credential state is incoherent, which
+                                    // RECORDED transactions cannot have caused themselves; treat
+                                    // the environment as uncertain and quarantine.
+                                    _sessionVault.QuarantineUnresolvedMutation();
+                                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                                        StartupJournalReconciliationStatus.Quarantined,
+                                        $"RECORDED journal retained: {durableSource.Message}", RetainedEntry: entry),
+                                        JournalRecoveryStates.ActionRequired);
+                                }
+
+                                var runtime = await ProveSourceRuntimeCoherenceAsync(
+                                    entry.SourceAccountId, durableSource.SourceEmail!, cancellationToken).ConfigureAwait(false);
+                                if (!runtime.Proven)
+                                {
+                                    // Credentials are provably intact; only the source runtime
+                                    // state is unproven (absent or bound to another identity).
+                                    // Retain the journal and block switching until coherence is
+                                    // established; never delete it as clean in this state.
+                                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                                        StartupJournalReconciliationStatus.Degraded,
+                                        $"RECORDED journal retained: {runtime.Message} Start Antigravity and resolve the journal.",
+                                        RetainedEntry: entry),
+                                        JournalRecoveryStates.ActionRequired);
+                                }
+
+                                try
+                                {
+                                    // Cleanup ownership is bound to the proved entry: only the
+                                    // exact journal entry the source-runtime proof authorized
+                                    // may be removed. A replacement written during the proof
+                                    // must survive for its own reconciliation.
+                                    var deleteResult = await _journalStore
+                                        .DeleteIfUnchangedAsync(entry, cancellationToken)
+                                        .ConfigureAwait(false);
+                                    return await RecordStartupConditionalCleanup(
+                                        entry,
+                                        deleteResult,
+                                        "RECORDED journal cleaned up; source runtime proven coherent.",
+                                        retainedCleanupMarker).ConfigureAwait(false);
+                                }
+                                catch (Exception ex)
+                                {
+                                    // Proven coherent underlying state. Do NOT quarantine!
+                                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(
+                                        StartupJournalReconciliationStatus.Degraded,
+                                        $"Failed to delete RECORDED journal: {ex.Message}", RetainedEntry: entry),
+                                        JournalRecoveryStates.ActionRequired);
+                                }
                             }
 
                         case SwitchJournalState.CREDENTIAL_APPLYING:
@@ -242,8 +581,15 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                                 // Metadata commit already completed!
                                 try
                                 {
-                                    await _journalStore.DeleteAsync(cancellationToken).ConfigureAwait(false);
-                                    return RecordStartupReconciliationResult(new StartupJournalReconciliationResult(StartupJournalReconciliationStatus.Clean, "PRECOMMIT journal cleaned up; target metadata already active.", RetainedEntry: null), JournalRecoveryStates.None);
+                                    // Same cleanup ownership rule as RECORDED: the commit proof
+                                    // authorizes deleting only the exact proved PRECOMMIT entry.
+                                    var deleteResult = await _journalStore
+                                        .DeleteIfUnchangedAsync(entry, cancellationToken)
+                                        .ConfigureAwait(false);
+                                    return await RecordStartupConditionalCleanup(
+                                        entry,
+                                        deleteResult,
+                                        "PRECOMMIT journal cleaned up; target metadata already active.").ConfigureAwait(false);
                                 }
                                 catch (Exception ex)
                                 {
@@ -433,6 +779,102 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
     }
 
+    private sealed record SourceCoherenceOutcome(bool Proven, string? SourceEmail, string Message);
+
+    /// <summary>
+    /// Establishes the durable facts RECORDED recovery needs: the journal's source account
+    /// still exists in metadata and carries the email the runtime identity proof compares
+    /// against. RECORDED transactions performed no credential or metadata mutation, so there
+    /// is nothing to compensate and no active-selection or validation requirement; the
+    /// runtime proof below is what decides cleanup safety. This deliberately does not read
+    /// the live process, so recovery can also decide retention when the runtime is absent.
+    /// </summary>
+    private async Task<SourceCoherenceOutcome> VerifyDurableSourceCoherenceAsync(string sourceAccountId, CancellationToken cancellationToken)
+    {
+        AccountMetadata? sourceAccount;
+        try
+        {
+            sourceAccount = await _accountStore.GetAccountAsync(sourceAccountId, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            return new SourceCoherenceOutcome(false, null, "Failed to read account metadata for source coherence.");
+        }
+
+        if (sourceAccount == null || string.IsNullOrWhiteSpace(sourceAccount.Email))
+        {
+            return new SourceCoherenceOutcome(false, null,
+                "The journal's source account is missing from metadata.");
+        }
+
+        return new SourceCoherenceOutcome(true, sourceAccount.Email, "Source account metadata is present.");
+    }
+
+    private sealed record SourceRuntimeProofOutcome(bool Proven, string Message);
+
+    /// <summary>
+    /// Proves the source Antigravity runtime is alive and bound to the source identity.
+    /// RECORDED is journaled before the source process stop, so a crash after that write can
+    /// leave the source stopped; the runtime is only declared coherent when live telemetry
+    /// reports a connected server whose identity matches the source account. The whole proof
+    /// (including each telemetry probe) is bounded by one deadline, so Antigravity's own
+    /// client supervision — the only launcher that owns the session-bound launch flags — can
+    /// restore the process within the window, while a hanging RPC can never retain recovery
+    /// ownership past it. A runtime that never appears keeps the journal retained and blocked.
+    /// </summary>
+    private async Task<SourceRuntimeProofOutcome> ProveSourceRuntimeCoherenceAsync(
+        string sourceAccountId, string sourceEmail, CancellationToken cancellationToken)
+    {
+        string trimmedEmail = sourceEmail.Trim();
+        using var proofCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        proofCts.CancelAfter(_verificationTimeout);
+        var proofToken = proofCts.Token;
+        try
+        {
+            while (true)
+            {
+                proofToken.ThrowIfCancellationRequested();
+                try
+                {
+                    var status = await _adapter.GetStatusAsync(proofToken).ConfigureAwait(false);
+                    if (status.Connected && status.Status is not ("DEGRADED" or "OFFLINE" or "ERROR"))
+                    {
+                        var identity = await _adapter.GetCurrentAccountAsync(proofToken).ConfigureAwait(false);
+                        if (identity != null && !string.IsNullOrWhiteSpace(identity.Email))
+                        {
+                            if (string.Equals(identity.Email.Trim(), trimmedEmail, StringComparison.OrdinalIgnoreCase))
+                            {
+                                return new SourceRuntimeProofOutcome(true,
+                                    "Source Antigravity runtime is alive and bound to the source identity.");
+                            }
+
+                            return new SourceRuntimeProofOutcome(false,
+                                "Live Antigravity identity does not match the journal's source account.");
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // Probe exceeded the proof deadline; fall through to the retention outcome.
+                    break;
+                }
+                catch
+                {
+                    // Transient telemetry unavailability; keep probing until the deadline.
+                }
+
+                await Task.Delay(_pollInterval, proofToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Proof deadline reached.
+        }
+
+        return new SourceRuntimeProofOutcome(false,
+            "Source Antigravity runtime coherence could not be proven before the recovery deadline.");
+    }
+
     private JournalResolutionResult RecordResolutionResult(JournalResolutionResult result)
     {
         lock (_statusLock)
@@ -468,7 +910,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
                 case JournalResolutionStatus.PersistenceFailure:
                     _recoveryQuarantine.Mark();
-                    if (result.ReasonCode == "DELETE_FAILED" || result.ReasonCode == "UNSUPPORTED_PLATFORM")
+                    if (result.ReasonCode == "DELETE_FAILED" || result.ReasonCode == "UNSUPPORTED_PLATFORM" || result.ReasonCode == "TARGET_QUOTA_INVALIDATION_FAILED")
                     {
                         _journalRecoveryState = JournalRecoveryStates.ActionRequired;
                     }
@@ -521,8 +963,39 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch journal.", ReasonCode: "IO_ERROR"));
                 }
 
+                // Resolution classifies the canonical journal and its transition marker
+                // together; neither file may be ignored while resolving recovery evidence.
+                SwitchTransitionMarkerReadResult markerRead;
+                try
+                {
+                    markerRead = await _journalStore.ReadTransitionMarkerAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    markerRead = SwitchTransitionMarkerReadResult.IoError(ex);
+                }
+
+                if (markerRead.Status is SwitchTransitionMarkerReadStatus.Corrupt or SwitchTransitionMarkerReadStatus.UnsupportedVersion)
+                {
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.NotResolvable, "The switch transition marker is corrupted and cannot be resolved automatically.", ReasonCode: "CORRUPT_TRANSITION_MARKER"));
+                }
+
+                if (markerRead.Status == SwitchTransitionMarkerReadStatus.IoError)
+                {
+                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "An I/O error occurred while accessing the switch transition marker.", ReasonCode: "IO_ERROR"));
+                }
+
                 if (readResult.Status == SwitchJournalReadStatus.Absent)
                 {
+                    if (markerRead.Status == SwitchTransitionMarkerReadStatus.Valid)
+                    {
+                        return RecordResolutionResult(await ResolveTransitionMarkerGapAsync(
+                            markerRead.Marker!, cancellationToken).ConfigureAwait(false));
+                    }
+
+                    var clearanceFailure = await GetRecoveryEvidenceClearanceFailureAsync().ConfigureAwait(false);
+                    if (clearanceFailure != null)
+                        return RecordResolutionResult(clearanceFailure);
                     return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false));
                 }
 
@@ -548,15 +1021,92 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
                 var entry = readResult.Entry;
 
+                // Marker-aware resolution for a canonical journal that coexists with a
+                // transition marker. A stale marker (successor already durable) is removed
+                // exactly first; a matching predecessor marker either routes the RECORDED
+                // pair through the RECORDED branch or travels with the standard proof path
+                // as cleanup duty; anything else is foreign evidence that fails closed.
+                SwitchTransitionMarkerEntry? cleanupMarker = null;
+                if (markerRead.Status == SwitchTransitionMarkerReadStatus.Valid)
+                {
+                    var marker = markerRead.Marker!;
+                    if (SwitchJournalStore.EntriesMatch(entry, marker.Next))
+                    {
+                        var staleDelete = await _journalStore
+                            .DeleteTransitionMarkerWhileCanonicalGuardedAsync(entry, marker, cancellationToken)
+                            .ConfigureAwait(false);
+                        if (staleDelete.Status != GuardedMarkerDeleteStatus.Deleted)
+                        {
+                            return RecordResolutionResult(new JournalResolutionResult(
+                                JournalResolutionStatus.PersistenceFailure,
+                                "The durable successor journal matches its transition marker, but the exact marker could not be removed; recovery remains blocked.",
+                                ReasonCode: "DELETE_FAILED"));
+                        }
+                    }
+                    else if (SwitchJournalStore.EntriesMatch(entry, marker.Expected))
+                    {
+                        cleanupMarker = marker;
+                    }
+                    else
+                    {
+                        return RecordResolutionResult(new JournalResolutionResult(
+                            JournalResolutionStatus.ProofFailed,
+                            "A canonical switch journal unrelated to the transition marker occupies the canonical path; manual reconciliation is required.",
+                            ReasonCode: "MISMATCHED_RECOVERY_EVIDENCE"));
+                    }
+                }
+
                 // F-270-3: Clean-only states alignment with Step 3
                 if (entry.State == SwitchJournalState.RECORDED)
                 {
-                    // No durable credential or metadata mutation began before crash. Clean cleanup.
+                    // RECORDED is written before the source process stop, so it proves the
+                    // target credential boundary was never crossed (no target evidence is
+                    // ever touched here) but NOT that the source runtime is still running.
+                    // Cleanup requires source coherence proof, never blind deletion.
+                    var durableSource = await VerifyDurableSourceCoherenceAsync(
+                        entry.SourceAccountId, cancellationToken).ConfigureAwait(false);
+                    if (!durableSource.Proven)
+                    {
+                        return RecordResolutionResult(new JournalResolutionResult(
+                            JournalResolutionStatus.ProofFailed,
+                            durableSource.Message,
+                            ReasonCode: "SOURCE_COHERENCE_UNPROVEN"));
+                    }
+
+                    var runtime = await ProveSourceRuntimeCoherenceAsync(
+                        entry.SourceAccountId, durableSource.SourceEmail!, cancellationToken).ConfigureAwait(false);
+                    if (!runtime.Proven)
+                    {
+                        return RecordResolutionResult(new JournalResolutionResult(
+                            JournalResolutionStatus.ProofFailed,
+                            runtime.Message,
+                            ReasonCode: "SOURCE_RUNTIME_UNPROVEN"));
+                    }
+
+                    // Source coherence proven; conditional clean cleanup. Deleting the proved
+                    // entry is not by itself proof of path clearance, so a Deleted outcome
+                    // re-reads the canonical path before publishing clean.
                     var del = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
+                    if (del.Status == SwitchJournalDeleteStatus.Deleted)
+                    {
+                        var markerCleanupFailure = await CleanupResolutionMarkerAsync(cleanupMarker).ConfigureAwait(false);
+                        if (markerCleanupFailure != null)
+                        {
+                            return RecordResolutionResult(markerCleanupFailure);
+                        }
+                    }
+
+                    if (del.Status == SwitchJournalDeleteStatus.Deleted)
+                    {
+                        var clearanceFailure = await GetRecoveryEvidenceClearanceFailureAsync().ConfigureAwait(false);
+                        if (clearanceFailure != null)
+                            return RecordResolutionResult(clearanceFailure);
+                    }
+
                     return RecordResolutionResult(del.Status switch
                     {
                         SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(JournalResolutionStatus.CleanCleanupCompleted, "Switch journal cleaned up successfully.", RestartRequired: false, ReasonCode: "CLEAN_RECORDED_REMOVED"),
-                        SwitchJournalDeleteStatus.Absent => new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false),
+                        SwitchJournalDeleteStatus.Absent => (await GetRecoveryEvidenceClearanceFailureAsync(unexpectedAbsence: true).ConfigureAwait(false))!,
                         SwitchJournalDeleteStatus.NotMatched => new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"),
                         SwitchJournalDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Conditional switch journal deletion is not supported on this platform.", RestartRequired: false, ReasonCode: "UNSUPPORTED_PLATFORM"),
                         _ => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Failed to delete the switch journal file.", ReasonCode: "DELETE_FAILED")
@@ -577,12 +1127,29 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
 
                     if (string.Equals(currentActiveId, entry.TargetAccountId, StringComparison.Ordinal))
                     {
-                        // Metadata commit already completed before crash. Clean cleanup.
+                        // Metadata commit already completed before crash. Clean cleanup; the
+                        // Deleted outcome must still prove the canonical path clear.
                         var del = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
+                        if (del.Status == SwitchJournalDeleteStatus.Deleted)
+                        {
+                            var markerCleanupFailure = await CleanupResolutionMarkerAsync(cleanupMarker).ConfigureAwait(false);
+                            if (markerCleanupFailure != null)
+                            {
+                                return RecordResolutionResult(markerCleanupFailure);
+                            }
+                        }
+
+                        if (del.Status == SwitchJournalDeleteStatus.Deleted)
+                        {
+                            var clearanceFailure = await GetRecoveryEvidenceClearanceFailureAsync().ConfigureAwait(false);
+                            if (clearanceFailure != null)
+                                return RecordResolutionResult(clearanceFailure);
+                        }
+
                         return RecordResolutionResult(del.Status switch
                         {
                             SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(JournalResolutionStatus.CleanCleanupCompleted, "Switch journal cleaned up successfully.", RestartRequired: false, ReasonCode: "CLEAN_COMMITTED_PRECOMMIT_REMOVED"),
-                            SwitchJournalDeleteStatus.Absent => new JournalResolutionResult(JournalResolutionStatus.NoJournal, "No switch journal present.", RestartRequired: false),
+                            SwitchJournalDeleteStatus.Absent => (await GetRecoveryEvidenceClearanceFailureAsync(unexpectedAbsence: true).ConfigureAwait(false))!,
                             SwitchJournalDeleteStatus.NotMatched => new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"),
                             SwitchJournalDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Conditional switch journal deletion is not supported on this platform.", RestartRequired: false, ReasonCode: "UNSUPPORTED_PLATFORM"),
                             _ => new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure, "Failed to delete the switch journal file.", ReasonCode: "DELETE_FAILED")
@@ -591,52 +1158,56 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 }
 
                 // Primary Proof-Resolution Cases (CREDENTIAL_APPLYING, unresolved PRECOMMIT, ROLLING_BACK, QUARANTINED):
-                // 1. Initial 4-Pillar Proof:
-                var initialProof = await VerifyCoherenceProofAsync(cancellationToken).ConfigureAwait(false);
-                if (!initialProof.IsProven)
+                var proofOutcome = await RunResolutionProofsAsync(entry, cancellationToken).ConfigureAwait(false);
+                if (!proofOutcome.Proven)
                 {
-                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.ProofFailed, initialProof.SafeMessage, ReasonCode: initialProof.ReasonCode));
+                    return RecordResolutionResult(proofOutcome.Failure!);
                 }
 
-                // 2. Final 4-Pillar Proof (F-270-1) immediately before delete:
-                var finalProof = await VerifyCoherenceProofAsync(cancellationToken).ConfigureAwait(false);
-                if (!finalProof.IsProven)
-                {
-                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.ProofFailed, finalProof.SafeMessage, ReasonCode: finalProof.ReasonCode));
-                }
-
-                if (!string.Equals(finalProof.ActiveAccountId, initialProof.ActiveAccountId, StringComparison.Ordinal))
-                {
-                    return RecordResolutionResult(new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"));
-                }
-
-                // 3. Conditional Journal Deletion (F-270-2):
+                // 3. Conditional Journal Deletion (F-270-2). The Deleted outcome must still
+                // prove the canonical path clear before resolution claims success.
                 var deleteResult = await _journalStore.DeleteIfUnchangedAsync(entry, cancellationToken).ConfigureAwait(false);
+                if (deleteResult.Status == SwitchJournalDeleteStatus.Deleted)
+                {
+                    var markerCleanupFailure = await CleanupResolutionMarkerAsync(cleanupMarker).ConfigureAwait(false);
+                    if (markerCleanupFailure != null)
+                    {
+                        return RecordResolutionResult(markerCleanupFailure with
+                        {
+                            CoherentAccountId = proofOutcome.ActiveAccountId
+                        });
+                    }
+                }
+
+                if (deleteResult.Status == SwitchJournalDeleteStatus.Deleted)
+                {
+                    var clearanceFailure = await GetRecoveryEvidenceClearanceFailureAsync().ConfigureAwait(false);
+                    if (clearanceFailure != null)
+                        return RecordResolutionResult(clearanceFailure with { CoherentAccountId = proofOutcome.ActiveAccountId });
+                }
+
                 return RecordResolutionResult(deleteResult.Status switch
                 {
                     SwitchJournalDeleteStatus.Deleted => new JournalResolutionResult(
                         JournalResolutionStatus.ResolvedRestartRequired,
                         "Switch journal successfully resolved and removed. Application restart is required before normal routing resumes.",
-                        CoherentAccountId: finalProof.ActiveAccountId,
+                        CoherentAccountId: proofOutcome.ActiveAccountId,
                         RestartRequired: true),
                     SwitchJournalDeleteStatus.NotMatched => new JournalResolutionResult(
                         JournalResolutionStatus.ProofFailed,
                         "State changed concurrently during resolution proof.",
                         ReasonCode: "CONCURRENT_MUTATION"),
-                    SwitchJournalDeleteStatus.Absent => new JournalResolutionResult(
-                        JournalResolutionStatus.NoJournal,
-                        "No switch journal present.",
-                        RestartRequired: false),
+                    SwitchJournalDeleteStatus.Absent => (await GetRecoveryEvidenceClearanceFailureAsync(unexpectedAbsence: true).ConfigureAwait(false))!,
                     SwitchJournalDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(
                         JournalResolutionStatus.PersistenceFailure,
                         "Conditional switch journal deletion is not supported on this platform.",
-                        CoherentAccountId: finalProof.ActiveAccountId,
+                        CoherentAccountId: proofOutcome.ActiveAccountId,
                         RestartRequired: false,
                         ReasonCode: "UNSUPPORTED_PLATFORM"),
                     _ => new JournalResolutionResult(
                         JournalResolutionStatus.PersistenceFailure,
                         "Failed to delete the switch journal file.",
-                        CoherentAccountId: finalProof.ActiveAccountId,
+                        CoherentAccountId: proofOutcome.ActiveAccountId,
                         RestartRequired: true,
                         ReasonCode: "DELETE_FAILED")
                 });
@@ -700,6 +1271,211 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         }
     }
 
+    /// <summary>
+    /// The shared operator-resolution proof core: two full coherence proofs with a stable
+    /// active-account check between them, then durable target-quota invalidation gated on
+    /// the persisted activation provenance of the evidence entry. Used by the retained-
+    /// journal path and by the absent-canonical marker gap, whose conservative evidence is
+    /// the marker's intended successor.
+    /// </summary>
+    private async Task<(bool Proven, JournalResolutionResult? Failure, string? ActiveAccountId)> RunResolutionProofsAsync(
+        SwitchJournalEntry evidence, CancellationToken cancellationToken)
+    {
+        // 1. Initial 4-Pillar Proof:
+        var initialProof = await VerifyCoherenceProofAsync(cancellationToken).ConfigureAwait(false);
+        if (!initialProof.IsProven)
+        {
+            return (false, new JournalResolutionResult(JournalResolutionStatus.ProofFailed, initialProof.SafeMessage, ReasonCode: initialProof.ReasonCode), null);
+        }
+
+        // 2. Final 4-Pillar Proof (F-270-1) immediately before delete:
+        var finalProof = await VerifyCoherenceProofAsync(cancellationToken).ConfigureAwait(false);
+        if (!finalProof.IsProven)
+        {
+            return (false, new JournalResolutionResult(JournalResolutionStatus.ProofFailed, finalProof.SafeMessage, ReasonCode: finalProof.ReasonCode), null);
+        }
+
+        if (!string.Equals(finalProof.ActiveAccountId, initialProof.ActiveAccountId, StringComparison.Ordinal))
+        {
+            return (false, new JournalResolutionResult(JournalResolutionStatus.ProofFailed, "State changed concurrently during resolution proof.", ReasonCode: "CONCURRENT_MUTATION"), null);
+        }
+
+        // 2.5 Invalidate unverified target quota observations (F1/R1 remediation).
+        // The decision uses the PERSISTED activation provenance, not merely the identity
+        // comparison:
+        // - NOT_ATTEMPTED proves the target credential boundary was never crossed, so the
+        //   untouched target's observations remain trustworthy and must be preserved.
+        // - MAY_HAVE_BEEN_ATTEMPTED means the target credential mutation may have begun,
+        //   so cached target evidence is untrusted and must be durably invalidated.
+        // - UNKNOWN is the legacy/ambiguous form (journals written before provenance was
+        //   persisted); recovery treats it conservatively like MAY_HAVE_BEEN_ATTEMPTED
+        //   rather than silently assuming NOT_ATTEMPTED.
+        // When the target is the proven-coherent active account, its evidence describes
+        // the account recovery just proved live, so invalidation is unnecessary.
+        bool targetProvenanceRequiresInvalidation =
+            evidence.TargetActivationProvenance != SwitchTargetActivationProvenance.NOT_ATTEMPTED;
+        if (_quotaObservationStore != null &&
+            targetProvenanceRequiresInvalidation &&
+            !string.IsNullOrWhiteSpace(evidence.TargetAccountId) &&
+            !string.Equals(finalProof.ActiveAccountId, evidence.TargetAccountId, StringComparison.Ordinal))
+        {
+            try
+            {
+                await _quotaObservationStore.InvalidateObservationsForAccountAsync(
+                    evidence.TargetAccountId,
+                    _timeProvider.GetUtcNow(),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return (false, new JournalResolutionResult(
+                    JournalResolutionStatus.PersistenceFailure,
+                    $"Failed to invalidate unverified target quota observations during recovery resolution: {AG2Security.SanitizeError(ex)}",
+                    CoherentAccountId: finalProof.ActiveAccountId,
+                    RestartRequired: true,
+                    ReasonCode: "TARGET_QUOTA_INVALIDATION_FAILED"), null);
+            }
+        }
+
+        return (true, null, finalProof.ActiveAccountId);
+    }
+
+    /// <summary>
+    /// Removes the exact resolution cleanup marker after the journal deletion succeeded.
+    /// Returns null when nothing blocked; a surviving or unremovable marker fails closed so
+    /// resolution never destroys or ignores marker evidence.
+    /// </summary>
+    private async Task<JournalResolutionResult?> CleanupResolutionMarkerAsync(SwitchTransitionMarkerEntry? cleanupMarker)
+    {
+        if (cleanupMarker == null)
+        {
+            return null;
+        }
+
+        var markerDelete = await _journalStore
+            .DeleteTransitionMarkerIfUnchangedAsync(cleanupMarker, CancellationToken.None)
+            .ConfigureAwait(false);
+        if (markerDelete.Status is SwitchTransitionMarkerDeleteStatus.Deleted or SwitchTransitionMarkerDeleteStatus.Absent)
+        {
+            return null;
+        }
+
+        return new JournalResolutionResult(
+            JournalResolutionStatus.PersistenceFailure,
+            "The exact transition marker could not be removed after the journal cleanup; it must be reconciled before switching resumes.",
+            ReasonCode: "DELETE_FAILED");
+    }
+
+    /// <summary>
+    /// Operator resolution for the absent-canonical marker gap. The RECORDED ->
+    /// CREDENTIAL_APPLYING pair is the only one that provably crossed no target boundary;
+    /// it resolves through the RECORDED source-runtime proof. Every other pair resolves
+    /// through the full operator proof path with conservative target-evidence semantics
+    /// taken from the marker's intended successor, and only an exact marker deletion after
+    /// both recovery paths are proven clear can succeed.
+    /// </summary>
+    private async Task<JournalResolutionResult> ResolveTransitionMarkerGapAsync(
+        SwitchTransitionMarkerEntry marker, CancellationToken cancellationToken)
+    {
+        if (marker.Expected.State == SwitchJournalState.RECORDED &&
+            marker.Next.State == SwitchJournalState.CREDENTIAL_APPLYING)
+        {
+            var durableSource = await VerifyDurableSourceCoherenceAsync(
+                marker.Expected.SourceAccountId, cancellationToken).ConfigureAwait(false);
+            if (!durableSource.Proven)
+            {
+                return new JournalResolutionResult(
+                    JournalResolutionStatus.ProofFailed,
+                    durableSource.Message,
+                    ReasonCode: "SOURCE_COHERENCE_UNPROVEN");
+            }
+
+            var runtime = await ProveSourceRuntimeCoherenceAsync(
+                marker.Expected.SourceAccountId, durableSource.SourceEmail!, cancellationToken).ConfigureAwait(false);
+            if (!runtime.Proven)
+            {
+                return new JournalResolutionResult(
+                    JournalResolutionStatus.ProofFailed,
+                    runtime.Message,
+                    ReasonCode: "SOURCE_RUNTIME_UNPROVEN");
+            }
+
+            var markerDelete = await _journalStore
+                .DeleteTransitionMarkerIfUnchangedAsync(marker, cancellationToken)
+                .ConfigureAwait(false);
+            if (markerDelete.Status == SwitchTransitionMarkerDeleteStatus.Deleted)
+            {
+                var clearanceFailure = await GetRecoveryEvidenceClearanceFailureAsync().ConfigureAwait(false);
+                if (clearanceFailure != null)
+                    return clearanceFailure;
+            }
+
+            return markerDelete.Status switch
+            {
+                SwitchTransitionMarkerDeleteStatus.Deleted => new JournalResolutionResult(
+                    JournalResolutionStatus.CleanCleanupCompleted,
+                    "RECORDED transition marker cleaned up; source runtime proven coherent.",
+                    RestartRequired: false,
+                    ReasonCode: "CLEAN_RECORDED_TRANSITION_REMOVED"),
+                SwitchTransitionMarkerDeleteStatus.Absent => (await GetRecoveryEvidenceClearanceFailureAsync(unexpectedAbsence: true).ConfigureAwait(false))!,
+                SwitchTransitionMarkerDeleteStatus.NotMatched => new JournalResolutionResult(
+                    JournalResolutionStatus.ProofFailed,
+                    "The transition marker changed during resolution; it was preserved untouched.",
+                    ReasonCode: "CONCURRENT_MUTATION"),
+                SwitchTransitionMarkerDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(
+                    JournalResolutionStatus.PersistenceFailure,
+                    "Conditional transition marker deletion is not supported on this platform.",
+                    RestartRequired: false,
+                    ReasonCode: "UNSUPPORTED_PLATFORM"),
+                _ => new JournalResolutionResult(
+                    JournalResolutionStatus.PersistenceFailure,
+                    "Failed to delete the transition marker file.",
+                    ReasonCode: "DELETE_FAILED")
+            };
+        }
+
+        var proofOutcome = await RunResolutionProofsAsync(marker.Next, cancellationToken).ConfigureAwait(false);
+        if (!proofOutcome.Proven)
+        {
+            return proofOutcome.Failure!;
+        }
+
+        var delete = await _journalStore
+            .DeleteTransitionMarkerIfUnchangedAsync(marker, cancellationToken)
+            .ConfigureAwait(false);
+        if (delete.Status == SwitchTransitionMarkerDeleteStatus.Deleted)
+        {
+            var clearanceFailure = await GetRecoveryEvidenceClearanceFailureAsync().ConfigureAwait(false);
+            if (clearanceFailure != null)
+                return clearanceFailure with { CoherentAccountId = proofOutcome.ActiveAccountId };
+        }
+
+        return delete.Status switch
+        {
+            SwitchTransitionMarkerDeleteStatus.Deleted => new JournalResolutionResult(
+                JournalResolutionStatus.ResolvedRestartRequired,
+                "Interrupted transition marker successfully resolved and removed. Application restart is required before normal routing resumes.",
+                CoherentAccountId: proofOutcome.ActiveAccountId,
+                RestartRequired: true),
+            SwitchTransitionMarkerDeleteStatus.NotMatched => new JournalResolutionResult(
+                JournalResolutionStatus.ProofFailed,
+                "The transition marker changed during resolution; it was preserved untouched.",
+                ReasonCode: "CONCURRENT_MUTATION"),
+            SwitchTransitionMarkerDeleteStatus.Absent => (await GetRecoveryEvidenceClearanceFailureAsync(unexpectedAbsence: true).ConfigureAwait(false))!,
+            SwitchTransitionMarkerDeleteStatus.UnsupportedPlatform => new JournalResolutionResult(
+                JournalResolutionStatus.PersistenceFailure,
+                "Conditional transition marker deletion is not supported on this platform.",
+                CoherentAccountId: proofOutcome.ActiveAccountId,
+                RestartRequired: false,
+                ReasonCode: "UNSUPPORTED_PLATFORM"),
+            _ => new JournalResolutionResult(
+                JournalResolutionStatus.PersistenceFailure,
+                "Failed to delete the transition marker file.",
+                CoherentAccountId: proofOutcome.ActiveAccountId,
+                RestartRequired: true,
+                ReasonCode: "DELETE_FAILED")
+        };
+    }
 
     public async Task<NativeSwitchResult> SwitchAsync(
         string targetAccountId,
@@ -709,20 +1485,34 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
         CancellationToken cancellationToken = default)
-        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, null, null, cancellationToken);
+        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId,
+            planIsCurrent == null ? null : () => Task.FromResult(planIsCurrent()),
+            null, null, cancellationToken);
 
     public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
         string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
         CancellationToken cancellationToken = default)
-        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent, requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken);
+        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId,
+            planIsCurrent == null ? null : () => Task.FromResult(planIsCurrent()),
+            requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken);
 
     public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
         string targetAccountId, string? expectedActiveAccountId, Func<bool> planIsCurrent,
         string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
         Func<CancellationToken, Task<IDisposable>> acquireInterruptionAdmissionAsync,
         CancellationToken cancellationToken = default)
-        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrent,
+        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId,
+            planIsCurrent == null ? null : () => Task.FromResult(planIsCurrent()),
+            requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken,
+            acquireInterruptionAdmissionAsync ?? throw new ArgumentNullException(nameof(acquireInterruptionAdmissionAsync)));
+
+    public Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+        string targetAccountId, string? expectedActiveAccountId, Func<Task<bool>> planIsCurrentAsync,
+        string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
+        Func<CancellationToken, Task<IDisposable>> acquireInterruptionAdmissionAsync,
+        CancellationToken cancellationToken = default)
+        => ObserveSwitchAsync(targetAccountId, expectedActiveAccountId, planIsCurrentAsync,
             requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken,
             acquireInterruptionAdmissionAsync ?? throw new ArgumentNullException(nameof(acquireInterruptionAdmissionAsync)));
 
@@ -787,7 +1577,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     }
 
     private async Task<NativeSwitchResult> ObserveSwitchAsync(
-        string targetAccountId, string? expectedActiveAccountId, Func<bool>? planIsCurrent,
+        string targetAccountId, string? expectedActiveAccountId, Func<Task<bool>>? planIsCurrentAsync,
         string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
         CancellationToken cancellationToken,
         Func<CancellationToken, Task<IDisposable>>? acquireInterruptionAdmissionAsync = null)
@@ -820,7 +1610,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         // The inner task owns every switch gate/lease until it actually finishes.
         // Timeout detaches only the caller, never the mutation or its serialization.
         Task<NativeSwitchResult> operation = SwitchCoreAsync(
-            targetAccountId, expectedActiveAccountId, planIsCurrent, requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken,
+            targetAccountId, expectedActiveAccountId, planIsCurrentAsync, requiredWorkloadModelKey, minimumCandidateQuotaPercent, cancellationToken,
             acquireInterruptionAdmissionAsync);
         try
         {
@@ -860,7 +1650,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     }
 
     private async Task<NativeSwitchResult> SwitchCoreAsync(
-        string targetAccountId, string? expectedActiveAccountId, Func<bool>? planIsCurrent,
+        string targetAccountId, string? expectedActiveAccountId, Func<Task<bool>>? planIsCurrentAsync,
         string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
         CancellationToken cancellationToken,
         Func<CancellationToken, Task<IDisposable>>? acquireInterruptionAdmissionAsync = null)
@@ -932,7 +1722,29 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             AG2ProcessSnapshot? processSnapshot = null;
             AG2ProcessGeneration? replacementGeneration = null;
             bool processTransitionStarted = false;
+            bool targetActivationAttempted = false;
             bool credentialWriteAttempted = false;
+            // Mirrors the activation provenance durably persisted for this transaction so the
+            // ROLLING_BACK and QUARANTINED journal writes preserve it across crash recovery.
+            // UNKNOWN until the RECORDED write persists NOT_ATTEMPTED; advanced to
+            // MAY_HAVE_BEEN_ATTEMPTED when the CREDENTIAL_APPLYING write lands, strictly before
+            // the target credential writer can be invoked. Never regresses.
+            SwitchTargetActivationProvenance journalProvenance = SwitchTargetActivationProvenance.UNKNOWN;
+            // Exact transaction journal ownership: null until a journal write successfully
+            // commits, then the exact persisted entry. Cleanup is authorized only against
+            // this value — a transaction that has not written a journal performs no journal
+            // cleanup, and no path deletes an entry the transaction does not still own.
+            SwitchJournalEntry? ownedJournalEntry = null;
+            // Exact transition-marker ownership, same discipline as the journal entry: null
+            // until a marker create-if-absent commits, advanced only from the successful
+            // result, and cleared when exact marker cleanup is proven. The marker keeps at
+            // least one durable recovery artifact on disk across every journal transition.
+            SwitchTransitionMarkerEntry? ownedTransitionMarker = null;
+            // Set when the transaction loses journal ownership to a foreign/replacement
+            // entry mid-flight: all further journal writes are suppressed, the foreign
+            // journal remains canonical recovery evidence, and required compensation still
+            // runs without overwriting it.
+            bool journalOwnershipLost = false;
             CrossProcessFileLease? switchLease = null;
 
             string switchResource = _sessionVault.GetVaultPath() + ".switch";
@@ -997,7 +1809,72 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
                     "Account lifecycle is unresolved; manual recovery is required.");
 
-            if (planIsCurrent != null && !planIsCurrent())
+            // Admission freshness: in-memory recovery state can be stale relative to the
+            // canonical journal path (a journal can appear after cleanup published clean).
+            // Before performing any mutation, prove no unresolved journal exists; any journal
+            // here fails closed into blocking recovery instead of opening admission.
+            SwitchJournalReadResult admissionJournal;
+            try
+            {
+                admissionJournal = await _journalStore.ReadAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                admissionJournal = SwitchJournalReadResult.IoError(ex);
+            }
+
+            if (admissionJournal.Status != SwitchJournalReadStatus.Absent)
+            {
+                MarkJournalRecoveryBlocked();
+                throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                    "An unresolved switch journal exists; recovery must reconcile it before switching can resume.");
+            }
+
+            // The transition marker path is part of admission: any valid, corrupt, or
+            // unreadable marker is unresolved recovery evidence that forbids mutation.
+            SwitchTransitionMarkerReadResult admissionMarker;
+            try
+            {
+                admissionMarker = await _journalStore.ReadTransitionMarkerAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                admissionMarker = SwitchTransitionMarkerReadResult.IoError(ex);
+            }
+
+            if (admissionMarker.Status != SwitchTransitionMarkerReadStatus.Absent)
+            {
+            if (admissionMarker.Status is SwitchTransitionMarkerReadStatus.Corrupt
+                or SwitchTransitionMarkerReadStatus.UnsupportedVersion)
+            {
+                lock (_statusLock)
+                {
+                    if (_journalRecoveryState != JournalRecoveryStates.RestartRequired)
+                    {
+                        _journalRecoveryState = JournalRecoveryStates.NotResolvable;
+                    }
+                }
+            }
+            else if (admissionMarker.Status == SwitchTransitionMarkerReadStatus.IoError)
+            {
+                lock (_statusLock)
+                {
+                    if (_journalRecoveryState != JournalRecoveryStates.RestartRequired &&
+                        _journalRecoveryState == JournalRecoveryStates.None)
+                    {
+                        _journalRecoveryState = JournalRecoveryStates.Unknown;
+                    }
+                }
+            }
+            else
+            {
+                MarkJournalRecoveryBlocked();
+            }
+                throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                    "An unresolved switch transition marker exists; recovery must reconcile it before switching can resume.");
+            }
+
+            if (planIsCurrentAsync != null && !await planIsCurrentAsync().ConfigureAwait(false))
                 throw new SwitchRejectedException(SwitchResultCodes.Cancelled, "Automatic switch plan became stale.");
 
             if (string.IsNullOrWhiteSpace(requestedId))
@@ -1015,8 +1892,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             }
 
             previousAccountId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
-            if (planIsCurrent != null &&
-                (!planIsCurrent() || !string.Equals(previousAccountId, expectedActiveAccountId, StringComparison.Ordinal)))
+            if (planIsCurrentAsync != null &&
+                (!await planIsCurrentAsync().ConfigureAwait(false) || !string.Equals(previousAccountId, expectedActiveAccountId, StringComparison.Ordinal)))
                 throw new SwitchRejectedException(SwitchResultCodes.Cancelled, "Automatic switch plan became stale.");
             sourceAccount = previousAccountId == null ? null :
                 await _accountStore.GetAccountAsync(previousAccountId, cancellationToken).ConfigureAwait(false);
@@ -1105,8 +1982,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 throw new SwitchRejectedException(SwitchResultCodes.TelemetryUnavailable,
                     "Live identity changed before credential mutation.");
 
-            if (planIsCurrent != null &&
-                (!planIsCurrent() || !string.Equals(
+            if (planIsCurrentAsync != null &&
+                (!await planIsCurrentAsync().ConfigureAwait(false) || !string.Equals(
                     await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false),
                     expectedActiveAccountId, StringComparison.Ordinal)))
                 throw new SwitchRejectedException(SwitchResultCodes.Cancelled, "Automatic switch plan became stale before mutation.");
@@ -1139,14 +2016,32 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             mutationCts.CancelAfter(mutationTimeout);
             var mutationToken = mutationCts.Token;
 
-            // Phase Transition a: RECORDED (strictly before StopVerifiedAsync)
-            await WriteJournalStateAsync(
+            // Phase Transition a: RECORDED — atomic create-if-absent (strictly before
+            // StopVerifiedAsync). A foreign journal written after admission can never be
+            // overwritten: the create succeeds only while the canonical path is genuinely
+            // free at the filesystem commit boundary. No marker is needed for the initial
+            // create: before this write commits, no destructive transaction action has
+            // begun, and the create itself is atomic.
+            var (recordedEntry, recordedMarker, recordedResult) = await TryAdvanceOwnedJournalAsync(
+                ownedJournalEntry,
+                ownedTransitionMarker,
                 transactionId,
                 SwitchJournalState.RECORDED,
                 sourceAccount!.Id,
                 target.Id,
                 quarantineReasonCode: null,
-                cancellationToken: mutationToken).ConfigureAwait(false);
+                SwitchTargetActivationProvenance.NOT_ATTEMPTED,
+                mutationToken).ConfigureAwait(false);
+            ownedTransitionMarker = recordedMarker;
+            if (recordedEntry == null)
+            {
+                await ClassifyForeignJournalRecoveryStateAsync().ConfigureAwait(false);
+                throw new SwitchRejectedException(SwitchResultCodes.SwitchFailedRollbackFailed,
+                    "A switch journal already occupies the canonical path; recovery must reconcile it before switching can resume.");
+            }
+
+            ownedJournalEntry = recordedEntry;
+            journalProvenance = SwitchTargetActivationProvenance.NOT_ATTEMPTED;
 
             // R02: Interruption admission lifecycle
             // When executing an automatic switch, acquireInterruptionAdmissionAsync is provided.
@@ -1187,7 +2082,7 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                                     ?? throw new InvalidOperationException("Automatic interruption admission did not provide ownership.");
                                 admissionCts.Token.ThrowIfCancellationRequested();
                             }
-                            if (planIsCurrent != null && !planIsCurrent())
+                            if (planIsCurrentAsync != null && !await planIsCurrentAsync().ConfigureAwait(false))
                                 throw new SwitchRejectedException(SwitchResultCodes.Cancelled,
                                     "Automatic quota evidence changed or expired at the process-stop boundary.");
                             if (_recoveryQuarantine.IsMarked || _sessionVault.IsQuarantined)
@@ -1221,16 +2116,42 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 targetSession);
             ValidateCredential(targetCredential, requireConfiguredTarget: true);
 
-            // Phase Transition b: CREDENTIAL_APPLYING (strictly before WriteCredentialAsync)
-            await WriteJournalStateAsync(
+            // Phase Transition b: CREDENTIAL_APPLYING — marker-first exact-entry conditional
+            // transition (strictly before WriteCredentialAsync). The durable transition
+            // marker exists before the predecessor can be removed, so no crash boundary can
+            // leave the canonical journal absent without recovery evidence. This same write
+            // persists MAY_HAVE_BEEN_ATTEMPTED before the credential writer can be invoked,
+            // so a throwing or partially-applied credential write still leaves durable proof
+            // that the target activation boundary may have been crossed. If journal
+            // ownership was lost to a foreign entry, the forward mutation must NOT run: the
+            // source process is already stopped, so the verified rollback below is the safe
+            // path.
+            var (applyingEntry, applyingMarker, applyingResult) = await TryAdvanceOwnedJournalAsync(
+                ownedJournalEntry,
+                ownedTransitionMarker,
                 transactionId,
                 SwitchJournalState.CREDENTIAL_APPLYING,
                 sourceAccount!.Id,
                 target.Id,
                 quarantineReasonCode: null,
-                cancellationToken: mutationToken).ConfigureAwait(false);
+                SwitchTargetActivationProvenance.MAY_HAVE_BEEN_ATTEMPTED,
+                mutationToken).ConfigureAwait(false);
+            ownedTransitionMarker = applyingMarker;
+            if (applyingEntry == null)
+            {
+                if (applyingResult.Status is SwitchJournalWriteStatus.PersistenceFailure or SwitchJournalWriteStatus.CleanupIncomplete)
+                    throw new IOException("The credential-applying journal transition could not be persisted.", applyingResult.Exception);
+                MarkJournalRecoveryBlocked();
+                journalOwnershipLost = true;
+                throw new SwitchJournalOwnershipLostException(
+                    $"Journal transition to {SwitchJournalState.CREDENTIAL_APPLYING} failed ownership validation ({applyingResult.Status}); the canonical journal was preserved untouched.");
+            }
+
+            ownedJournalEntry = applyingEntry;
+            journalProvenance = SwitchTargetActivationProvenance.MAY_HAVE_BEEN_ATTEMPTED;
 
             SetState(NativeSwitchStates.ApplyingCredential);
+            targetActivationAttempted = true;
             credentialWriteAttempted = true;
             bool written = await _winCredWriter.WriteCredentialAsync(targetCredential, mutationToken)
                 .ConfigureAwait(false);
@@ -1267,21 +2188,9 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 }
                 catch (SwitchVerificationException)
                 {
-                    if (_quotaObservationStore != null && cachedEvidence != null)
+                    if (_quotaObservationStore != null && target != null)
                     {
-                        try
-                        {
-                            // Do not invalidate a newer independent observation. Persist
-                            // rejection before rollback; cooldown expiry must not revive it.
-                            await _quotaObservationStore.InvalidateIfUnchangedAsync(cachedEvidence,
-                                _timeProvider.GetUtcNow(), CancellationToken.None).ConfigureAwait(false);
-                            stages.Add("TARGET_QUOTA_EVIDENCE_INVALIDATED");
-                        }
-                        catch
-                        {
-                            _recoveryQuarantine.Mark();
-                            stages.Add("TARGET_QUOTA_INVALIDATION_FAILED");
-                        }
+                        await InvalidateTargetQuotaObservationsAsync(target.Id, stages).ConfigureAwait(false);
                     }
                     throw;
                 }
@@ -1295,14 +2204,33 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     "Process generation changed after target verification and before metadata finalization.");
             }
 
-            // Phase Transition c: TARGET_IDENTITY_VERIFIED_PRECOMMIT (strictly before TryFinalizeSwitchAsync)
-            await WriteJournalStateAsync(
+            // Phase Transition c: TARGET_IDENTITY_VERIFIED_PRECOMMIT — marker-first
+            // exact-entry conditional transition (strictly before TryFinalizeSwitchAsync).
+            // Losing journal ownership here (after the target credential was applied and the
+            // target verified) routes into the verified rollback below: target evidence is
+            // invalidated and the source is restored, while the foreign journal survives.
+            var (precommitEntry, precommitMarker, precommitResult) = await TryAdvanceOwnedJournalAsync(
+                ownedJournalEntry,
+                ownedTransitionMarker,
                 transactionId,
                 SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT,
                 sourceAccount!.Id,
                 target.Id,
                 quarantineReasonCode: null,
-                cancellationToken: mutationToken).ConfigureAwait(false);
+                SwitchTargetActivationProvenance.MAY_HAVE_BEEN_ATTEMPTED,
+                mutationToken).ConfigureAwait(false);
+            ownedTransitionMarker = precommitMarker;
+            if (precommitEntry == null)
+            {
+                if (precommitResult.Status is SwitchJournalWriteStatus.PersistenceFailure or SwitchJournalWriteStatus.CleanupIncomplete)
+                    throw new IOException("The precommit journal transition could not be persisted.", precommitResult.Exception);
+                MarkJournalRecoveryBlocked();
+                journalOwnershipLost = true;
+                throw new SwitchJournalOwnershipLostException(
+                    $"Journal transition to {SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT} failed ownership validation ({precommitResult.Status}); the canonical journal was preserved untouched.");
+            }
+
+            ownedJournalEntry = precommitEntry;
 
             var updated = await _accountStore.TryFinalizeSwitchAsync(previousAccountId, target.Id, new UpdateAccountInput(
                 ValidationStatus: AccountValidationStatus.Valid,
@@ -1326,31 +2254,40 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 }
             }
 
-            // Phase Transition d: Success Deletion (only after TryFinalizeSwitchAsync succeeds)
-            try
+            // Phase Transition d: Success Deletion (only after TryFinalizeSwitchAsync succeeds).
+            // Exact-entry conditional cleanup with a post-deletion path proof: the transaction
+            // may delete only the PRECOMMIT entry it wrote, and deletion alone does not prove
+            // the canonical path clear. The switch result remains a business success; a
+            // surviving or mismatched journal keeps recovery blocking for reconciliation.
+            bool commitCleanupClear = ownedJournalEntry != null &&
+                await CleanupOwnedJournalEntryAsync(ownedJournalEntry, ownedTransitionMarker).ConfigureAwait(false);
+            if (!commitCleanupClear)
             {
-                await _journalStore.DeleteAsync(mutationToken).ConfigureAwait(false);
-            }
-            catch (Exception)
-            {
-                // Deletion failure: do not fail switch, do not revert metadata.
-                // TARGET_IDENTITY_VERIFIED_PRECOMMIT remains on disk for Step 3 startup reconciliation.
+                stages.Add("JOURNAL_CLEANUP_REQUIRES_RECONCILIATION");
             }
 
             return Terminal(transactionId, true, SwitchResultCodes.Success, NativeSwitchStates.Complete,
                 target.Id, target.Email, previousAccountId, previousEmail,
-                "Target account was activated and verified.", stages, now);
+                "Target account was activated and verified." +
+                (commitCleanupClear ? "" : " Journal cleanup requires reconciliation; recovery is blocking."),
+                stages, now);
         }
         catch (SwitchRejectedException ex) when (!processTransitionStarted)
         {
-            try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+            // A transaction that has not written a journal performs no cleanup at all: an
+            // unrelated journal on the canonical path belongs to another owner and must
+            // survive for its own reconciliation. The transaction-exit proof below publishes
+            // blocking recovery when a foreign journal is present.
+            if (ownedJournalEntry != null)
+                await CleanupOwnedJournalEntryAsync(ownedJournalEntry, ownedTransitionMarker).ConfigureAwait(false);
             return Terminal(transactionId, false, ex.Code, NativeSwitchStates.Failed,
                 requestedId, target?.Email, previousAccountId, previousEmail,
                 AG2Security.RedactSensitiveText(ex.Message), stages, now);
         }
         catch (OperationCanceledException) when (!processTransitionStarted)
         {
-            try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+            if (ownedJournalEntry != null)
+                await CleanupOwnedJournalEntryAsync(ownedJournalEntry, ownedTransitionMarker).ConfigureAwait(false);
             return Terminal(transactionId, false, SwitchResultCodes.Cancelled, NativeSwitchStates.Failed,
                 requestedId, target?.Email, previousAccountId, previousEmail,
                 "Switch request was cancelled before credential mutation.", stages, now);
@@ -1359,7 +2296,8 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         {
             if (!processTransitionStarted || originalCredential == null || processSnapshot == null)
             {
-                try { await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+                if (ownedJournalEntry != null)
+                    await CleanupOwnedJournalEntryAsync(ownedJournalEntry, ownedTransitionMarker).ConfigureAwait(false);
                 return Terminal(transactionId, false,
                     switchError is OperationCanceledException ? SwitchResultCodes.Cancelled : SwitchResultCodes.TelemetryUnavailable,
                     NativeSwitchStates.Failed, requestedId, target?.Email, previousAccountId, previousEmail,
@@ -1369,16 +2307,64 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             SetState(NativeSwitchStates.RollingBack);
             stages.Add("ROLLBACK_STARTED");
 
-            // Phase Transition e: ROLLING_BACK (strictly before QuiesceForRollbackAsync or restoring credentials)
+            // If genuine target activation was attempted, invalidate target quota evidence
+            // so candidate selector cannot repeatedly retry this target using stale positive
+            // observations once rollback and cooldown finish. Pre-activation failures (such as
+            // source stop failure or snapshot failure) preserve target observations intact.
+            string failedTargetId = target?.Id ?? requestedId;
+            if (targetActivationAttempted && _quotaObservationStore != null && !string.IsNullOrWhiteSpace(failedTargetId))
+            {
+                await InvalidateTargetQuotaObservationsAsync(failedTargetId, stages).ConfigureAwait(false);
+            }
+
+            // Phase Transition e: ROLLING_BACK (strictly before QuiesceForRollbackAsync or restoring credentials) —
+            // marker-first exact-entry conditional transition. Two distinct failure shapes:
+            // ownership loss (a foreign journal or foreign marker replaced/occupies the
+            // recovery evidence) still requires the pending compensation and must never
+            // overwrite the foreign evidence; a plain persistence failure leaves the prior
+            // owned journal — and the durable marker, when one was created — on disk and
+            // keeps the critical no-compensation-under-unrecorded-rollback rule.
             try
             {
-                await WriteJournalStateAsync(
+                var (rollingBackEntry, rollingBackMarker, rollingBackResult) = await TryAdvanceOwnedJournalAsync(
+                    ownedJournalEntry,
+                    ownedTransitionMarker,
                     transactionId,
                     SwitchJournalState.ROLLING_BACK,
                     sourceAccount?.Id ?? previousAccountId ?? string.Empty,
                     target?.Id ?? requestedId,
                     quarantineReasonCode: null,
-                    cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    journalProvenance,
+                    CancellationToken.None).ConfigureAwait(false);
+                ownedTransitionMarker = rollingBackMarker;
+                if (rollingBackEntry != null)
+                {
+                    ownedJournalEntry = rollingBackEntry;
+                    // A covered publication failure can recover exact ownership through
+                    // the predecessor bridge. This successful write now owns rollback;
+                    // foreign evidence never reaches this branch.
+                    journalOwnershipLost = false;
+                }
+                else if (rollingBackResult.Status == SwitchJournalWriteStatus.CleanupIncomplete)
+                {
+                    ownedJournalEntry = rollingBackResult.DurableSuccessor;
+                    journalOwnershipLost = false;
+                    MarkJournalRecoveryBlocked();
+                    stages.Add("JOURNAL_CLEANUP_REQUIRES_RECONCILIATION");
+                }
+                else if (rollingBackResult.Status is SwitchJournalWriteStatus.NotMatched
+                    or SwitchJournalWriteStatus.AlreadyExists
+                    or SwitchJournalWriteStatus.Absent)
+                {
+                    journalOwnershipLost = true;
+                    MarkJournalRecoveryBlocked();
+                    stages.Add("JOURNAL_OWNERSHIP_LOST");
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        $"Failed to persist the ROLLING_BACK journal state: {rollingBackResult.Message ?? rollingBackResult.Status.ToString()}");
+                }
             }
             catch (Exception rollbackJournalError)
             {
@@ -1431,24 +2417,26 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                     .ConfigureAwait(false);
                 stages.Add("SOURCE_IDENTITY_VERIFIED");
 
-                // Phase Transition f: Rollback Success Deletion
-                try
+                // Phase Transition f: Rollback Success Deletion. Exact-entry conditional
+                // cleanup of the owned journal with a post-deletion path proof; the verified
+                // rollback remains the business outcome, while a surviving or mismatched
+                // journal keeps recovery blocking.
+                bool rollbackCleanupClear = true;
+                if (!_recoveryQuarantine.IsMarked && ownedJournalEntry != null)
                 {
                     // If durable evidence rejection failed, retain the recovery
                     // journal so restart cannot clear an in-memory-only quarantine
                     // and route using the same disproven healthy observation.
-                    if (!_recoveryQuarantine.IsMarked)
-                        await _journalStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception)
-                {
-                    // If deletion fails/throws: log warning; rollback succeeded.
+                    rollbackCleanupClear = await CleanupOwnedJournalEntryAsync(ownedJournalEntry, ownedTransitionMarker).ConfigureAwait(false);
                 }
 
                 string failureDetail = SafeFailure(switchError);
+                string cleanupNote = rollbackCleanupClear
+                    ? ""
+                    : " Journal cleanup requires reconciliation; recovery is blocking.";
                 string message = string.IsNullOrWhiteSpace(failureDetail)
-                    ? "Switch failed; the original credential and verified source identity were restored."
-                    : $"Switch failed; the original credential and verified source identity were restored. {failureDetail}";
+                    ? $"Switch failed; the original credential and verified source identity were restored.{cleanupNote}"
+                    : $"Switch failed; the original credential and verified source identity were restored. {failureDetail}{cleanupNote}";
 
                 return Terminal(transactionId, false, SwitchResultCodes.SwitchFailedRolledBack,
                     NativeSwitchStates.RolledBack, requestedId, target?.Email, previousAccountId, previousEmail,
@@ -1460,20 +2448,37 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 stages.Add("ROLLBACK_FAILED");
                 _recoveryQuarantine.Mark();
 
-                try
+                if (journalOwnershipLost)
                 {
-                    await WriteJournalStateAsync(
-                        transactionId,
-                        SwitchJournalState.QUARANTINED,
-                        sourceAccount?.Id ?? previousAccountId ?? string.Empty,
-                        target?.Id ?? requestedId,
-                        quarantineReasonCode: "ROLLBACK_FAILED",
-                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    // Journal ownership was already lost to a foreign entry: do not attempt
+                    // to overwrite it with the QUARANTINED state. The in-process quarantine
+                    // plus the surviving foreign journal keep recovery blocked.
                 }
-                catch (Exception)
+                else
                 {
-                    // If writing QUARANTINED throws: mark in-process quarantine anyway (already marked),
-                    // return uncertain/manual-recovery failure.
+                    try
+                    {
+                        var (quarantinedEntry, quarantinedMarker, _) = await TryAdvanceOwnedJournalAsync(
+                            ownedJournalEntry,
+                            ownedTransitionMarker,
+                            transactionId,
+                            SwitchJournalState.QUARANTINED,
+                            sourceAccount?.Id ?? previousAccountId ?? string.Empty,
+                            target?.Id ?? requestedId,
+                            quarantineReasonCode: "ROLLBACK_FAILED",
+                            journalProvenance,
+                            CancellationToken.None).ConfigureAwait(false);
+                        ownedTransitionMarker = quarantinedMarker;
+                        if (quarantinedEntry != null)
+                        {
+                            ownedJournalEntry = quarantinedEntry;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // If persisting QUARANTINED throws: the in-process quarantine is
+                        // already marked and the terminal result stays manual-recovery.
+                    }
                 }
 
                 return Terminal(transactionId, false, SwitchResultCodes.SwitchFailedRollbackFailed,
@@ -1575,10 +2580,36 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
                 IsQuarantinedOrRecoveryUnresolved()) return false;
         }
         SwitchJournalReadResult journal;
+        SwitchTransitionMarkerReadResult marker;
         try
         {
             using var deadline = new CancellationTokenSource(_transactionTimeout);
             journal = await _journalStore.ReadAsync(deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false);
+            if (journal.Status == SwitchJournalReadStatus.Absent)
+            {
+                // Terminal cleanup is not proven complete while any transition marker
+                // remains: the marker path is part of the reusable-admission proof.
+                marker = await _journalStore
+                    .ReadTransitionMarkerAsync(deadline.Token)
+                    .WaitAsync(deadline.Token)
+                    .ConfigureAwait(false);
+                if (marker.Status == SwitchTransitionMarkerReadStatus.Absent) return true;
+
+                lock (_statusLock)
+                {
+                    if (_journalRecoveryState == JournalRecoveryStates.None)
+                        _journalRecoveryState = marker.Status switch
+                        {
+                            SwitchTransitionMarkerReadStatus.Valid => JournalRecoveryStates.ActionRequired,
+                            SwitchTransitionMarkerReadStatus.Corrupt or SwitchTransitionMarkerReadStatus.UnsupportedVersion
+                                => JournalRecoveryStates.NotResolvable,
+                            _ => JournalRecoveryStates.Unknown
+                        };
+                }
+                return false;
+            }
+
+            marker = SwitchTransitionMarkerReadResult.Absent();
         }
         catch
         {
@@ -1589,7 +2620,6 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             }
             return false;
         }
-        if (journal.Status == SwitchJournalReadStatus.Absent) return true;
         lock (_statusLock)
         {
             // Never clear established recovery state while retiring a transaction.
@@ -1737,6 +2767,31 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             ? "Switch was cancelled during a protected phase."
             : AG2Security.SanitizeError(error);
 
+    private async Task InvalidateTargetQuotaObservationsAsync(string targetAccountId, List<string> stages)
+    {
+        if (_quotaObservationStore == null || string.IsNullOrWhiteSpace(targetAccountId))
+            return;
+
+        try
+        {
+            var now = _timeProvider.GetUtcNow();
+            await _quotaObservationStore.InvalidateObservationsForAccountAsync(
+                targetAccountId, now, CancellationToken.None).ConfigureAwait(false);
+            if (!stages.Contains("TARGET_QUOTA_EVIDENCE_INVALIDATED"))
+            {
+                stages.Add("TARGET_QUOTA_EVIDENCE_INVALIDATED");
+            }
+        }
+        catch
+        {
+            _recoveryQuarantine.Mark();
+            if (!stages.Contains("TARGET_QUOTA_INVALIDATION_FAILED"))
+            {
+                stages.Add("TARGET_QUOTA_INVALIDATION_FAILED");
+            }
+        }
+    }
+
     private void SetActive(string transactionId, string state)
     {
         lock (_statusLock)
@@ -1798,15 +2853,39 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
         return result;
     }
 
-    private async Task WriteJournalStateAsync(
-        string transactionId,
-        SwitchJournalState state,
-        string sourceAccountId,
-        string targetAccountId,
-        string? quarantineReasonCode = null,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Persists the next journal state ownership-conditionally under the durable transition
+    /// marker protocol. With no owned entry the state is created atomically if and only if
+    /// the canonical path is still absent — no marker is required, because before that
+    /// create commits the transaction has performed no destructive action and the create
+    /// itself is atomic. With an owned entry the transition is: durably create the exact
+    /// marker (expected = owned entry, next = proposed entry) if absent; rotate an existing
+    /// marker only when it exactly matches previously acquired marker ownership, retaining
+    /// a proved, pinned canonical predecessor across that rotation; then replace the owned entry with
+    /// the store's delete-then-publish primitive (whose successor bytes are prepared before
+    /// the predecessor is removed); then remove the exact owned marker. At every durable
+    /// boundary at least one recovery artifact remains: the canonical journal, or the
+    /// marker, or both. A failed publication may leave only the marker; an exact predecessor
+    /// restoration may leave both. Foreign recovery evidence is never overwritten. Journal and marker
+    /// ownership advance only from successful results — never adopted from disk.
+    /// </summary>
+    // Freezes the durability boundary after rotating away the old marker, before its
+    // replacement is published. Production leaves this fault-injection seam unset.
+    internal Func<Task>? AfterOwnedMarkerRotationDeleteAsync { get; set; }
+
+    private async Task<(SwitchJournalEntry? Entry, SwitchTransitionMarkerEntry? OwnedMarker, SwitchJournalWriteResult Result)>
+        TryAdvanceOwnedJournalAsync(
+            SwitchJournalEntry? ownedJournalEntry,
+            SwitchTransitionMarkerEntry? ownedTransitionMarker,
+            string transactionId,
+            SwitchJournalState state,
+            string sourceAccountId,
+            string targetAccountId,
+            string? quarantineReasonCode,
+            SwitchTargetActivationProvenance provenance,
+            CancellationToken cancellationToken)
     {
-        var entry = new SwitchJournalEntry
+        var next = new SwitchJournalEntry
         {
             Magic = SwitchJournalEntry.CurrentMagic,
             SchemaVersion = SwitchJournalEntry.CurrentSchemaVersion,
@@ -1815,10 +2894,511 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
             UpdatedAt = DateTimeOffset.UtcNow,
             SourceAccountId = sourceAccountId,
             TargetAccountId = targetAccountId,
-            QuarantineReasonCode = quarantineReasonCode
+            QuarantineReasonCode = quarantineReasonCode,
+            TargetActivationProvenance = provenance
         };
 
-        await _journalStore.WriteEntryAsync(entry, cancellationToken).ConfigureAwait(false);
+        if (ownedJournalEntry == null)
+        {
+            var create = await _journalStore.CreateIfAbsentAsync(next, cancellationToken).ConfigureAwait(false);
+            return (create.Status == SwitchJournalWriteStatus.Created ? create.Entry : null, ownedTransitionMarker, create);
+        }
+
+        // STEP 1-2: the transition marker must be durable before the predecessor can be
+        // removed. An occupant is never adopted: only an exact previously-owned marker
+        // may be rotated, with its canonical predecessor serving as a durable bridge.
+        var marker = new SwitchTransitionMarkerEntry
+        {
+            Magic = SwitchTransitionMarkerEntry.CurrentMagic,
+            SchemaVersion = SwitchTransitionMarkerEntry.CurrentSchemaVersion,
+            TransactionId = transactionId,
+            CreatedAt = DateTimeOffset.UtcNow,
+            Expected = ownedJournalEntry,
+            Next = next
+        };
+
+        var markerCreate = await _journalStore
+            .CreateTransitionMarkerIfAbsentAsync(marker, cancellationToken)
+            .ConfigureAwait(false);
+        if (markerCreate.Status == SwitchTransitionMarkerWriteStatus.AlreadyExists)
+        {
+            // Only the marker acquired from a successful persistence result is owned.
+            // Matching a transaction ID or predecessor never promotes an occupant to owned.
+            SwitchTransitionMarkerReadResult occupant;
+            try
+            {
+                occupant = await _journalStore
+                    .ReadTransitionMarkerAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                occupant = SwitchTransitionMarkerReadResult.IoError(ex);
+            }
+
+            bool ownsOccupant = occupant.Status == SwitchTransitionMarkerReadStatus.Valid &&
+                occupant.Marker != null &&
+                ownedTransitionMarker != null &&
+                SwitchTransitionMarkerStore.MarkersMatch(occupant.Marker, ownedTransitionMarker) &&
+                SwitchJournalStore.EntriesMatch(ownedTransitionMarker.Expected, ownedJournalEntry);
+            if (!ownsOccupant)
+            {
+                await ClassifyForeignMarkerRecoveryStateAsync().ConfigureAwait(false);
+                return (null, ownedTransitionMarker, SwitchJournalWriteResult.AlreadyExists(
+                    "A transition marker already occupies the marker path; recovery must reconcile it before this transaction can transition its journal."));
+            }
+
+            // A failed successor publication may already have deleted the predecessor.
+            // Restore only the exact predecessor we persisted, without replacing any
+            // occupant, and retain the old marker until its canonical bridge is proven.
+            var bridge = await RestoreOwnedMarkerPredecessorAsync(ownedTransitionMarker!, cancellationToken)
+                .ConfigureAwait(false);
+            if (bridge != null)
+            {
+                MarkJournalRecoveryBlocked();
+                return (null, ownedTransitionMarker, bridge);
+            }
+
+            try
+            {
+                // Unlike the conditional-delete handle, this short-lived read guard does
+                // NOT share delete/write access. Revalidate through it and keep A pinned
+                // across the rotation so an external rename/delete cannot remove the
+                // bridge while it is the only recovery artifact.
+                var guardResult = await _journalStore.AcquireExactJournalGuardAsync(ownedTransitionMarker!.Expected, cancellationToken).ConfigureAwait(false);
+                if (guardResult.Status != ExactJournalGuardStatus.Acquired || guardResult.Guard == null)
+                {
+                    MarkJournalRecoveryBlocked();
+                    return (null, ownedTransitionMarker, guardResult.Status switch
+                    {
+                        ExactJournalGuardStatus.Absent => SwitchJournalWriteResult.Absent(
+                            "The canonical predecessor disappeared before marker rotation; the marker was preserved."),
+                        ExactJournalGuardStatus.NotMatched => SwitchJournalWriteResult.NotMatched(
+                            "The canonical predecessor changed before marker rotation; both occupants were preserved."),
+                        _ => SwitchJournalWriteResult.PersistenceFailure(
+                            $"Failed to guard the canonical predecessor: {guardResult.Message}", guardResult.Exception)
+                    });
+                }
+                using var predecessorGuard = guardResult.Guard;
+
+
+
+
+
+
+
+
+
+
+
+                var ownDelete = await _journalStore
+                    .DeleteTransitionMarkerIfUnchangedAsync(ownedTransitionMarker!, cancellationToken)
+                    .ConfigureAwait(false);
+                if (ownDelete.Status != SwitchTransitionMarkerDeleteStatus.Deleted)
+                {
+                    MarkJournalRecoveryBlocked();
+                    return (null, ownedTransitionMarker, SwitchJournalWriteResult.AlreadyExists(
+                        "The exact owned transition marker could not be removed; recovery remains blocked."));
+                }
+
+                ownedTransitionMarker = null;
+                if (AfterOwnedMarkerRotationDeleteAsync != null)
+                    await AfterOwnedMarkerRotationDeleteAsync().ConfigureAwait(false);
+
+                markerCreate = await _journalStore
+                    .CreateTransitionMarkerIfAbsentAsync(marker, cancellationToken)
+                    .ConfigureAwait(false);
+                if (markerCreate.Status != SwitchTransitionMarkerWriteStatus.Created)
+                {
+                    MarkJournalRecoveryBlocked();
+                    return (null, null, markerCreate.Status == SwitchTransitionMarkerWriteStatus.AlreadyExists
+                        ? SwitchJournalWriteResult.AlreadyExists("A replacement marker occupies the path; it was preserved.")
+                        : SwitchJournalWriteResult.PersistenceFailure(
+                            $"Failed to persist the replacement transition marker: {markerCreate.Message}", markerCreate.Exception));
+                }
+
+                ownedTransitionMarker = markerCreate.Marker;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException)
+            {
+                MarkJournalRecoveryBlocked();
+                return (null, ownedTransitionMarker, SwitchJournalWriteResult.PersistenceFailure(
+                    "Marker rotation failed; the canonical bridge or the prior marker retains recovery evidence.", ex));
+            }
+        }
+        else if (markerCreate.Status == SwitchTransitionMarkerWriteStatus.Created)
+        {
+            ownedTransitionMarker = markerCreate.Marker;
+        }
+        else
+        {
+            // Marker persistence failed before any destructive step: the predecessor
+            // remains durable and owned, and no recovery evidence was lost.
+            return (null, ownedTransitionMarker, SwitchJournalWriteResult.PersistenceFailure(
+                $"Failed to persist the transition marker: {markerCreate.Message ?? markerCreate.Status.ToString()}",
+                markerCreate.Exception));
+        }
+
+        // STEP 3-5: replace exactly the owned entry. A NotMatched/Absent outcome or a failed
+        // publish leaves the durable marker behind as recovery evidence; ownership of the
+        // journal stays where it was.
+        SwitchJournalWriteResult replace;
+        try
+        {
+            replace = await _journalStore.ReplaceIfUnchangedAsync(ownedJournalEntry, next, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException)
+        {
+            // Return the marker we successfully persisted even when the store throws.
+            // The caller must retain that ownership for a covered rollback transition.
+            return (null, ownedTransitionMarker, SwitchJournalWriteResult.PersistenceFailure(
+                "The journal transition failed while its owned marker remains recovery evidence.", ex));
+        }
+        if (replace.Status != SwitchJournalWriteStatus.Replaced || replace.Entry == null)
+        {
+            return (null, ownedTransitionMarker, replace);
+        }
+
+        // STEP 6: the successor is proven durable — remove the exact owned marker. If the
+        // exact removal fails or the marker was replaced, the successor remains
+        // authoritative but recovery stays blocked until the unresolved marker is
+        // reconciled.
+        GuardedMarkerDeleteResult markerDelete;
+        try
+        {
+            markerDelete = await _journalStore
+                .DeleteTransitionMarkerWhileCanonicalGuardedAsync(replace.Entry, ownedTransitionMarker!, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException)
+        {
+            MarkJournalRecoveryBlocked();
+            return (null, ownedTransitionMarker, SwitchJournalWriteResult.CleanupIncomplete(
+                replace.Entry,
+                $"Guarded transition marker cleanup failed with an exception: {ex.Message}",
+                ex));
+        }
+        if (markerDelete.Status != GuardedMarkerDeleteStatus.Deleted)
+        {
+            MarkJournalRecoveryBlocked();
+            if (markerDelete.Status is GuardedMarkerDeleteStatus.CanonicalAbsent
+                or GuardedMarkerDeleteStatus.CanonicalMismatch
+                or GuardedMarkerDeleteStatus.CanonicalCorrupt)
+            {
+                return (null, ownedTransitionMarker, SwitchJournalWriteResult.PersistenceFailure(
+                    $"The canonical companion could not be guarded during transition marker cleanup ({markerDelete.Status}): {markerDelete.Message}",
+                    markerDelete.Exception));
+            }
+
+            if (markerDelete.Status is GuardedMarkerDeleteStatus.UnsupportedPlatform)
+            {
+                return (null, ownedTransitionMarker, SwitchJournalWriteResult.UnsupportedPlatform(
+                    markerDelete.Message ?? "Guarded marker deletion is not supported on this platform."));
+            }
+
+            if (markerDelete.Status is GuardedMarkerDeleteStatus.MarkerMismatch)
+            {
+                return (null, ownedTransitionMarker, SwitchJournalWriteResult.AlreadyExists(
+                    $"Transition marker mismatch during guarded cleanup: {markerDelete.Message}"));
+            }
+
+            return (null, ownedTransitionMarker, SwitchJournalWriteResult.CleanupIncomplete(
+                replace.Entry,
+                $"The canonical companion was published, but guarded transition marker cleanup did not complete ({markerDelete.Status}): {markerDelete.Message}",
+                markerDelete.Exception));
+        }
+
+        return (replace.Entry, null, replace);
+    }
+
+    private async Task<SwitchJournalWriteResult?> RestoreOwnedMarkerPredecessorAsync(
+        SwitchTransitionMarkerEntry ownedMarker, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var canonical = await _journalStore.ReadAsync(cancellationToken).ConfigureAwait(false);
+            if (canonical.Status == SwitchJournalReadStatus.Absent)
+            {
+                try
+                {
+                    var restored = await _journalStore.CreateIfAbsentAsync(ownedMarker.Expected, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (restored.Status is SwitchJournalWriteStatus.AlreadyExists or SwitchJournalWriteStatus.NotMatched)
+                        return SwitchJournalWriteResult.NotMatched("A canonical occupant won predecessor restoration; it and the owned marker were preserved.");
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // A publish may have landed before reporting failure. Only exact
+                    // readback of our previously durable predecessor authorizes rotation.
+                }
+
+                canonical = await _journalStore.ReadAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (canonical.Status == SwitchJournalReadStatus.Valid && canonical.Entry != null &&
+                SwitchJournalStore.EntriesMatch(canonical.Entry, ownedMarker.Expected))
+                return null;
+
+            return canonical.Status is SwitchJournalReadStatus.Valid or SwitchJournalReadStatus.Corrupt or SwitchJournalReadStatus.UnsupportedVersion
+                ? SwitchJournalWriteResult.NotMatched("The canonical predecessor is not exactly owned; it and the marker were preserved.")
+                : SwitchJournalWriteResult.PersistenceFailure("The canonical predecessor could not be proven durable; the owned marker was retained.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException)
+        {
+            return SwitchJournalWriteResult.PersistenceFailure("Predecessor restoration is uncertain; the owned marker was retained.", ex);
+        }
+    }
+
+    /// <summary>
+    /// Classifies the journal occupying the canonical path after a first-create ownership
+    /// failure, purely for recovery reporting. The occupying bytes are never deleted,
+    /// replaced, or normalized by this transaction.
+    /// </summary>
+    private async Task ClassifyForeignJournalRecoveryStateAsync()
+    {
+        SwitchJournalReadResult read;
+        try
+        {
+            read = await _journalStore.ReadAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            read = SwitchJournalReadResult.IoError(ex);
+        }
+
+        lock (_statusLock)
+        {
+            if (_journalRecoveryState != JournalRecoveryStates.RestartRequired)
+            {
+                _journalRecoveryState = read.Status switch
+                {
+                    SwitchJournalReadStatus.Valid => JournalRecoveryStates.ActionRequired,
+                    SwitchJournalReadStatus.Corrupt or SwitchJournalReadStatus.UnsupportedVersion => JournalRecoveryStates.NotResolvable,
+                    _ => JournalRecoveryStates.Unknown,
+                };
+            }
+        }
+    }
+
+    /// <summary>
+    /// Classifies the marker occupying the marker path after a marker create-if-absent
+    /// ownership failure, purely for recovery reporting. The occupying bytes are never
+    /// deleted, replaced, or normalized by this transaction: a valid or unreadable marker
+    /// is unresolved recovery evidence that blocks admission.
+    /// </summary>
+    private async Task ClassifyForeignMarkerRecoveryStateAsync()
+    {
+        SwitchTransitionMarkerReadResult read;
+        try
+        {
+            read = await _journalStore.ReadTransitionMarkerAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            read = SwitchTransitionMarkerReadResult.IoError(ex);
+        }
+
+        lock (_statusLock)
+        {
+            if (_journalRecoveryState != JournalRecoveryStates.RestartRequired)
+            {
+                _journalRecoveryState = read.Status switch
+                {
+                    SwitchTransitionMarkerReadStatus.Valid => JournalRecoveryStates.ActionRequired,
+                    SwitchTransitionMarkerReadStatus.Corrupt or SwitchTransitionMarkerReadStatus.UnsupportedVersion
+                        => JournalRecoveryStates.NotResolvable,
+                    _ => JournalRecoveryStates.Unknown,
+                };
+            }
+        }
+    }
+
+    /// <summary>
+    /// Deletes the transaction's owned journal entry and its owned transition marker
+    /// conditionally, then proves the canonical journal path AND the marker path clear.
+    /// Ownership starts null and advances only after a journal or marker write successfully
+    /// commits, so a transaction that never wrote evidence performs no cleanup at all and
+    /// unrelated evidence is never touched. Deleting the owned entry is not by itself proof
+    /// of path clearance (a replacement can be written during the comparison/disposition
+    /// window), and neither is deleting the owned marker: a surviving replacement, an
+    /// unresolved marker, or corrupt bytes at either path publish blocking recovery
+    /// immediately; an uncertain readback defers to the transaction-exit proof, which
+    /// re-reads the same disk state and applies its established classification (valid
+    /// journal or marker → ACTION_REQUIRED, corrupt/unsupported → NOT_RESOLVABLE, I/O error
+    /// → UNKNOWN). Terminal RESTART_REQUIRED is never overwritten. Never throws.
+    /// </summary>
+    private async Task<bool> CleanupOwnedJournalEntryAsync(
+        SwitchJournalEntry ownedJournalEntry,
+        SwitchTransitionMarkerEntry? ownedTransitionMarker)
+    {
+        try
+        {
+            var deleteResult = await _journalStore
+                .DeleteIfUnchangedAsync(ownedJournalEntry, CancellationToken.None)
+                .ConfigureAwait(false);
+            if (deleteResult.Status != SwitchJournalDeleteStatus.Deleted)
+            {
+                if (deleteResult.Status == SwitchJournalDeleteStatus.Absent)
+                {
+                    // The owned entry vanished before this cleanup and the remover cannot be
+                    // established; the transaction-exit proof would observe a clean path, so
+                    // the unexpected disappearance must fail closed here.
+                    MarkJournalRecoveryBlocked();
+                }
+
+                return false;
+            }
+
+            if (ownedTransitionMarker != null)
+            {
+                var markerDelete = await _journalStore
+                    .DeleteTransitionMarkerIfUnchangedAsync(ownedTransitionMarker, CancellationToken.None)
+                    .ConfigureAwait(false);
+                if (markerDelete.Status != SwitchTransitionMarkerDeleteStatus.Deleted &&
+                    markerDelete.Status != SwitchTransitionMarkerDeleteStatus.Absent)
+                {
+                    // The exact owned marker could not be removed (replaced, corrupt, or
+                    // I/O uncertainty): the surviving marker keeps recovery blocked.
+                    MarkJournalRecoveryBlocked();
+                    return false;
+                }
+            }
+
+            var postCleanup = await _journalStore.ReadAsync(CancellationToken.None).ConfigureAwait(false);
+            if (postCleanup.Status != SwitchJournalReadStatus.Absent)
+            {
+                if (postCleanup.Status == SwitchJournalReadStatus.Valid)
+                {
+                    MarkJournalRecoveryBlocked();
+                }
+
+                return false;
+            }
+
+            return await IsTransitionMarkerAbsentAfterCleanupAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Proves the marker path clear after cleanup and classifies surviving evidence.
+    /// Returns true only when the marker is genuinely absent.
+    /// </summary>
+    private async Task<bool> IsTransitionMarkerAbsentAfterCleanupAsync()
+    {
+        try
+        {
+            var markerRead = await _journalStore
+                .ReadTransitionMarkerAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+            if (markerRead.Status == SwitchTransitionMarkerReadStatus.Absent)
+            {
+                return true;
+            }
+
+            if (markerRead.Status is SwitchTransitionMarkerReadStatus.Corrupt
+                or SwitchTransitionMarkerReadStatus.UnsupportedVersion)
+            {
+                lock (_statusLock)
+                {
+                    if (_journalRecoveryState != JournalRecoveryStates.RestartRequired)
+                    {
+                        _journalRecoveryState = JournalRecoveryStates.NotResolvable;
+                    }
+                }
+            }
+            else if (markerRead.Status == SwitchTransitionMarkerReadStatus.Valid)
+            {
+                MarkJournalRecoveryBlocked();
+            }
+            else if (markerRead.Status == SwitchTransitionMarkerReadStatus.IoError)
+            {
+                lock (_statusLock)
+                {
+                    if (_journalRecoveryState != JournalRecoveryStates.RestartRequired &&
+                        _journalRecoveryState == JournalRecoveryStates.None)
+                    {
+                        _journalRecoveryState = JournalRecoveryStates.Unknown;
+                    }
+                }
+            }
+
+            return false;
+        }
+        catch (Exception)
+        {
+            lock (_statusLock)
+            {
+                if (_journalRecoveryState == JournalRecoveryStates.None)
+                {
+                    _journalRecoveryState = JournalRecoveryStates.Unknown;
+                }
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deleting the proved entry (and any cleanup marker) does not by itself prove the
+    /// recovery evidence paths clear: a replacement can be written at either path during
+    /// the comparison/disposition window. Resolution may declare success only when the
+    /// canonical journal AND the transition marker are genuinely absent afterwards.
+    /// </summary>
+    private async Task<JournalResolutionResult?> GetRecoveryEvidenceClearanceFailureAsync(bool unexpectedAbsence = false)
+    {
+        SwitchJournalReadResult canonical;
+        SwitchTransitionMarkerReadResult marker;
+        using var deadline = new CancellationTokenSource(_transactionTimeout);
+        try
+        {
+            canonical = await _journalStore.ReadAsync(deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            canonical = SwitchJournalReadResult.IoError(ex);
+        }
+        try
+        {
+            marker = await _journalStore.ReadTransitionMarkerAsync(deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            marker = SwitchTransitionMarkerReadResult.IoError(ex);
+        }
+
+        if (marker.Status is SwitchTransitionMarkerReadStatus.Corrupt or SwitchTransitionMarkerReadStatus.UnsupportedVersion)
+            return new JournalResolutionResult(JournalResolutionStatus.NotResolvable,
+                "The transition marker cannot be classified as supported recovery evidence.", ReasonCode: "CORRUPT_TRANSITION_MARKER");
+        if (canonical.Status is SwitchJournalReadStatus.Corrupt or SwitchJournalReadStatus.UnsupportedVersion)
+            return new JournalResolutionResult(JournalResolutionStatus.NotResolvable,
+                "The canonical journal cannot be classified as supported recovery evidence.", ReasonCode: "CORRUPT_JOURNAL");
+        if (canonical.Status == SwitchJournalReadStatus.IoError || marker.Status == SwitchTransitionMarkerReadStatus.IoError)
+            return new JournalResolutionResult(JournalResolutionStatus.PersistenceFailure,
+                "Joint recovery-evidence clearance could not be read reliably.", ReasonCode: "IO_ERROR");
+        if (canonical.Status == SwitchJournalReadStatus.Absent && marker.Status == SwitchTransitionMarkerReadStatus.Absent &&
+            !unexpectedAbsence)
+            return null;
+
+        // Unexpected disappearance has no attributable cleanup owner, even when both
+        // names are now absent. A subsequent explicit resolution may prove a clean pair.
+        return new JournalResolutionResult(JournalResolutionStatus.ProofFailed,
+            "Recovery evidence changed during resolution; both paths must be reconciled before switching resumes.",
+            ReasonCode: "CONCURRENT_MUTATION");
+    }
+
+    private void MarkJournalRecoveryBlocked()
+    {
+        lock (_statusLock)
+        {
+            if (_journalRecoveryState != JournalRecoveryStates.RestartRequired)
+            {
+                _journalRecoveryState = JournalRecoveryStates.ActionRequired;
+            }
+        }
     }
 
     private async Task<List<AccountModelQuotaObservation>> VerifyTargetQuotaAsync(
@@ -1910,6 +3490,17 @@ public sealed class NativeAccountSwitchCoordinator : INativeAccountSwitchCoordin
     {
         public string Code { get; }
         public SwitchRejectedException(string code, string message) : base(message) => Code = code;
+    }
+
+    /// <summary>
+    /// The transaction lost ownership of its journal (a foreign/replacement entry occupies
+    /// the canonical path, or the owned entry vanished). Thrown only from awaited
+    /// transaction states; the general failure path routes into verified compensation while
+    /// all further journal writes are suppressed and the foreign journal remains canonical.
+    /// </summary>
+    private sealed class SwitchJournalOwnershipLostException : Exception
+    {
+        public SwitchJournalOwnershipLostException(string message) : base(message) { }
     }
 }
 

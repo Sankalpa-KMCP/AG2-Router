@@ -31,7 +31,8 @@ public record RouterStatusDto(
     string? PendingTargetAccountId,
     string? LastEvaluatedAt,
     string? LastDecisionReason,
-    RouterConfigDto Config
+    RouterConfigDto Config,
+    CandidatePoolStatusDto? PoolStatus = null
 );
 
 public record RouterConfigDto(
@@ -44,7 +45,8 @@ public record RouterConfigDto(
 
 // Read-only projection of the same durable evidence used by automatic routing.
 public record CandidateEvidenceStatusDto(string? ModelKey, int MinimumCandidateQuotaPercent,
-    bool Available, IReadOnlyList<CandidateQuotaStatusDto> Candidates);
+    bool Available, IReadOnlyList<CandidateQuotaStatusDto> Candidates,
+    CandidatePoolStatusDto? PoolStatus = null);
 
 public record CandidateQuotaStatusDto(string AccountId, string State,
     double? RemainingFraction, DateTimeOffset? ObservedAtUtc, double? AgeSeconds);

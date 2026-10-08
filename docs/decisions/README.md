@@ -36,6 +36,9 @@ Current records:
 | [ADR-002](ADR-002-native-dotnet-runtime.md) | Adopt native .NET/WPF runtime instead of Electron or a Node daemon | Accepted |
 | [ADR-003](ADR-003-documentation-governance.md) | Documentation governance — understanding layer, mandatory gates, and decision records | Accepted |
 | [ADR-004](ADR-004-use-mit-license.md) | Use MIT License for AG2 Router | Accepted |
+| [ADR-005](ADR-005-target-activation-provenance.md) | Persist target-activation provenance in the switch journal | Accepted (implemented) |
+| [ADR-006](ADR-006-recorded-source-runtime-coherence-recovery.md) | RECORDED journal cleanup requires source-runtime coherence | Accepted (implemented) |
+| [ADR-007](ADR-007-evidence-revision-and-pool-status-authority.md) | Durable evidence revision and authoritative pool-status publication | Accepted (implemented) |
 
 When adding an ADR, add its row to this table in the same change.
 

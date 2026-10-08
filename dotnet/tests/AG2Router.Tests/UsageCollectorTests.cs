@@ -452,6 +452,16 @@ public class UsageCollectorTests
         var accountId = forward.AccountId;
         Assert.False(string.IsNullOrWhiteSpace(accountId));
         Assert.Equal((await harness.Accounts.GetAccountByEmailAsync("user@example.com"))!.Id, accountId);
+
+        // Crucial L3 invariant: corrupt checkpoint bytes must NOT be overwritten by the successful cycle save!
+        Assert.Equal("{ corrupt", await File.ReadAllTextAsync(statePath));
+        Assert.Contains("Usage checkpoint save failed", string.Join(Environment.NewLine, harness.Logs));
+
+        // Subsequent cycle: still detects corrupt checkpoint, does NOT destroy it, continues recording ledger
+        var cycle3Diag = await service.RunCollectionCycleAsync();
+        Assert.NotNull(cycle3Diag.LastError);
+        Assert.Contains("checkpoint", cycle3Diag.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("{ corrupt", await File.ReadAllTextAsync(statePath));
     }
 
     [Fact]

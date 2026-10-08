@@ -45,6 +45,7 @@ public static class CandidateSelector
         double lowThresholdFraction = config.LowQuotaThresholdPercent / 100.0;
         double minCandidateFraction = config.MinimumCandidateQuotaPercent / 100.0;
         bool requiresModelEvidence = relevantModelKeys != null && relevantModelKeys.Count > 0;
+        DateTimeOffset now = evaluationTimeUtc ?? DateTimeOffset.UtcNow;
 
         if (currentAccountId == null ||
             !currentQuotaFraction.HasValue || !double.IsFinite(currentQuotaFraction.Value))
@@ -105,7 +106,6 @@ public static class CandidateSelector
                 }
                 else
                 {
-                    DateTimeOffset now = evaluationTimeUtc ?? DateTimeOffset.UtcNow;
                     string reqKey = relevantModelKeys!.First();
                     string? canonicalReqKey = CanonicalizeModelKey(reqKey);
 
@@ -302,11 +302,22 @@ public static class CandidateSelector
         // 3. Filter eligible candidates
         var eligible = evaluations.Where(e => e.IsEligible).ToList();
 
+        var poolStatus = AssessPoolStatus(
+            currentAccountId,
+            accounts,
+            evaluations,
+            config,
+            now,
+            vaultedAccountIds,
+            cooldownAccountIds,
+            candidateModelObservations,
+            accountModelQuotas);
+
         if (eligible.Count == 0)
         {
             string noCandidateReason = evaluations.Count == 0
-                ? "No secondary accounts are registered in the store."
-                : $"No candidate accounts meet the minimum quota threshold ({config.MinimumCandidateQuotaPercent}%).";
+                ? poolStatus.Message
+                : $"No candidate accounts meet the minimum quota threshold ({config.MinimumCandidateQuotaPercent}%). {poolStatus.Message}";
 
             return new SelectionResult(
                 ShouldSwitch: false,
@@ -314,7 +325,8 @@ public static class CandidateSelector
                 CurrentAccountId: currentAccountId,
                 CurrentQuotaFraction: currentQuotaFraction,
                 BestCandidate: null,
-                Candidates: evaluations
+                Candidates: evaluations,
+                PoolStatus: poolStatus
             );
         }
 
@@ -357,7 +369,286 @@ public static class CandidateSelector
             CurrentAccountId: currentAccountId,
             CurrentQuotaFraction: currentQuotaFraction,
             BestCandidate: best,
-            Candidates: evaluations
+            Candidates: evaluations,
+            PoolStatus: poolStatus
         );
+    }
+
+    public static CandidatePoolStatusDto AssessPoolStatus(
+        string? currentAccountId,
+        IReadOnlyList<AccountMetadata> accounts,
+        IReadOnlyList<CandidateEvaluation> evaluations,
+        RouterConfigDto config,
+        DateTimeOffset now,
+        ISet<string>? vaultedAccountIds = null,
+        ISet<string>? cooldownAccountIds = null,
+        IReadOnlyDictionary<string, AccountModelQuotaObservation>? candidateModelObservations = null,
+        IReadOnlyDictionary<string, IReadOnlyList<ModelQuotaDto>>? accountModelQuotas = null)
+    {
+        var alternatives = accounts.Where(a => a.Id != currentAccountId).ToList();
+        int enrolledCount = alternatives.Count;
+
+        if (enrolledCount == 0)
+        {
+            return new CandidatePoolStatusDto(
+                HasUsableCandidate: false,
+                ReasonCode: CandidatePoolReasonCodes.NoEnrolledAlternatives,
+                Message: "No secondary accounts are registered in the store.",
+                EnrolledCandidatesCount: 0,
+                EligibleCandidatesCount: 0,
+                UsableCandidatesCount: 0,
+                EarliestResetTime: null
+            );
+        }
+
+        var eligible = evaluations.Where(e => e.IsEligible).ToList();
+        int usableCount = eligible.Count;
+
+        int credentialEligibleCount = alternatives.Count(a =>
+            !string.Equals(a.ValidationStatus, "EXPIRED", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(a.ValidationStatus, "FAILED", StringComparison.OrdinalIgnoreCase) &&
+            (vaultedAccountIds != null ? vaultedAccountIds.Contains(a.Id) : a.HasVaultedSession) &&
+            (cooldownAccountIds == null || !cooldownAccountIds.Contains(a.Id)));
+
+        if (usableCount > 0)
+        {
+            bool allUsableAreReserve = eligible.All(e => e.Account.IsReserve);
+            string reasonCode = allUsableAreReserve
+                ? CandidatePoolReasonCodes.ReserveOnly
+                : CandidatePoolReasonCodes.Ready;
+
+            string message = allUsableAreReserve
+                ? $"Usable candidate available from reserve accounts ({eligible.Count} usable)."
+                : $"Usable candidates available ({eligible.Count} usable out of {enrolledCount} enrolled).";
+
+            return new CandidatePoolStatusDto(
+                HasUsableCandidate: true,
+                ReasonCode: reasonCode,
+                Message: message,
+                EnrolledCandidatesCount: enrolledCount,
+                EligibleCandidatesCount: credentialEligibleCount,
+                UsableCandidatesCount: usableCount,
+                EarliestResetTime: null
+            );
+        }
+
+        // usableCount == 0: No usable candidate exists.
+        // 1. Did all alternative accounts fail validation or lack a vaulted session?
+        bool anyVaultedAndValid = alternatives.Any(a =>
+            !string.Equals(a.ValidationStatus, "EXPIRED", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(a.ValidationStatus, "FAILED", StringComparison.OrdinalIgnoreCase) &&
+            (vaultedAccountIds != null ? vaultedAccountIds.Contains(a.Id) : a.HasVaultedSession));
+
+        if (!anyVaultedAndValid)
+        {
+            return new CandidatePoolStatusDto(
+                HasUsableCandidate: false,
+                ReasonCode: CandidatePoolReasonCodes.ValidationOrSessionFailed,
+                Message: "All candidate accounts fail validation or lack a vaulted session.",
+                EnrolledCandidatesCount: enrolledCount,
+                EligibleCandidatesCount: 0,
+                UsableCandidatesCount: 0,
+                EarliestResetTime: null
+            );
+        }
+
+        // 2. Are all candidate accounts with valid sessions in cooldown?
+        var validSessionAccounts = alternatives.Where(a =>
+            !string.Equals(a.ValidationStatus, "EXPIRED", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(a.ValidationStatus, "FAILED", StringComparison.OrdinalIgnoreCase) &&
+            (vaultedAccountIds != null ? vaultedAccountIds.Contains(a.Id) : a.HasVaultedSession)).ToList();
+
+        if (validSessionAccounts.Count > 0 && validSessionAccounts.All(a => cooldownAccountIds != null && cooldownAccountIds.Contains(a.Id)))
+        {
+            return new CandidatePoolStatusDto(
+                HasUsableCandidate: false,
+                ReasonCode: CandidatePoolReasonCodes.AllInCooldown,
+                Message: "All eligible candidate accounts are currently in cooldown.",
+                EnrolledCandidatesCount: enrolledCount,
+                EligibleCandidatesCount: 0,
+                UsableCandidatesCount: 0,
+                EarliestResetTime: null
+            );
+        }
+
+        // 3. Are all candidate accounts reserve-only?
+        if (alternatives.All(a => a.IsReserve))
+        {
+            return new CandidatePoolStatusDto(
+                HasUsableCandidate: false,
+                ReasonCode: CandidatePoolReasonCodes.ReserveOnly,
+                Message: "All candidate accounts are reserve-only.",
+                EnrolledCandidatesCount: enrolledCount,
+                EligibleCandidatesCount: credentialEligibleCount,
+                UsableCandidatesCount: 0,
+                EarliestResetTime: null
+            );
+        }
+
+        // 4. Quota evidence classification for accounts that are valid and not in cooldown:
+        var structurallyEligibleCandidateIds = alternatives
+            .Where(a => !string.Equals(a.ValidationStatus, "EXPIRED", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(a.ValidationStatus, "FAILED", StringComparison.OrdinalIgnoreCase) &&
+                        (vaultedAccountIds != null ? vaultedAccountIds.Contains(a.Id) : a.HasVaultedSession))
+            .Select(a => a.Id)
+            .ToHashSet(StringComparer.Ordinal);
+
+        string? earliestReset = FindEarliestResetTime(
+            candidateModelObservations,
+            accountModelQuotas,
+            now,
+            structurallyEligibleCandidateIds);
+
+        bool allStaleOrUnknown = true;
+        bool allExhausted = true;
+        bool allBelowMinimum = true;
+        int evaluatedWithEvidence = 0;
+
+        foreach (var eval in evaluations)
+        {
+            if (eval.IneligibilityReason != null &&
+                (eval.IneligibilityReason.Contains("validation", StringComparison.OrdinalIgnoreCase) ||
+                 eval.IneligibilityReason.Contains("vaulted", StringComparison.OrdinalIgnoreCase) ||
+                 eval.IneligibilityReason.Contains("cooldown", StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            evaluatedWithEvidence++;
+            bool isExhausted = (eval.IneligibilityReason != null &&
+                               (eval.IneligibilityReason.Contains("exhausted", StringComparison.OrdinalIgnoreCase) ||
+                                eval.IneligibilityReason.Contains("reset-provisional", StringComparison.OrdinalIgnoreCase))) ||
+                               eval.RemainingFraction <= 0.0;
+            bool isBelowMin = (eval.IneligibilityReason != null &&
+                              eval.IneligibilityReason.Contains("below minimum", StringComparison.OrdinalIgnoreCase)) ||
+                              (eval.RemainingFraction > 0.0 && eval.RemainingFraction < (config.MinimumCandidateQuotaPercent / 100.0));
+            bool isStaleOrUnknown = eval.IneligibilityReason != null &&
+                                    (eval.IneligibilityReason.Contains("unknown", StringComparison.OrdinalIgnoreCase) ||
+                                     eval.IneligibilityReason.Contains("stale", StringComparison.OrdinalIgnoreCase) ||
+                                     eval.IneligibilityReason.Contains("future-dated", StringComparison.OrdinalIgnoreCase));
+
+            if (!isStaleOrUnknown) allStaleOrUnknown = false;
+            if (!isExhausted) allExhausted = false;
+            if (!isBelowMin) allBelowMinimum = false;
+        }
+
+        if (evaluatedWithEvidence == 0 || allStaleOrUnknown)
+        {
+            return new CandidatePoolStatusDto(
+                HasUsableCandidate: false,
+                ReasonCode: CandidatePoolReasonCodes.EvidenceStaleOrUnknown,
+                Message: "Candidate accounts exist but quota observations are stale or unknown.",
+                EnrolledCandidatesCount: enrolledCount,
+                EligibleCandidatesCount: credentialEligibleCount,
+                UsableCandidatesCount: 0,
+                EarliestResetTime: null
+            );
+        }
+
+        if (allExhausted)
+        {
+            string msg = earliestReset != null
+                ? $"All candidate accounts are quota-exhausted (earliest reset expected at {earliestReset})."
+                : "All candidate accounts are quota-exhausted.";
+
+            return new CandidatePoolStatusDto(
+                HasUsableCandidate: false,
+                ReasonCode: CandidatePoolReasonCodes.AllExhausted,
+                Message: msg,
+                EnrolledCandidatesCount: enrolledCount,
+                EligibleCandidatesCount: credentialEligibleCount,
+                UsableCandidatesCount: 0,
+                EarliestResetTime: earliestReset
+            );
+        }
+
+        if (allBelowMinimum)
+        {
+            string msg = earliestReset != null
+                ? $"All candidate accounts with fresh evidence are below the minimum candidate threshold ({config.MinimumCandidateQuotaPercent}%) (earliest reset expected at {earliestReset})."
+                : $"All candidate accounts with fresh evidence are below the minimum candidate threshold ({config.MinimumCandidateQuotaPercent}%).";
+
+            return new CandidatePoolStatusDto(
+                HasUsableCandidate: false,
+                ReasonCode: CandidatePoolReasonCodes.AllBelowMinimum,
+                Message: msg,
+                EnrolledCandidatesCount: enrolledCount,
+                EligibleCandidatesCount: credentialEligibleCount,
+                UsableCandidatesCount: 0,
+                EarliestResetTime: earliestReset
+            );
+        }
+
+        // Mixture of exhausted and below minimum:
+        string depletedMsg = earliestReset != null
+            ? $"All candidate accounts with fresh evidence are exhausted or below the minimum threshold ({config.MinimumCandidateQuotaPercent}%) (earliest reset expected at {earliestReset})."
+            : $"All candidate accounts with fresh evidence are exhausted or below the minimum threshold ({config.MinimumCandidateQuotaPercent}%).";
+
+        return new CandidatePoolStatusDto(
+            HasUsableCandidate: false,
+            ReasonCode: CandidatePoolReasonCodes.QuotaDepleted,
+            Message: depletedMsg,
+            EnrolledCandidatesCount: enrolledCount,
+            EligibleCandidatesCount: credentialEligibleCount,
+            UsableCandidatesCount: 0,
+            EarliestResetTime: earliestReset
+        );
+    }
+
+    public static string? FindEarliestResetTime(
+        IReadOnlyDictionary<string, AccountModelQuotaObservation>? candidateModelObservations,
+        IReadOnlyDictionary<string, IReadOnlyList<ModelQuotaDto>>? accountModelQuotas,
+        DateTimeOffset now,
+        IReadOnlySet<string>? eligibleAccountIds = null)
+    {
+        var candidates = new List<(string Raw, DateTimeOffset Parsed)>();
+
+        if (candidateModelObservations != null)
+        {
+            foreach (var kvp in candidateModelObservations)
+            {
+                var obs = kvp.Value;
+                if (obs == null) continue;
+                string accountId = !string.IsNullOrWhiteSpace(obs.AccountId) ? obs.AccountId : kvp.Key;
+                if (eligibleAccountIds != null && !eligibleAccountIds.Contains(accountId))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(obs.ResetTime) &&
+                    DateTimeOffset.TryParse(obs.ResetTime, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dt) &&
+                    dt > now)
+                {
+                    candidates.Add((obs.ResetTime.Trim(), dt));
+                }
+            }
+        }
+
+        if (accountModelQuotas != null)
+        {
+            foreach (var kvp in accountModelQuotas)
+            {
+                string accountId = kvp.Key;
+                if (eligibleAccountIds != null && !eligibleAccountIds.Contains(accountId))
+                {
+                    continue;
+                }
+
+                var models = kvp.Value;
+                if (models == null) continue;
+                foreach (var m in models)
+                {
+                    if (!string.IsNullOrWhiteSpace(m?.ResetTime) &&
+                        DateTimeOffset.TryParse(m.ResetTime, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dt) &&
+                        dt > now)
+                    {
+                        candidates.Add((m.ResetTime!.Trim(), dt));
+                    }
+                }
+            }
+        }
+
+        if (candidates.Count == 0) return null;
+        return candidates.MinBy(c => c.Parsed).Raw;
     }
 }

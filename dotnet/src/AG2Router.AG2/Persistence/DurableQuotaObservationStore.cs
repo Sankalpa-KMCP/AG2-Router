@@ -25,6 +25,19 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
     private readonly string _filePath;
     private readonly SemaphoreSlim _pathLock;
     private readonly IDurableFileWriter _fileWriter;
+    private long _knownObservationRevision = -1;
+
+    public long? KnownObservationRevision
+    {
+        get
+        {
+            long revision = Volatile.Read(ref _knownObservationRevision);
+            return revision < 0 ? null : revision;
+        }
+    }
+
+    private void ObserveCommittedRevision(DateTimeOffset updatedAt) =>
+        Volatile.Write(ref _knownObservationRevision, updatedAt.UtcDateTime.Ticks);
 
     public DurableQuotaObservationStore(string? filePath = null)
         : this(filePath, new DurableFileWriter())
@@ -74,7 +87,7 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var items = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
+            var (_, items) = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
             return items.AsReadOnly();
         }
         finally
@@ -92,7 +105,7 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var items = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
+            var (_, items) = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
             return items.Where(o => string.Equals(o.AccountId, accountId.Trim(), StringComparison.Ordinal)).ToList().AsReadOnly();
         }
         finally
@@ -113,10 +126,46 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var items = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
+            var (_, items) = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
             return items.FirstOrDefault(o =>
                 string.Equals(o.AccountId, accountId.Trim(), StringComparison.Ordinal) &&
                 string.Equals(o.ModelKey, canonicalKey, StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Reads the observation rows and the durable evidence revision they were read at from
+    /// one consistent load. The revision is the durable document timestamp's UTC ticks, which every
+    /// mutation writes strictly monotonically, so it changes across all shipped writers and
+    /// store instances (including readers in other processes) and is stable across
+    /// non-mutating reads.
+    /// </summary>
+    public async Task<QuotaObservationSnapshot> GetObservationSnapshotAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var (updatedAt, items) = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
+            return new QuotaObservationSnapshot(items.AsReadOnly(), updatedAt.UtcDateTime.Ticks);
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
+    }
+
+    public async Task<long> GetObservationRevisionAsync(CancellationToken cancellationToken = default)
+    {
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var (updatedAt, _) = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
+            return updatedAt.UtcDateTime.Ticks;
         }
         finally
         {
@@ -193,7 +242,7 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         try
         {
             await using var lease = await CrossProcessFileLease.AcquireAsync(_filePath, cancellationToken).ConfigureAwait(false);
-            var existingItems = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
+            var (previousUpdatedAt, existingItems) = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
 
             if (completeSnapshotTime.HasValue)
             {
@@ -226,12 +275,13 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
 
             var doc = new QuotaObservationsDocument(
                 schemaVersion: CurrentSchemaVersion,
-                updatedAt: DateTimeOffset.UtcNow,
+                updatedAt: StrictlyAfter(DateTimeOffset.UtcNow, previousUpdatedAt),
                 observations: mergedList
             );
 
             string json = JsonSerializer.Serialize(doc, JsonOptions);
             await _fileWriter.WriteAtomicAsync(_filePath, json, cancellationToken).ConfigureAwait(false);
+            ObserveCommittedRevision(doc.UpdatedAt);
         }
         finally
         {
@@ -239,11 +289,22 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         }
     }
 
-    private async Task<List<AccountModelQuotaObservation>> LoadStateAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Returns the durable document timestamp for a new mutation. The document timestamp
+    /// doubles as the evidence revision, so it must strictly increase on every committed
+    /// mutation even when the proposed time equals a previous one (same-tick writes or
+    /// caller-supplied timestamps clamped by the never-move-backwards rule). Normalize
+    /// before advancing so an offset-local maximum does not exhaust the UTC tick range.
+    /// </summary>
+    private static DateTimeOffset StrictlyAfter(DateTimeOffset proposed, DateTimeOffset previous) =>
+        proposed > previous ? proposed.ToUniversalTime() : previous.ToUniversalTime().AddTicks(1);
+
+    private async Task<(DateTimeOffset UpdatedAt, List<AccountModelQuotaObservation> Items)> LoadStateAsync(CancellationToken cancellationToken)
     {
         if (!File.Exists(_filePath))
         {
-            return new List<AccountModelQuotaObservation>();
+            ObserveCommittedRevision(DateTimeOffset.MinValue);
+            return (DateTimeOffset.MinValue, new List<AccountModelQuotaObservation>());
         }
 
         string text;
@@ -300,7 +361,9 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
                 throw new InvalidDataException("Quota observation store contains entry with empty Source.");
         }
 
-        return QuotaObservationEvidence.Consolidate(doc.Observations).ToList();
+        var items = QuotaObservationEvidence.Consolidate(doc.Observations).ToList();
+        ObserveCommittedRevision(doc.UpdatedAt);
+        return (doc.UpdatedAt, items);
     }
 
     public async Task InvalidateIfUnchangedAsync(AccountModelQuotaObservation expected, DateTimeOffset invalidatedAtUtc,
@@ -310,14 +373,62 @@ public sealed class DurableQuotaObservationStore : IQuotaObservationStore
         try
         {
             await using var lease = await CrossProcessFileLease.AcquireAsync(_filePath, cancellationToken).ConfigureAwait(false);
-            var items = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
+            var (previousUpdatedAt, items) = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
             int index = items.FindIndex(o => o.AccountId == expected.AccountId && o.ModelKey == expected.ModelKey);
             if (index < 0 || items[index] != expected) return;
             items[index] = new AccountModelQuotaObservation(expected.AccountId, expected.ModelKey, null, null,
                 invalidatedAtUtc < expected.ObservedAtUtc ? expected.ObservedAtUtc : invalidatedAtUtc, "LiveTargetVerificationRejected");
-            var document = new QuotaObservationsDocument(CurrentSchemaVersion, invalidatedAtUtc, items);
+            var document = new QuotaObservationsDocument(CurrentSchemaVersion,
+                StrictlyAfter(invalidatedAtUtc, previousUpdatedAt), items);
             await _fileWriter.WriteAtomicAsync(_filePath, JsonSerializer.Serialize(document, JsonOptions), cancellationToken).ConfigureAwait(false);
+            ObserveCommittedRevision(document.UpdatedAt);
         }
         finally { _pathLock.Release(); }
+    }
+
+    public async Task InvalidateObservationsForAccountAsync(
+        string accountId,
+        DateTimeOffset invalidatedAtUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(accountId)) return;
+        string normalizedAccountId = accountId.Trim();
+
+        await _pathLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var lease = await CrossProcessFileLease.AcquireAsync(_filePath, cancellationToken).ConfigureAwait(false);
+            var (previousUpdatedAt, items) = await LoadStateAsync(cancellationToken).ConfigureAwait(false);
+            bool modified = false;
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i];
+                if (string.Equals(item.AccountId, normalizedAccountId, StringComparison.Ordinal))
+                {
+                    if (item.RemainingFraction != null || item.ResetTime != null || !string.Equals(item.Source, "LiveTargetVerificationRejected", StringComparison.Ordinal))
+                    {
+                        items[i] = new AccountModelQuotaObservation(
+                            item.AccountId,
+                            item.ModelKey,
+                            null,
+                            null,
+                            invalidatedAtUtc < item.ObservedAtUtc ? item.ObservedAtUtc : invalidatedAtUtc,
+                            "LiveTargetVerificationRejected");
+                        modified = true;
+                    }
+                }
+            }
+
+            if (!modified) return;
+
+            var document = new QuotaObservationsDocument(CurrentSchemaVersion,
+                StrictlyAfter(invalidatedAtUtc, previousUpdatedAt), items);
+            await _fileWriter.WriteAtomicAsync(_filePath, JsonSerializer.Serialize(document, JsonOptions), cancellationToken).ConfigureAwait(false);
+            ObserveCommittedRevision(document.UpdatedAt);
+        }
+        finally
+        {
+            _pathLock.Release();
+        }
     }
 }

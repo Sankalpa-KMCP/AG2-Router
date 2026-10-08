@@ -94,11 +94,22 @@ export interface CandidateQuotaStatusDto {
   ageSeconds: number | null;
 }
 
+export interface CandidatePoolStatusDto {
+  hasUsableCandidate: boolean;
+  reasonCode: string;
+  message: string;
+  enrolledCandidatesCount: number;
+  eligibleCandidatesCount: number;
+  usableCandidatesCount: number;
+  earliestResetTime?: string | null;
+}
+
 export interface CandidateEvidenceStatusDto {
   modelKey: string | null;
   minimumCandidateQuotaPercent: number;
   available: boolean;
   candidates: CandidateQuotaStatusDto[];
+  poolStatus?: CandidatePoolStatusDto | null;
 }
 
 export interface RouterStatusDto {
@@ -110,6 +121,7 @@ export interface RouterStatusDto {
   lastEvaluatedAt?: string | null;
   lastDecisionReason?: string | null;
   config?: RouterConfigDto;
+  poolStatus?: CandidatePoolStatusDto | null;
 }
 
 export interface TelemetrySnapshotDto {
@@ -145,6 +157,27 @@ export interface SwitchStatusDto {
   } | null;
   quarantineActive?: boolean;
   journalRecoveryState?: JournalRecoveryState;
+}
+
+export interface SwitchPlanResultDto {
+  targetAccountId: string;
+  targetEmail?: string | null;
+  targetExists: boolean;
+  isEligible: boolean;
+  hasVaultedSession: boolean;
+  isAlreadyActive: boolean;
+  isReserve: boolean;
+  systemState: string;
+  safetyState: string;
+  workloadModelKey?: string | null;
+  targetQuotaPercent?: number | null;
+  quotaStatus: string;
+  observationAgeSeconds?: number | null;
+  inCooldown: boolean;
+  ineligibilityReason?: string | null;
+  admissible: boolean;
+  reasonCode: string;
+  message: string;
 }
 
 export type JournalResolutionStatus =

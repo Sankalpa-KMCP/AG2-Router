@@ -84,7 +84,10 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
     [InlineData(true, true)]
     public async Task Resolution_LeaseCleanup_PreservesThrownFailureAndCancellation(bool cancel, bool cleanupFails)
     {
-        await SeedJournalAsync(SwitchJournalState.RECORDED, "synthetic-source", "synthetic-target");
+        // A coherent source is required to reach the RECORDED delete path.
+        await SeedAccountsAsync();
+        _adapter.Identity = new AccountIdentityDto(_source!.Email);
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
         using var cts = new CancellationTokenSource();
         Exception primary = cancel ? new OperationCanceledException(cts.Token) : new IOException("Primary delete failure.");
         _journal.DeleteIfUnchangedBehavior = (_, _) =>
@@ -691,16 +694,33 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
         pathLock.Release();
     }
 
-    // 24. ResolveQuarantinedJournal_WhenRecordedState_PerformsCleanCleanup_WithoutPillarProofs
+    // 24. ResolveQuarantinedJournal_WhenRecordedState_RequiresSourceCoherenceBeforeCleanup
     [Fact]
-    public async Task ResolveQuarantinedJournal_WhenRecordedState_PerformsCleanCleanup_WithoutPillarProofs()
+    public async Task ResolveQuarantinedJournal_WhenRecordedState_AndSourceRuntimeUnproven_RetainsJournal()
     {
         await SeedAccountsAsync();
         await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
 
-        // Break live identity and WinCred to prove RECORDED cleanup does NOT require pillar proofs
+        // The source runtime is absent/unavailable (no live identity to prove), which a
+        // crash after the RECORDED write and source stop can produce. Cleanup must be blocked.
         _adapter.Identity = null;
-        _credentials.Clear();
+
+        var coordinator = CreateCoordinator();
+        var result = await coordinator.ResolveQuarantinedJournalAsync();
+
+        Assert.Equal(JournalResolutionStatus.ProofFailed, result.Status);
+        Assert.Equal("SOURCE_RUNTIME_UNPROVEN", result.ReasonCode);
+        Assert.True(File.Exists(_journal.JournalFilePath));
+    }
+
+    [Fact]
+    public async Task ResolveQuarantinedJournal_WhenRecordedState_AndSourceRuntimeCoherent_PerformsCleanCleanup()
+    {
+        await SeedAccountsAsync();
+        await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
+
+        // Source runtime is alive and bound to the source identity: safe to clean.
+        _adapter.Identity = new AccountIdentityDto(_source.Email);
 
         var coordinator = CreateCoordinator();
         var result = await coordinator.ResolveQuarantinedJournalAsync();
@@ -922,6 +942,7 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
     public async Task ResolveQuarantinedJournal_WhenRecordedState_AndDeleteReturnsUnsupportedPlatform_ReturnsPersistenceFailureWithRestartRequiredFalse()
     {
         await SeedAccountsAsync();
+        _adapter.Identity = new AccountIdentityDto(_source!.Email);
         await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
 
         _journal.DeleteIfUnchangedBehavior = (entry, ct) =>
@@ -994,6 +1015,7 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
     public async Task CleanCleanupRetry_AfterDeletionFailure_ReportsRestartAndPreservesQuarantine()
     {
         await SeedAccountsAsync();
+        _adapter.Identity = new AccountIdentityDto(_source!.Email);
         await SeedJournalAsync(SwitchJournalState.RECORDED, _source!.Id, _target!.Id);
         var coordinator = CreateCoordinator();
         _journal.FailOnDelete = true;
@@ -1026,6 +1048,8 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
         SwitchJournalState journalState, bool automatic)
     {
         await SeedAccountsAsync();
+        // A proven source runtime is required for the RECORDED case to reach its delete path.
+        _adapter.Identity = new AccountIdentityDto(_source!.Email);
         await SeedJournalAsync(journalState, _source!.Id, _target!.Id);
         _journal.FailOnDelete = true;
 
@@ -1393,6 +1417,38 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
 
     // Test doubles & spies
 
+    [Fact]
+    public async Task Resolution_CommittedPrecommitDeleteAbsent_RetainsSidecarAndBlocks()
+    {
+        await SeedAccountsAsync();
+        await _accounts.SetActiveAccountIdAsync(_target!.Id);
+        await SeedJournalAsync(SwitchJournalState.TARGET_IDENTITY_VERIFIED_PRECOMMIT, _source!.Id, _target.Id);
+        var entry = (await _journal.ReadAsync()).Entry! with
+        {
+            TargetActivationProvenance = SwitchTargetActivationProvenance.MAY_HAVE_BEEN_ATTEMPTED
+        };
+        await _journal.WriteEntryAsync(entry);
+        var markerStore = new SwitchTransitionMarkerStore(_journal.JournalFilePath + ".transition");
+        var marker = new SwitchTransitionMarkerEntry
+        {
+            TransactionId = entry.TransactionId,
+            Expected = entry,
+            Next = entry with { State = SwitchJournalState.ROLLING_BACK }
+        };
+        Assert.Equal(SwitchTransitionMarkerWriteStatus.Created,
+            (await markerStore.CreateTransitionMarkerIfAbsentAsync(marker)).Status);
+        _journal.DeleteIfUnchangedBehavior = (_, _) =>
+        {
+            File.Delete(_journal.JournalFilePath);
+            return Task.FromResult(SwitchJournalDeleteResult.Absent());
+        };
+        var coordinator = CreateCoordinator();
+        Assert.Equal(JournalResolutionStatus.ProofFailed, (await coordinator.ResolveQuarantinedJournalAsync()).Status);
+        Assert.Equal(JournalRecoveryStates.ActionRequired, coordinator.GetStatus().JournalRecoveryState);
+        Assert.False(coordinator.CanAdmitSwitch(out _));
+        Assert.Equal(SwitchTransitionMarkerReadStatus.Valid, (await markerStore.ReadTransitionMarkerAsync()).Status);
+    }
+
     private sealed class TestJournalStore : ISwitchJournalStore
     {
         private readonly SwitchJournalStore _underlying;
@@ -1475,6 +1531,17 @@ public sealed class NativeAccountSwitchCoordinatorResolutionTests : IDisposable
 
             return await _underlying.DeleteIfUnchangedAsync(expectedEntry, cancellationToken).ConfigureAwait(false);
         }
+
+        public Task<SwitchJournalWriteResult> CreateIfAbsentAsync(
+            SwitchJournalEntry nextEntry,
+            CancellationToken cancellationToken = default) =>
+            _underlying.CreateIfAbsentAsync(nextEntry, cancellationToken);
+
+        public Task<SwitchJournalWriteResult> ReplaceIfUnchangedAsync(
+            SwitchJournalEntry expectedEntry,
+            SwitchJournalEntry nextEntry,
+            CancellationToken cancellationToken = default) =>
+            _underlying.ReplaceIfUnchangedAsync(expectedEntry, nextEntry, cancellationToken);
     }
 
     private sealed class TestAccountStore : InMemoryAccountStore, IAccountStore

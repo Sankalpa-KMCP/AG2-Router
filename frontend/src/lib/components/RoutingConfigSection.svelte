@@ -205,6 +205,14 @@
     </fieldset>
   </form>
   <section class="candidate-evidence" aria-label="Candidate quota evidence">
+    {#if candidateEvidence?.poolStatus && !candidateEvidence.poolStatus.hasUsableCandidate}
+      <div class="routing-warning" role="alert" style="margin-bottom: 12px;">
+        <strong>Automatic candidate pool exhausted ({candidateEvidence.poolStatus.reasonCode}):</strong> {candidateEvidence.poolStatus.message}
+        {#if candidateEvidence.poolStatus.earliestResetTime}
+          <div><small>Earliest expected quota reset: {candidateEvidence.poolStatus.earliestResetTime}</small></div>
+        {/if}
+      </div>
+    {/if}
     <h3>Candidate quota evidence</h3>
     {#if routingReason}<p class="form-hint">Router: {routingReason}</p>{/if}
     {#if !candidateEvidence?.available}

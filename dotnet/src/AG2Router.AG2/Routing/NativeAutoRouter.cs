@@ -65,6 +65,30 @@ public class NativeAutoRouter : INativeAutoRouter
     private bool _disposed;
     private CancellationTokenSource? _activeEvaluationCts;
     private Task? _evaluationCancellation;
+    private CandidatePoolStatusDto? _lastPoolStatus;
+
+    // Durable evidence revision the published pool status was computed from. The pair is
+    // the validity marker: candidate-evidence reads serve the cached status only while a
+    // fresh durable snapshot still carries this revision, so evidence mutations performed
+    // outside the router (coordinator invalidation, recovery resolution, telemetry writes)
+    // invalidate the cached status without any coordinator→router coupling.
+    private long? _lastPoolStatusRevision;
+
+    // Monotonically increasing epoch of the evidence/context that _lastPoolStatus was
+    // computed from. Every state change that can invalidate a previously published pool
+    // status (identity change, quota/target evidence purge, observed-model cache change,
+    // manual switch result, configuration change) increments this under _stateLock and
+    // clears the cached status. Publication paths capture the generation with their
+    // evidence snapshot and may only publish while it is still current, so a concurrent
+    // invalidation can never be overwritten by an older READY result.
+    private long _poolStatusGeneration;
+
+    private void InvalidatePoolStatusLocked()
+    {
+        _poolStatusGeneration++;
+        _lastPoolStatus = null;
+        _lastPoolStatusRevision = null;
+    }
 
     private sealed record CandidateQuotaEvidence(DateTimeOffset ObservedAtUtc, string Provenance);
 
@@ -175,31 +199,53 @@ public class NativeAutoRouter : INativeAutoRouter
     public RouterConfigDto UpdateConfig(RouterConfigDto updates) => UpdateConfigWithGeneration(updates).Config;
 
     /// <summary>
+    /// Asynchronously updates and persists the router configuration.
+    /// </summary>
+    public async Task<RouterConfigDto> UpdateConfigAsync(RouterConfigDto updates, CancellationToken cancellationToken = default)
+    {
+        var result = await UpdateConfigWithGenerationAsync(updates, cancellationToken).ConfigureAwait(false);
+        return result.Config;
+    }
+
+    /// <summary>
     /// Atomically persists configuration updates and publishes a monotonically increasing generation number (R05).
     /// </summary>
     /// <param name="updates">The validated new router configuration.</param>
     /// <returns>A tuple containing the applied configuration and its unique monotonic generation ID.</returns>
     public (RouterConfigDto Config, long Generation) UpdateConfigWithGeneration(RouterConfigDto updates)
+        => UpdateConfigWithGenerationAsync(updates, CancellationToken.None).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Asynchronously and atomically persists configuration updates and publishes a monotonically increasing generation number (R05).
+    /// </summary>
+    /// <param name="updates">The validated new router configuration.</param>
+    /// <param name="cancellationToken">Cancellation token for acquiring admission and persisting configuration.</param>
+    /// <returns>A tuple containing the applied configuration and its unique monotonic generation ID.</returns>
+    public async Task<(RouterConfigDto Config, long Generation)> UpdateConfigWithGenerationAsync(
+        RouterConfigDto updates, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(updates);
         RouterConfigValidator.Validate(updates);
-        if (!_interruptionAdmission.Wait(0))
+        if (!await _interruptionAdmission.WaitAsync(0, cancellationToken).ConfigureAwait(false))
         {
             ConfigAdmissionContended?.Invoke();
-            _interruptionAdmission.Wait();
+            await _interruptionAdmission.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         try
         {
+            if (!string.IsNullOrEmpty(_configFilePath) && _fileWriter != null)
+            {
+                var json = JsonSerializer.Serialize(updates, new JsonSerializerOptions { WriteIndented = true });
+                await _fileWriter.WriteAtomicAsync(_configFilePath, json, cancellationToken).ConfigureAwait(false);
+            }
+
             lock (_stateLock)
             {
-                if (!string.IsNullOrEmpty(_configFilePath) && _fileWriter != null)
-                {
-                    var json = JsonSerializer.Serialize(updates, new JsonSerializerOptions { WriteIndented = true });
-                    _fileWriter.WriteAtomicAsync(_configFilePath, json, CancellationToken.None).GetAwaiter().GetResult();
-                }
-
                 _config = updates;
                 _configGeneration++;
+                // Configuration (workload model, minimum quota) is a pool-assessment input;
+                // a cached pool status computed under older settings must not survive.
+                InvalidatePoolStatusLocked();
                 if (!_config.AutoSwitchEnabled &&
                     (_safetyGate.State is RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.WaitingForIdle or RoutingSafetyGateState.LowQuotaDetected))
                 {
@@ -244,6 +290,7 @@ public class NativeAutoRouter : INativeAutoRouter
             long tokenId = ++_nextManualTokenId;
             _activeManualSwitches[tokenId] = targetAccountId;
             _manualSwitchPending = true;
+            InvalidatePoolStatusLocked();
 
             if (_safetyGate.State is RoutingSafetyGateState.WaitingForIdle or RoutingSafetyGateState.SwitchPending or RoutingSafetyGateState.LowQuotaDetected)
             {
@@ -294,6 +341,7 @@ public class NativeAutoRouter : INativeAutoRouter
                 {
                     _lastActiveAccountId = activeId;
                     _lastActiveAccountEmail = activeAccount?.Email;
+                    InvalidatePoolStatusLocked();
                     _lastDecisionReason = "Manual completion superseded by authoritative active identity.";
                     return;
                 }
@@ -307,6 +355,7 @@ public class NativeAutoRouter : INativeAutoRouter
                 if (!_activeManualSwitches.Remove(token.Id)) return;
                 _manualSwitchEpoch++;
                 _manualSwitchPending = _activeManualSwitches.Count > 0;
+                InvalidatePoolStatusLocked();
                 RequireManualRecovery($"Manual completion ownership could not be verified: {AG2Security.RedactSensitiveText(ex.Message)}");
             }
         }
@@ -338,6 +387,9 @@ public class NativeAutoRouter : INativeAutoRouter
             _observedQuotas.Remove(result.TargetAccountId);
             _observedModelQuotas.Remove(result.TargetAccountId);
             _quotaEvidence.Remove(result.TargetAccountId);
+            // Active identity changed; any previously published pool status described the
+            // previous routing context and must not remain externally visible.
+            InvalidatePoolStatusLocked();
             if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
             {
                 if (_safetyGate.State != RoutingSafetyGateState.Cooldown)
@@ -352,26 +404,40 @@ public class NativeAutoRouter : INativeAutoRouter
                 _lastDecisionReason = $"Manual switch succeeded to {result.TargetEmail}. In cooldown.";
             }
         }
-        else if (result.ManualRecoveryRequired)
+        else
         {
-            if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
+            // Mirror the automatic failure handling: the failed attempt may have durably
+            // invalidated the target's candidate evidence (or left its outcome unresolved),
+            // so the failed target's cached evidence and any published pool status computed
+            // before the attempt are dropped. The durable observation store remains the
+            // production authority; valid target evidence is re-read from there. Manual
+            // switching stays advisory: no candidate cooldown is added here.
+            _observedQuotas.Remove(result.TargetAccountId);
+            _observedModelQuotas.Remove(result.TargetAccountId);
+            _quotaEvidence.Remove(result.TargetAccountId);
+            InvalidatePoolStatusLocked();
+
+            if (result.ManualRecoveryRequired)
             {
-                if (_safetyGate.State != RoutingSafetyGateState.Idle)
+                if (_safetyGate.State != RoutingSafetyGateState.ManualRecoveryRequired)
                 {
-                    _safetyGate.Reset("Manual switch failed; resetting before manual recovery.");
+                    if (_safetyGate.State != RoutingSafetyGateState.Idle)
+                    {
+                        _safetyGate.Reset("Manual switch failed; resetting before manual recovery.");
+                    }
+                    _safetyGate.Transition(RoutingSafetyGateState.ManualRecoveryRequired, $"Manual recovery required: {result.Message}");
                 }
-                _safetyGate.Transition(RoutingSafetyGateState.ManualRecoveryRequired, $"Manual recovery required: {result.Message}");
+                _config = _config with { AutoSwitchEnabled = false };
+                _lastDecisionReason = $"Manual switch failed; manual recovery required: {result.Message}";
             }
-            _config = _config with { AutoSwitchEnabled = false };
-            _lastDecisionReason = $"Manual switch failed; manual recovery required: {result.Message}";
-        }
-        else if (!hasRemaining &&
-                 _safetyGate.State == RoutingSafetyGateState.SwitchInProgress &&
-                 _switchCoordinator.GetStatus().ActiveTransactionId == null)
-        {
-            _safetyGate.Reset("Manual request ended after contending with automatic switch.");
-            _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after switch contention");
-            _cooldownUntil = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(30);
+            else if (!hasRemaining &&
+                     _safetyGate.State == RoutingSafetyGateState.SwitchInProgress &&
+                     _switchCoordinator.GetStatus().ActiveTransactionId == null)
+            {
+                _safetyGate.Reset("Manual request ended after contending with automatic switch.");
+                _safetyGate.Transition(RoutingSafetyGateState.Cooldown, "Stabilizing after switch contention");
+                _cooldownUntil = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(30);
+            }
         }
     }
 
@@ -387,9 +453,25 @@ public class NativeAutoRouter : INativeAutoRouter
                 PendingTargetAccountId: _safetyGate.TargetAccountId,
                 LastEvaluatedAt: _lastEvaluatedAt,
                 LastDecisionReason: _lastDecisionReason,
-                Config: _config
+                Config: _config,
+                PoolStatus: GetCurrentPoolStatusLocked()
             );
         }
+    }
+
+    // Shipped coordinator and router share the store, so a completed evidence commit is
+    // visible here without disk I/O under the state lock. Independent writers are detected
+    // by the asynchronous accessors' durable reads, not by this synchronous view.
+    private CandidatePoolStatusDto? GetCurrentPoolStatusLocked()
+    {
+        if (_quotaObservationStore != null &&
+            (_quotaObservationStore.KnownObservationRevision is not { } revision ||
+             _lastPoolStatusRevision != revision))
+        {
+            _lastPoolStatus = null;
+            _lastPoolStatusRevision = null;
+        }
+        return _lastPoolStatus;
     }
 
     public async Task<CandidateEvidenceStatusDto> GetCandidateEvidenceStatusAsync(CancellationToken cancellationToken = default)
@@ -397,15 +479,58 @@ public class NativeAutoRouter : INativeAutoRouter
         var config = GetConfig();
         var model = CandidateSelector.CanonicalizeModelKey(config.WorkloadModelKey);
         if (_quotaObservationStore == null)
-            return new(model, config.MinimumCandidateQuotaPercent, false, []);
+        {
+            CandidatePoolStatusDto? pool;
+            lock (_stateLock)
+            {
+                pool = GetCurrentPoolStatusLocked();
+            }
+            // Without a durable evidence source there is no revision to validate against;
+            // the generation-guarded cache is served as-is and never synthesized.
+            return new(model, config.MinimumCandidateQuotaPercent, false, [], pool);
+        }
 
-        // Do not populate the routing cache or probe inactive accounts for a dashboard read.
-        var observations = QuotaObservationEvidence.Consolidate(
-            await _quotaObservationStore.GetAllObservationsAsync(cancellationToken).ConfigureAwait(false));
+        // The dashboard never synthesizes a pool assessment: candidate rows come from one
+        // durable evidence snapshot, and PoolStatus is served only from the evaluation-
+        // published cache while its evidence revision still matches that snapshot. Bounded
+        // to two computations; an unstable read serves a conservative null pool status
+        // rather than any stale READY.
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            var snapshot = await _quotaObservationStore.GetObservationSnapshotAsync(cancellationToken).ConfigureAwait(false);
+            var candidates = await BuildCandidateRowsAsync(config, model, snapshot.Observations, cancellationToken).ConfigureAwait(false);
+
+            long currentRevision = await _quotaObservationStore.GetObservationRevisionAsync(cancellationToken).ConfigureAwait(false);
+            if (currentRevision == snapshot.Revision)
+            {
+                lock (_stateLock)
+                {
+                    var poolStatus = GetCurrentPoolStatusLocked();
+                    if (_lastPoolStatusRevision != snapshot.Revision)
+                        poolStatus = null;
+                    return new(model, config.MinimumCandidateQuotaPercent, true, candidates, poolStatus);
+                }
+            }
+
+            if (attempt == 1)
+            {
+                // Evidence mutated through both computations; the rows are the freshest
+                // available and the pool status stays unavailable instead of stale.
+                return new(model, config.MinimumCandidateQuotaPercent, true, candidates, null);
+            }
+        }
+
+        throw new InvalidOperationException("Unreachable candidate evidence status retry state.");
+    }
+
+    private async Task<CandidateQuotaStatusDto[]> BuildCandidateRowsAsync(
+        RouterConfigDto config, string? model, IReadOnlyList<AccountModelQuotaObservation> observations,
+        CancellationToken cancellationToken)
+    {
         var accounts = await _accountStore.ListAccountsAsync(cancellationToken).ConfigureAwait(false);
         var activeId = await _accountStore.GetActiveAccountIdAsync(cancellationToken).ConfigureAwait(false);
         var now = _timeProvider.GetUtcNow();
-        var candidates = accounts.Where(a => a.Id != activeId).Select(account =>
+        return accounts.Where(a => a.Id != activeId).Select(account =>
         {
             var observation = observations.SingleOrDefault(o => o.AccountId == account.Id && o.ModelKey == model);
             string state = model == null ? "UNCONFIGURED" : observation == null ? "NOT_OBSERVED" :
@@ -419,7 +544,6 @@ public class NativeAutoRouter : INativeAutoRouter
             return new CandidateQuotaStatusDto(account.Id, state, remaining, observation?.ObservedAtUtc,
                 observation == null ? null : (now - observation.ObservedAtUtc).TotalSeconds);
         }).OrderBy(c => c.AccountId, StringComparer.Ordinal).ToArray();
-        return new(model, config.MinimumCandidateQuotaPercent, true, candidates);
     }
 
     public void ResetManualRecovery()
@@ -684,6 +808,7 @@ public class NativeAutoRouter : INativeAutoRouter
             Dictionary<string, double> observedSnapshot;
             Dictionary<string, IReadOnlyList<ModelQuotaDto>> observedModelSnapshot;
             RouterConfigDto configSnapshot;
+            long poolGenerationSnapshot;
             string switchResource = _sessionVault.GetVaultPath() + ".switch";
             if (RecoveryQuarantineRegistry.Get(switchResource).IsMarked)
             {
@@ -778,6 +903,9 @@ public class NativeAutoRouter : INativeAutoRouter
                     observedModelSnapshot = _observedModelQuotas
                         .Where(kvp => freshIds.Contains(kvp.Key))
                         .ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.Ordinal);
+                    // Bind this cycle's pool-status publication to the evidence generation it
+                    // was computed from; a concurrent invalidation forbids caching the result.
+                    poolGenerationSnapshot = _poolStatusGeneration;
                 }
 
                 if (_quotaObservationStore != null && activeAccountId != null && observationsToRecord != null)
@@ -817,12 +945,16 @@ public class NativeAutoRouter : INativeAutoRouter
             }
 
             IReadOnlyDictionary<string, AccountModelQuotaObservation>? candidateModelObservations = null;
+            long evidenceRevision = 0;
             if (_quotaObservationStore != null)
             {
                 try
                 {
-                    var durableObservations = QuotaObservationEvidence.Consolidate(await _quotaObservationStore.GetAllObservationsAsync(cancellationToken).ConfigureAwait(false));
-                    candidateModelObservations = durableObservations
+                    // One consistent snapshot: the rows feed selection and the revision pairs
+                    // the published pool status with exactly this evidence generation.
+                    var evidenceSnapshot = await _quotaObservationStore.GetObservationSnapshotAsync(cancellationToken).ConfigureAwait(false);
+                    evidenceRevision = evidenceSnapshot.Revision;
+                    candidateModelObservations = evidenceSnapshot.Observations
                         .Where(o => string.Equals(o.ModelKey, requestedModelKey, StringComparison.OrdinalIgnoreCase))
                         .ToDictionary(o => o.AccountId, StringComparer.Ordinal);
                 }
@@ -855,6 +987,15 @@ public class NativeAutoRouter : INativeAutoRouter
             if (BeforeGatePublicationAsync is { } beforeGatePublication)
                 await beforeGatePublication().ConfigureAwait(false);
 
+            // Re-read the durable evidence revision outside the state lock, then publish only
+            // while BOTH the routing context generation and the evidence revision still match
+            // the snapshot this selection was computed from. A raced durable mutation (for
+            // example a recovery-resolution invalidation) must not be overwritten by an
+            // older pool status.
+            long? revisionAtPublication = _quotaObservationStore == null
+                ? null
+                : await _quotaObservationStore.GetObservationRevisionAsync(cancellationToken).ConfigureAwait(false);
+
             // Publish the plan and gate progression under the same owner as manual
             // start/completion. A stale selection cannot create a pending switch.
             bool autoSwitchEnabled;
@@ -862,8 +1003,17 @@ public class NativeAutoRouter : INativeAutoRouter
             {
                 if (!IsEvaluationCurrentLocked(planEpoch))
                     return new SelectionResult(false, "Manual switch superseded evaluation.", _lastActiveAccountId,
-                        null, null, Array.Empty<CandidateEvaluation>());
+                        null, null, Array.Empty<CandidateEvaluation>(), selection.PoolStatus);
                 autoSwitchEnabled = _config.AutoSwitchEnabled;
+                // Cache the pool status only while the evidence generation AND the durable
+                // evidence revision it was computed from are still current; the paired
+                // revision lets later readers reject it the moment evidence moves again.
+                if (_poolStatusGeneration == poolGenerationSnapshot && revisionAtPublication == evidenceRevision &&
+                    (_quotaObservationStore == null || _quotaObservationStore.KnownObservationRevision == evidenceRevision))
+                {
+                    _lastPoolStatus = selection.PoolStatus;
+                    _lastPoolStatusRevision = evidenceRevision;
+                }
                 if (selection.ShouldSwitch && selection.BestCandidate != null)
                 {
                     if (!_switchCoordinator.CanAdmitSwitch(out var switchAdmissionReason))
@@ -875,7 +1025,7 @@ public class NativeAutoRouter : INativeAutoRouter
                             RecoveryQuarantineRegistry.Get(_sessionVault.GetVaultPath()).IsMarked;
 
                         string reason = switchAdmissionReason ?? "Account lifecycle recovery is unresolved; automatic switching is halted.";
-                        selection = new SelectionResult(false, reason, selection.CurrentAccountId, null, null, selection.Candidates);
+                        selection = new SelectionResult(false, reason, selection.CurrentAccountId, null, null, selection.Candidates, selection.PoolStatus);
                         _lastEvaluatedAt = nowIso;
                         _lastDecisionReason = reason;
 
@@ -976,7 +1126,7 @@ public class NativeAutoRouter : INativeAutoRouter
         }
     }
 
-    private bool IsAutomaticPlanCurrent(long epoch, string candidateAccountId,
+    private async Task<bool> IsAutomaticPlanCurrentAsync(long epoch, string candidateAccountId,
         string? requestedModelKey, RouterConfigDto planConfig, AccountModelQuotaObservation? selectedEvidence)
     {
         lock (_stateLock)
@@ -995,10 +1145,10 @@ public class NativeAutoRouter : INativeAutoRouter
         }
         try
         {
-            // The coordinator's synchronous admission callback runs outside the router
+            // The coordinator's admission callback runs outside the router
             // state lock. Read the authoritative file again at every admission boundary.
-            var current = _quotaObservationStore.GetObservationAsync(candidateAccountId, requestedModelKey!)
-                .GetAwaiter().GetResult();
+            var current = await _quotaObservationStore.GetObservationAsync(candidateAccountId, requestedModelKey!)
+                .ConfigureAwait(false);
             if (current != selectedEvidence || !QuotaObservationEvidence.IsUsable(selectedEvidence,
                 _timeProvider.GetUtcNow(), planConfig.MinimumCandidateQuotaPercent)) return false;
             lock (_stateLock) return IsAutomaticPlanCurrentLocked(epoch) &&
@@ -1006,6 +1156,10 @@ public class NativeAutoRouter : INativeAutoRouter
         }
         catch { return false; }
     }
+
+    internal bool IsAutomaticPlanCurrent(long epoch, string candidateAccountId,
+        string? requestedModelKey, RouterConfigDto planConfig, AccountModelQuotaObservation? selectedEvidence)
+        => IsAutomaticPlanCurrentAsync(epoch, candidateAccountId, requestedModelKey, planConfig, selectedEvidence).GetAwaiter().GetResult();
 
     private bool IsBackendRecoveryBlocked()
     {
@@ -1078,7 +1232,7 @@ public class NativeAutoRouter : INativeAutoRouter
         string? requestedModelKey, RouterConfigDto planConfig,
         AccountModelQuotaObservation? selectedEvidence, CancellationToken cancellationToken)
     {
-        if (!IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, planConfig, selectedEvidence))
+        if (!await IsAutomaticPlanCurrentAsync(planEpoch, targetAccountId, requestedModelKey, planConfig, selectedEvidence).ConfigureAwait(false))
         {
             lock (_stateLock)
             {
@@ -1105,7 +1259,7 @@ public class NativeAutoRouter : INativeAutoRouter
                     RequireManualRecovery(reason);
                 }
                 else if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress &&
-                         _switchCoordinator.GetStatus().ActiveTransactionId == null)
+                          _switchCoordinator.GetStatus().ActiveTransactionId == null)
                 {
                     _safetyGate.Reset(reason);
                 }
@@ -1118,7 +1272,7 @@ public class NativeAutoRouter : INativeAutoRouter
         {
             switchResult = await _switchCoordinator.SwitchAutomaticallyAsync(
                 targetAccountId, expectedActiveAccountId,
-                () => IsAutomaticPlanCurrent(planEpoch, targetAccountId, requestedModelKey, planConfig, selectedEvidence),
+                () => IsAutomaticPlanCurrentAsync(planEpoch, targetAccountId, requestedModelKey, planConfig, selectedEvidence),
                 requestedModelKey, planConfig.MinimumCandidateQuotaPercent,
                 AcquireInterruptionAdmissionAsync,
                 cancellationToken).ConfigureAwait(false);
@@ -1159,6 +1313,10 @@ public class NativeAutoRouter : INativeAutoRouter
             {
             if (switchResult.ManualRecoveryRequired)
             {
+                _observedQuotas.Remove(targetAccountId);
+                _observedModelQuotas.Remove(targetAccountId);
+                _quotaEvidence.Remove(targetAccountId);
+                InvalidatePoolStatusLocked();
                 RequireManualRecovery($"Automatic switching halted: manual recovery required ({switchResult.Message}).");
                 return;
             }
@@ -1178,6 +1336,7 @@ public class NativeAutoRouter : INativeAutoRouter
                 _observedQuotas.Remove(switchResult.TargetAccountId);
                 _observedModelQuotas.Remove(switchResult.TargetAccountId);
                 _quotaEvidence.Remove(switchResult.TargetAccountId);
+                InvalidatePoolStatusLocked();
                 if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)
                 {
                     _safetyGate.Transition(RoutingSafetyGateState.Verifying,
@@ -1199,6 +1358,10 @@ public class NativeAutoRouter : INativeAutoRouter
             if (switchResult.Code == SwitchResultCodes.SwitchFailedRolledBack)
             {
                 _candidateCooldowns[targetAccountId] = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(60);
+                _observedQuotas.Remove(targetAccountId);
+                _observedModelQuotas.Remove(targetAccountId);
+                _quotaEvidence.Remove(targetAccountId);
+                InvalidatePoolStatusLocked();
                 if (!_manualSwitchPending)
                 {
                     if (_safetyGate.State == RoutingSafetyGateState.SwitchInProgress)

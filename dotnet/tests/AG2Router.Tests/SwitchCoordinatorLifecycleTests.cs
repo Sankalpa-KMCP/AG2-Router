@@ -151,6 +151,9 @@ public sealed partial class TargetQuotaVerificationSwitchTests
     public async Task Lifecycle_UncertainCleanupRead_CannotBecomeReusable(SwitchJournalReadStatus readStatus, string recoveryState)
     {
         await SeedAccountsAsync();
+        // The uncertainty must poison the post-cleanup readbacks, not the pre-mutation
+        // admission proof; the first read (admission) passes through to the real store.
+        _journal.PassThroughReadCount = 1;
         _journal.ReadBehavior = () => Task.FromResult(new SwitchJournalReadResult(readStatus));
         var coordinator = CreateCoordinator();
         Assert.True((await coordinator.SwitchAsync(_target!.Id)).Success);

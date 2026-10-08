@@ -1,6 +1,6 @@
 {
   "name": "ag2-router",
-  "version": "0.4.1-rc.3",
+  "version": "0.4.1-rc.4",
   "description": "Lightweight Windows application foundation for Antigravity 2 quota monitoring and safe account routing.",
   "type": "module",
   "main": "dist/src/index.js",

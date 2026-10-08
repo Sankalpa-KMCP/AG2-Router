@@ -795,6 +795,7 @@ public sealed partial class TargetQuotaVerificationSwitchTests : IDisposable
         private WinCredEntry? _current;
 
         public WinCredEntry? Current => _current == null ? null : Clone(_current);
+        public int WriteCount { get; set; }
 
         public TestCredentialStore(List<string> timeline)
         {
@@ -815,6 +816,7 @@ public sealed partial class TargetQuotaVerificationSwitchTests : IDisposable
 
         public Task<bool> WriteCredentialAsync(WinCredEntry entry, CancellationToken cancellationToken = default)
         {
+            WriteCount++;
             _timeline.Add($"WINCRED_WRITE:{entry.UserName}");
             cancellationToken.ThrowIfCancellationRequested();
             Set(entry);
@@ -965,14 +967,31 @@ public sealed partial class TargetQuotaVerificationSwitchTests : IDisposable
         public Exception? DeleteError { get; set; }
         public Func<Task<SwitchJournalReadResult>>? ReadBehavior { get; set; }
 
+        /// <summary>Number of initial reads that pass through to the real store before
+        /// ReadBehavior applies; lets a test poison only post-cleanup readbacks.</summary>
+        public int PassThroughReadCount { get; set; }
+
         public TestJournalStore(string journalFilePath, List<string> timeline)
         {
             _underlying = new SwitchJournalStore(journalFilePath);
             _timeline = timeline;
         }
 
-        public Task<SwitchJournalReadResult> ReadAsync(CancellationToken cancellationToken = default) =>
-            ReadBehavior?.Invoke() ?? _underlying.ReadAsync(cancellationToken);
+        public async Task<SwitchJournalReadResult> ReadAsync(CancellationToken cancellationToken = default)
+        {
+            if (PassThroughReadCount > 0)
+            {
+                PassThroughReadCount--;
+                return await _underlying.ReadAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (ReadBehavior != null)
+            {
+                return await ReadBehavior.Invoke().ConfigureAwait(false);
+            }
+
+            return await _underlying.ReadAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         public async Task WriteEntryAsync(SwitchJournalEntry entry, CancellationToken cancellationToken = default)
         {
@@ -990,10 +1009,41 @@ public sealed partial class TargetQuotaVerificationSwitchTests : IDisposable
             return _underlying.DeleteAsync(cancellationToken);
         }
 
-        public Task<SwitchJournalDeleteResult> DeleteIfUnchangedAsync(
+        public async Task<SwitchJournalDeleteResult> DeleteIfUnchangedAsync(
             SwitchJournalEntry expectedEntry,
-            CancellationToken cancellationToken = default) =>
-            _underlying.DeleteIfUnchangedAsync(expectedEntry, cancellationToken);
+            CancellationToken cancellationToken = default)
+        {
+            // Production cleanup uses the exact-entry conditional primitive; the deletion
+            // fault seam applies to it identically so retention-by-failure tests keep their
+            // meaning regardless of which primitive the coordinator calls.
+            _timeline.Add("JOURNAL_DELETE_CONDITIONAL");
+            Operations.Add("DELETE_CONDITIONAL");
+            if (DeleteError != null) return await Task.FromException<SwitchJournalDeleteResult>(DeleteError).ConfigureAwait(false);
+            return await _underlying.DeleteIfUnchangedAsync(expectedEntry, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<SwitchJournalWriteResult> CreateIfAbsentAsync(
+            SwitchJournalEntry nextEntry,
+            CancellationToken cancellationToken = default)
+        {
+            // The coordinator's first journal write is an atomic create-if-absent; record it
+            // as the journal write it logically is so timeline-ordering assertions hold.
+            _timeline.Add($"JOURNAL_WRITE:{nextEntry.State}");
+            Operations.Add($"CREATE:{nextEntry.State}");
+            RecordedEntries.Add(nextEntry);
+            return await _underlying.CreateIfAbsentAsync(nextEntry, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<SwitchJournalWriteResult> ReplaceIfUnchangedAsync(
+            SwitchJournalEntry expectedEntry,
+            SwitchJournalEntry nextEntry,
+            CancellationToken cancellationToken = default)
+        {
+            _timeline.Add($"JOURNAL_WRITE:{nextEntry.State}");
+            Operations.Add($"REPLACE:{nextEntry.State}");
+            RecordedEntries.Add(nextEntry);
+            return await _underlying.ReplaceIfUnchangedAsync(expectedEntry, nextEntry, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private sealed class FakeQuotaObservationStore : IQuotaObservationStore

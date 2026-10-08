@@ -148,7 +148,36 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
 
     public void UpdateInterval(TimeSpan newInterval) => UpdateInterval(newInterval, 0);
 
-    public SystemStatusDto CurrentStatus => Volatile.Read(ref _currentStatus);
+    public SystemStatusDto CurrentStatus
+    {
+        get
+        {
+            var status = Volatile.Read(ref _currentStatus);
+            if (_autoRouter != null)
+            {
+                var authoritativeRouter = _autoRouter.GetStatus();
+                if (status.Router.PoolStatus != authoritativeRouter.PoolStatus ||
+                    status.Router != authoritativeRouter)
+                {
+                    lock (_stateLock)
+                    {
+                        var current = Volatile.Read(ref _currentStatus);
+                        if (current.Router.PoolStatus != authoritativeRouter.PoolStatus ||
+                            current.Router != authoritativeRouter)
+                        {
+                            status = current with { Router = authoritativeRouter };
+                            Volatile.Write(ref _currentStatus, status);
+                        }
+                        else
+                        {
+                            status = current;
+                        }
+                    }
+                }
+            }
+            return status;
+        }
+    }
 
     public void Start()
     {
@@ -384,33 +413,54 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         }
     }
 
+    internal Action? OnBeforeApplyStatus { get; set; }
+
     private void PublishStatus(long sequence, SystemStatusDto status, bool fallback = false)
     {
-        lock (_stateLock)
+        OnBeforeApplyStatus?.Invoke();
+        if (!TryApplyStatus(sequence, status, out var appliedStatus) || appliedStatus == null)
         {
-            if (!TryApplyStatus(sequence, status)) return;
-            try { StatusUpdated?.Invoke(status); }
-            catch (Exception ex)
-            {
-                string context = fallback ? " on fallback status" : string.Empty;
-                _log?.Invoke($"StatusUpdated subscriber threw an exception{context}: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
-            }
+            return;
+        }
+
+        try
+        {
+            StatusUpdated?.Invoke(appliedStatus);
+        }
+        catch (Exception ex)
+        {
+            string context = fallback ? " on fallback status" : string.Empty;
+            _log?.Invoke($"StatusUpdated subscriber threw an exception{context}: {AG2Security.RedactSensitiveText(ex.GetType().Name + ": " + ex.Message)}");
         }
     }
 
-    internal bool TryApplyStatus(long sequence, SystemStatusDto status)
+    internal bool TryApplyStatus(long sequence, SystemStatusDto incoming, out SystemStatusDto? appliedStatus)
     {
         lock (_stateLock)
         {
             if (!_stopping && !_disposeRequested && sequence >= _lastAppliedSequence)
             {
+                if (_autoRouter != null)
+                {
+                    var authoritativeRouter = _autoRouter.GetStatus();
+                    if (incoming.Router.PoolStatus != authoritativeRouter.PoolStatus ||
+                        incoming.Router != authoritativeRouter)
+                    {
+                        incoming = incoming with { Router = authoritativeRouter };
+                    }
+                }
                 _lastAppliedSequence = sequence;
-                Volatile.Write(ref _currentStatus, status);
+                Volatile.Write(ref _currentStatus, incoming);
+                appliedStatus = incoming;
                 return true;
             }
+            appliedStatus = null;
             return false; // Discard superseded status
         }
     }
+
+    internal bool TryApplyStatus(long sequence, SystemStatusDto incoming) =>
+        TryApplyStatus(sequence, incoming, out _);
 
     /// <summary>Requests stop and drains admitted work within the caller's wait budget.
     /// A canceled wait retains task/CTS ownership; a late poll cannot publish after stop.</summary>

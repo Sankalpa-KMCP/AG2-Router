@@ -9,13 +9,37 @@ public record CandidateEvaluation(
     double Score
 );
 
+public static class CandidatePoolReasonCodes
+{
+    public const string Ready = "READY";
+    public const string NoEnrolledAlternatives = "NO_ENROLLED_ALTERNATIVES";
+    public const string ValidationOrSessionFailed = "VALIDATION_OR_SESSION_FAILED";
+    public const string AllInCooldown = "ALL_IN_COOLDOWN";
+    public const string EvidenceStaleOrUnknown = "EVIDENCE_STALE_OR_UNKNOWN";
+    public const string AllExhausted = "ALL_EXHAUSTED";
+    public const string AllBelowMinimum = "ALL_BELOW_MINIMUM";
+    public const string QuotaDepleted = "QUOTA_DEPLETED";
+    public const string ReserveOnly = "RESERVE_ONLY";
+}
+
+public record CandidatePoolStatusDto(
+    bool HasUsableCandidate,
+    string ReasonCode,
+    string Message,
+    int EnrolledCandidatesCount,
+    int EligibleCandidatesCount,
+    int UsableCandidatesCount,
+    string? EarliestResetTime = null
+);
+
 public record SelectionResult(
     bool ShouldSwitch,
     string Reason,
     string? CurrentAccountId,
     double? CurrentQuotaFraction,
     CandidateEvaluation? BestCandidate,
-    IReadOnlyList<CandidateEvaluation> Candidates
+    IReadOnlyList<CandidateEvaluation> Candidates,
+    CandidatePoolStatusDto? PoolStatus = null
 );
 
 public static class RoutingSafetyGateState

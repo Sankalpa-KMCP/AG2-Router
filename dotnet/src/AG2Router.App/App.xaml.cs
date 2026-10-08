@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using System.Windows;
+using AG2Router.Core.Models;
 using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Adapter;
 using AG2Router.AG2.Discovery;
@@ -51,6 +52,7 @@ public partial class App : System.Windows.Application
     private WindowsWinCredWriter? _wincredWriter;
     private AccountEnrollmentService? _enrollmentService;
     private NativeAccountSwitchCoordinator? _switchCoordinator;
+    private SwitchPlanner? _switchPlanner;
     private NativeAutoRouter? _autoRouter;
     private DurableQuotaObservationStore? _quotaObservationStore;
     private DurableUsageCallLedger? _usageLedger;
@@ -186,9 +188,10 @@ public partial class App : System.Windows.Application
             var reconciliationResult = await _switchCoordinator.ReconcileStartupJournalAsync();
             Log($"Startup switch journal reconciliation completed: {reconciliationResult.Status}. {reconciliationResult.Message}");
 
-            Log("Initializing NativeAutoRouter and AutostartService...");
+            Log("Initializing NativeAutoRouter, SwitchPlanner, and AutostartService...");
             string configPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(_accountStore.GetFilePath())!, "config.json");
             _autoRouter = new NativeAutoRouter(_accountStore, _sessionVault, _ag2Adapter, _switchCoordinator, configFilePath: configPath, quotaObservationStore: _quotaObservationStore);
+            _switchPlanner = new SwitchPlanner(_accountStore, _sessionVault, _ag2Adapter, _switchCoordinator, _autoRouter, _quotaObservationStore);
             _autostartService = new WindowsRegistryAutostartService(new WindowsRegistryAccessor());
 
             Log("Initializing TelemetryPollingCoordinator...");
@@ -209,6 +212,7 @@ public partial class App : System.Windows.Application
                 enrollmentService: _enrollmentService,
                 switchCoordinator: _switchCoordinator,
                 autoRouter: _autoRouter,
+                switchPlanner: _switchPlanner,
                 autostartService: _autostartService,
                 onPollingIntervalChangedWithGeneration: (interval, gen) => _telemetryCoordinator?.UpdateInterval(interval, gen),
                 usageAggregation: _usageAggregation,
@@ -224,17 +228,19 @@ public partial class App : System.Windows.Application
             Log("Initializing QuickStatusWindow...");
             _quickStatusWindow = new QuickStatusWindow(OpenDashboard, statusProvider: () => _telemetryCoordinator.CurrentStatus);
 
-            _telemetryCoordinator.StatusUpdated += status =>
+            _telemetryCoordinator.StatusUpdated += _ =>
             {
-                Dispatcher.InvokeAsync(() =>
-                {
-                    if (_quickStatusWindow?.IsVisible == true)
+                Dispatcher.InvokeAsync(CreateDesktopStatusUpdateCallback(
+                    () => _telemetryCoordinator?.CurrentStatus,
+                    status =>
                     {
-                        _quickStatusWindow.UpdateStatus(status);
-                    }
-                    var autoStatus = status.Router.AutoSwitchEnabled ? $"Auto: {status.Router.State}" : "Auto: Off";
-                    _trayIconManager?.UpdateTooltip($"AG2 Router - {status.Ag2.Status} ({autoStatus})");
-                });
+                        if (_quickStatusWindow?.IsVisible == true)
+                        {
+                            _quickStatusWindow.UpdateStatus(status);
+                        }
+                    },
+                    tooltip => _trayIconManager?.UpdateTooltip(tooltip)
+                ));
             };
 
             // 5. Initialize notification area tray icon
@@ -533,5 +539,66 @@ public partial class App : System.Windows.Application
             return true;
         });
         return string.Join(Environment.NewLine, filtered).Trim();
+    }
+
+    internal static string FormatTrayTooltip(string ag2Status, bool autoSwitchEnabled, string routerState, CandidatePoolStatusDto? poolStatus)
+    {
+        string autoStatus;
+        if (!autoSwitchEnabled)
+        {
+            autoStatus = "Auto: Off";
+        }
+        else if (poolStatus != null && !poolStatus.HasUsableCandidate)
+        {
+            autoStatus = poolStatus.ReasonCode switch
+            {
+                CandidatePoolReasonCodes.AllExhausted or CandidatePoolReasonCodes.QuotaDepleted => "Auto: Pool exhausted",
+                CandidatePoolReasonCodes.AllInCooldown => "Auto: Cooling down",
+                CandidatePoolReasonCodes.EvidenceStaleOrUnknown => "Auto: No fresh evidence",
+                CandidatePoolReasonCodes.ReserveOnly => "Auto: Reserve only",
+                CandidatePoolReasonCodes.ValidationOrSessionFailed => "Auto: Session invalid",
+                CandidatePoolReasonCodes.NoEnrolledAlternatives => "Auto: No alternatives",
+                CandidatePoolReasonCodes.AllBelowMinimum => "Auto: Below minimum",
+                _ => "Auto: No candidates"
+            };
+        }
+        else
+        {
+            autoStatus = $"Auto: {routerState}";
+        }
+        return $"AG2 Router - {ag2Status} ({autoStatus})";
+    }
+
+    internal static Action CreateDesktopStatusUpdateCallback(
+        Func<SystemStatusDto?> statusProvider,
+        Action<SystemStatusDto>? updateQuickStatus,
+        Action<string>? updateTrayTooltip)
+    {
+        return () =>
+        {
+            var current = statusProvider();
+            if (current != null)
+            {
+                UpdateDesktopPresentation(current, updateQuickStatus, updateTrayTooltip);
+            }
+        };
+    }
+
+    internal static void UpdateDesktopPresentation(
+        SystemStatusDto current,
+        Action<SystemStatusDto>? updateQuickStatus,
+        Action<string>? updateTrayTooltip)
+    {
+        if (current == null) return;
+        updateQuickStatus?.Invoke(current);
+        if (updateTrayTooltip != null)
+        {
+            var tooltip = FormatTrayTooltip(
+                current.Ag2.Status,
+                current.Router.AutoSwitchEnabled,
+                current.Router.State,
+                current.Router.PoolStatus);
+            updateTrayTooltip(tooltip);
+        }
     }
 }

@@ -36,6 +36,12 @@ public interface INativeAutoRouter : IRouterState, IAsyncDisposable
     RouterConfigDto UpdateConfig(RouterConfigDto updates);
 
     /// <summary>
+    /// Asynchronously updates and persists the router configuration.
+    /// </summary>
+    Task<RouterConfigDto> UpdateConfigAsync(RouterConfigDto updates, CancellationToken cancellationToken = default) =>
+        Task.FromResult(UpdateConfig(updates));
+
+    /// <summary>
     /// Monotonically increasing configuration generation ID (R05). Incremented on every configuration mutation.
     /// </summary>
     long ConfigGeneration => 0;
@@ -44,6 +50,12 @@ public interface INativeAutoRouter : IRouterState, IAsyncDisposable
     /// Updates configuration and returns the new configuration alongside its monotonic generation ID (R05).
     /// </summary>
     (RouterConfigDto Config, long Generation) UpdateConfigWithGeneration(RouterConfigDto updates) => (UpdateConfig(updates), ConfigGeneration);
+
+    /// <summary>
+    /// Asynchronously updates configuration and returns the new configuration alongside its monotonic generation ID (R05).
+    /// </summary>
+    Task<(RouterConfigDto Config, long Generation)> UpdateConfigWithGenerationAsync(RouterConfigDto updates, CancellationToken cancellationToken = default) =>
+        Task.FromResult(UpdateConfigWithGeneration(updates));
 
     /// <summary>
     /// Retrieves candidate quota evidence status for all candidate accounts without probing live Antigravity.
@@ -65,4 +77,13 @@ public interface INativeAutoRouter : IRouterState, IAsyncDisposable
     /// Reconciles manual switch completion with the router's active identity and stabilization cooldowns.
     /// </summary>
     Task NotifyManualSwitchCompletedAsync(ManualSwitchToken token, NativeSwitchResult result);
+}
+
+/// <summary>
+/// Evaluates whether an account switch is currently admissible based on present evidence,
+/// performing strictly read-only checks with zero mutations.
+/// </summary>
+public interface ISwitchPlanner
+{
+    Task<SwitchPlanResultDto> PlanSwitchAsync(string targetAccountId, CancellationToken cancellationToken = default);
 }

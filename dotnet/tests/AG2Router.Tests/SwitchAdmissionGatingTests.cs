@@ -657,6 +657,17 @@ public sealed class SwitchAdmissionGatingTests : IDisposable
             SwitchJournalEntry expectedEntry,
             CancellationToken cancellationToken = default) =>
             _underlying.DeleteIfUnchangedAsync(expectedEntry, cancellationToken);
+
+        public Task<SwitchJournalWriteResult> CreateIfAbsentAsync(
+            SwitchJournalEntry nextEntry,
+            CancellationToken cancellationToken = default) =>
+            _underlying.CreateIfAbsentAsync(nextEntry, cancellationToken);
+
+        public Task<SwitchJournalWriteResult> ReplaceIfUnchangedAsync(
+            SwitchJournalEntry expectedEntry,
+            SwitchJournalEntry nextEntry,
+            CancellationToken cancellationToken = default) =>
+            _underlying.ReplaceIfUnchangedAsync(expectedEntry, nextEntry, cancellationToken);
     }
 
     private sealed class FakeAutoRouterAccountStore : IAccountStore

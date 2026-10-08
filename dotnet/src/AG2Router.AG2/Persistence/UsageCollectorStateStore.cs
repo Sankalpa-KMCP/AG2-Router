@@ -118,6 +118,10 @@ public sealed class UsageCollectorStateStore
         try
         {
             await using var lease = await CrossProcessFileLease.AcquireAsync(_filePath, cancellationToken).ConfigureAwait(false);
+
+            // Fail closed if existing state is corrupt or unsupported: existing bytes must never be overwritten.
+            _ = ReadCheckpoint();
+
             var checkpoint = new UsageCollectorCheckpoint(
                 UsageCollectorCheckpoint.CurrentSchemaVersion,
                 _timeProvider.GetUtcNow(),

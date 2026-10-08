@@ -20,6 +20,7 @@ public partial class MainWindow : Window, IDashboardWindow
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
     private readonly string _dashboardUrl;
+    private readonly WebViewNavigationPolicy _navigationPolicy;
     private CoreWebView2DevToolsProtocolEventReceiver? _exceptionReceiver;
     private CoreWebView2DevToolsProtocolEventReceiver? _consoleReceiver;
     private CoreWebViewRecoveryEventSource? _eventSource;
@@ -37,6 +38,7 @@ public partial class MainWindow : Window, IDashboardWindow
     {
         InitializeComponent();
         _dashboardUrl = dashboardUrl;
+        _navigationPolicy = new WebViewNavigationPolicy(dashboardUrl);
         Loaded += MainWindow_Loaded;
     }
 
@@ -121,6 +123,10 @@ public partial class MainWindow : Window, IDashboardWindow
                         kind == WebViewFailureKind.Process ? "ProcessFailed" : "NavigationFailure", detail);
                     await RecoverWebViewAsync(kind, detail, capturedGeneration);
                 });
+
+            // 6. Security hardening (F7): lock top-level navigation to trusted local app origin
+            core.NavigationStarting += OnNavigationStarting;
+            core.NewWindowRequested += OnNewWindowRequested;
 
             core.Navigate(_dashboardUrl);
             _isWebViewInitialized = true;
@@ -207,6 +213,11 @@ public partial class MainWindow : Window, IDashboardWindow
         _pendingRecovery = null;
         var old = DashboardWebView;
         DetachWebViewEvents();
+        if (old.CoreWebView2 != null)
+        {
+            old.CoreWebView2.NavigationStarting -= OnNavigationStarting;
+            old.CoreWebView2.NewWindowRequested -= OnNewWindowRequested;
+        }
         if (_exceptionReceiver != null)
         {
             _exceptionReceiver.DevToolsProtocolEventReceived -= OnExceptionThrown;
@@ -248,9 +259,18 @@ public partial class MainWindow : Window, IDashboardWindow
         public event EventHandler<WebViewNavigationOutcomeEventArgs>? NavigationCompleted;
         public event EventHandler<WebViewProcessFailureEventArgs>? ProcessFailed;
 
-        private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e) =>
+        private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
+        {
+            if (!e.IsSuccess && e.WebErrorStatus == CoreWebView2WebErrorStatus.OperationCanceled)
+            {
+                // Deliberately cancelled navigation (e.g. unauthorized navigation blocked by policy)
+                // must not trigger failure recovery or error overlays.
+                return;
+            }
+
             NavigationCompleted?.Invoke(this,
                 new WebViewNavigationOutcomeEventArgs(e.IsSuccess, e.WebErrorStatus.ToString()));
+        }
 
         private void OnProcessFailed(object? sender, CoreWebView2ProcessFailedEventArgs e) =>
             ProcessFailed?.Invoke(this,
@@ -324,6 +344,9 @@ public partial class MainWindow : Window, IDashboardWindow
         {
             if (_isWebViewInitialized && DashboardWebView.CoreWebView2 != null)
             {
+                DashboardWebView.CoreWebView2.NavigationStarting -= OnNavigationStarting;
+                DashboardWebView.CoreWebView2.NewWindowRequested -= OnNewWindowRequested;
+
                 if (_exceptionReceiver != null)
                 {
                     _exceptionReceiver.DevToolsProtocolEventReceived -= OnExceptionThrown;
@@ -360,6 +383,21 @@ public partial class MainWindow : Window, IDashboardWindow
                 // Ignore disposal errors on teardown
             }
         }
+    }
+
+    private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
+    {
+        if (!_navigationPolicy.ShouldAllowNavigation(e.Uri, out var reason))
+        {
+            e.Cancel = true;
+            JsRuntimeDiagnostics.RecordError("NavigationBlocked", $"Blocked navigation to unauthorized URI '{e.Uri}'. Reason: {reason}");
+        }
+    }
+
+    private void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
+    {
+        e.Handled = true;
+        JsRuntimeDiagnostics.RecordError("NewWindowBlocked", $"Blocked new window request to URI '{e.Uri}'.");
     }
 
     private void OnRetryConnectionClicked(object sender, RoutedEventArgs e)

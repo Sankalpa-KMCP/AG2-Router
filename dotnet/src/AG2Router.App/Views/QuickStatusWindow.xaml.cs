@@ -49,7 +49,33 @@ public partial class QuickStatusWindow : Window
         TxtQuota.Text = quotaValue;
         TxtQuota.ToolTip = quotaToolTip;
 
-        TxtAutoSwitch.Text = status.Router.AutoSwitchEnabled ? "Active" : "Disabled";
+        var (autoText, autoTip) = FormatAutoSwitchStatus(status.Router.AutoSwitchEnabled, status.Router.PoolStatus);
+        TxtAutoSwitch.Text = autoText;
+        TxtAutoSwitch.ToolTip = autoTip;
+    }
+
+    internal static (string Text, string? ToolTip) FormatAutoSwitchStatus(bool autoSwitchEnabled, CandidatePoolStatusDto? poolStatus)
+    {
+        if (!autoSwitchEnabled)
+        {
+            return ("Disabled", null);
+        }
+        if (poolStatus != null && !poolStatus.HasUsableCandidate)
+        {
+            string text = poolStatus.ReasonCode switch
+            {
+                CandidatePoolReasonCodes.AllExhausted or CandidatePoolReasonCodes.QuotaDepleted => "Pool Exhausted",
+                CandidatePoolReasonCodes.AllInCooldown => "In Cooldown",
+                CandidatePoolReasonCodes.EvidenceStaleOrUnknown => "No Fresh Evidence",
+                CandidatePoolReasonCodes.ReserveOnly => "Reserve Only",
+                CandidatePoolReasonCodes.ValidationOrSessionFailed => "Invalid Sessions",
+                CandidatePoolReasonCodes.NoEnrolledAlternatives => "No Alternatives",
+                CandidatePoolReasonCodes.AllBelowMinimum => "Below Minimum",
+                _ => "No Candidates"
+            };
+            return (text, poolStatus.Message);
+        }
+        return ("Active", null);
     }
 
     public void ShowNearTray()

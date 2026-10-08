@@ -842,4 +842,256 @@ public class TelemetryPollingCoordinatorTests
         Assert.Equal(TimeSpan.FromSeconds(25), coordinator.Interval);
         Assert.Equal(3, coordinator.LastAppliedConfigGeneration);
     }
+
+    [Fact]
+    public async Task CurrentStatus_WhenAutoRouterPoolStatusInvalidatedToNull_ImmediatelyReflectsNullWithoutPoll()
+    {
+        var readyPool = new CandidatePoolStatusDto(true, CandidatePoolReasonCodes.Ready, "Ready", 2, 2, 2);
+        var autoRouter = new MockAutoRouter();
+        autoRouter.Status = autoRouter.Status with { PoolStatus = readyPool };
+
+        var account = new AccountIdentityDto("user@example.com", "User", "tier", "Tier", DateTime.UtcNow.ToString("o"));
+        var quota = new QuotaSnapshotDto(DateTime.UtcNow.ToString("o"), new List<ModelQuotaDto>(), null, null);
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "Connected")),
+            GetAccountQuotaObservationFunc = _ => Task.FromResult(new AccountQuotaObservation(account, quota))
+        };
+
+        await using var coordinator = new TelemetryPollingCoordinator(adapter, autoRouter: autoRouter);
+        await coordinator.PollAsync();
+
+        // Initial poll published READY
+        Assert.NotNull(coordinator.CurrentStatus.Router.PoolStatus);
+        Assert.Equal(CandidatePoolReasonCodes.Ready, coordinator.CurrentStatus.Router.PoolStatus!.ReasonCode);
+
+        // Authoritative router invalidates PoolStatus to null (e.g. config update, manual switch, epoch change)
+        autoRouter.Status = autoRouter.Status with { PoolStatus = null };
+
+        // CurrentStatus immediately reflects null without waiting for next poll tick
+        var current = coordinator.CurrentStatus;
+        Assert.Null(current.Router.PoolStatus);
+        Assert.Same(autoRouter.Status, current.Router);
+        // Telemetry is preserved
+        Assert.NotNull(current.Telemetry);
+        Assert.Equal("user@example.com", current.Telemetry!.CurrentAccount?.Email);
+    }
+
+    [Fact]
+    public async Task PollAsync_WhenPoolStatusInvalidatedDuringInFlightAdapterCall_PublishesAuthoritativeNull()
+    {
+        var readyPool = new CandidatePoolStatusDto(true, CandidatePoolReasonCodes.Ready, "Ready", 2, 2, 2);
+        var autoRouter = new MockAutoRouter();
+        autoRouter.Status = autoRouter.Status with { PoolStatus = readyPool };
+
+        var observationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseObservation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var account = new AccountIdentityDto("user@example.com", "User", "tier", "Tier", DateTime.UtcNow.ToString("o"));
+        var quota = new QuotaSnapshotDto(DateTime.UtcNow.ToString("o"), new List<ModelQuotaDto>(), null, null);
+
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "Connected")),
+            GetAccountQuotaObservationFunc = async _ =>
+            {
+                observationStarted.TrySetResult();
+                await releaseObservation.Task;
+                return new AccountQuotaObservation(account, quota);
+            }
+        };
+
+        await using var coordinator = new TelemetryPollingCoordinator(adapter, autoRouter: autoRouter);
+
+        SystemStatusDto? published = null;
+        coordinator.StatusUpdated += s => published = s;
+
+        var pollTask = coordinator.PollAsync();
+
+        // Wait until poll has evaluated router and is suspended in observation fetch
+        await observationStarted.Task;
+
+        // Invalidate router pool status while poll is in flight
+        autoRouter.Status = autoRouter.Status with { PoolStatus = null };
+
+        // Release observation fetch
+        releaseObservation.TrySetResult();
+        await pollTask;
+
+        // The published status must have null PoolStatus, not the stale READY captured before the adapter call
+        Assert.NotNull(published);
+        Assert.Null(published!.Router.PoolStatus);
+        Assert.Null(coordinator.CurrentStatus.Router.PoolStatus);
+        // Telemetry must be successfully populated
+        Assert.NotNull(published.Telemetry);
+        Assert.Equal("user@example.com", published.Telemetry!.CurrentAccount?.Email);
+    }
+
+    [Fact]
+    public async Task PoolStatus_ReadyToNullToExhaustedTransitions_PropagateCleanlyWithoutStickyState()
+    {
+        var readyPool = new CandidatePoolStatusDto(true, CandidatePoolReasonCodes.Ready, "Ready", 2, 2, 2);
+        var exhaustedPool = new CandidatePoolStatusDto(false, CandidatePoolReasonCodes.AllExhausted, "All exhausted", 2, 0, 0);
+
+        var autoRouter = new MockAutoRouter();
+        autoRouter.Status = autoRouter.Status with { PoolStatus = readyPool };
+
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "Connected")),
+            GetAccountQuotaObservationFunc = _ => Task.FromResult(new AccountQuotaObservation(
+                new AccountIdentityDto("user@example.com"),
+                new QuotaSnapshotDto(DateTime.UtcNow.ToString("o"), new List<ModelQuotaDto>(), null, null)))
+        };
+
+        await using var coordinator = new TelemetryPollingCoordinator(adapter, autoRouter: autoRouter);
+
+        // State 1: READY
+        await coordinator.PollAsync();
+        Assert.Equal(CandidatePoolReasonCodes.Ready, coordinator.CurrentStatus.Router.PoolStatus?.ReasonCode);
+
+        // State 2: Invalidated to null
+        autoRouter.Status = autoRouter.Status with { PoolStatus = null };
+        Assert.Null(coordinator.CurrentStatus.Router.PoolStatus);
+
+        // State 3: New evaluation results in ALL_EXHAUSTED
+        autoRouter.Status = autoRouter.Status with { PoolStatus = exhaustedPool };
+        Assert.Equal(CandidatePoolReasonCodes.AllExhausted, coordinator.CurrentStatus.Router.PoolStatus?.ReasonCode);
+
+        // Next poll also publishes ALL_EXHAUSTED
+        await coordinator.PollAsync();
+        Assert.Equal(CandidatePoolReasonCodes.AllExhausted, coordinator.CurrentStatus.Router.PoolStatus?.ReasonCode);
+
+        // State 4: Invalidated to null again
+        autoRouter.Status = autoRouter.Status with { PoolStatus = null };
+        Assert.Null(coordinator.CurrentStatus.Router.PoolStatus);
+    }
+
+    [Fact]
+    public void TryApplyStatus_WhenAutoRouterHasNullPoolStatus_OverridesStaleReadyStatus()
+    {
+        var autoRouter = new MockAutoRouter();
+        autoRouter.Status = autoRouter.Status with { PoolStatus = null };
+
+        var adapter = new MockAG2Adapter();
+        var coordinator = new TelemetryPollingCoordinator(adapter, autoRouter: autoRouter);
+
+        var staleReady = new SystemStatusDto(
+            Status: "ok",
+            Ag2: new Ag2StatusDto(true, "HEALTHY", null, "ok"),
+            Router: new RouterStatusDto("HEALTHY", false, "user@example.com", "user@example.com", null, null, "Active",
+                new RouterConfigDto(),
+                PoolStatus: new CandidatePoolStatusDto(true, CandidatePoolReasonCodes.Ready, "Stale ready", 2, 2, 2)),
+            Telemetry: null
+        );
+
+        bool applied = coordinator.TryApplyStatus(1, staleReady);
+        Assert.True(applied);
+        Assert.Null(coordinator.CurrentStatus.Router.PoolStatus);
+    }
+
+    [Fact]
+    public async Task PublishStatus_WhenRouterBecomesNullBeforeTryApplyStatus_PublishesExactAppliedNullSnapshot()
+    {
+        // F1 regression:
+        // Publication begins with router PoolStatus READY.
+        // Before TryApplyStatus, router becomes null.
+        // TryApplyStatus stores null, and StatusUpdated MUST emit THAT exact normalized snapshot (null).
+        var readyPool = new CandidatePoolStatusDto(true, CandidatePoolReasonCodes.Ready, "Ready", 2, 2, 2);
+        var autoRouter = new MockAutoRouter();
+        autoRouter.Status = autoRouter.Status with { PoolStatus = readyPool };
+
+        var account = new AccountIdentityDto("user@example.com", "User", "tier", "Tier", DateTime.UtcNow.ToString("o"));
+        var quota = new QuotaSnapshotDto(DateTime.UtcNow.ToString("o"), new List<ModelQuotaDto>(), null, null);
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "Connected")),
+            GetAccountQuotaObservationFunc = _ => Task.FromResult(new AccountQuotaObservation(account, quota))
+        };
+
+        await using var coordinator = new TelemetryPollingCoordinator(adapter, autoRouter: autoRouter);
+
+        SystemStatusDto? published = null;
+        coordinator.StatusUpdated += s => published = s;
+
+        // Deterministic seam: right before TryApplyStatus is called in PublishStatus, invalidate router to null
+        coordinator.OnBeforeApplyStatus = () =>
+        {
+            autoRouter.Status = autoRouter.Status with { PoolStatus = null };
+        };
+
+        await coordinator.PollAsync();
+
+        // 1. Stored status must have null PoolStatus
+        Assert.Null(coordinator.CurrentStatus.Router.PoolStatus);
+
+        // 2. Published payload MUST have null PoolStatus (fixing F1 where it emitted older READY)
+        Assert.NotNull(published);
+        Assert.Null(published!.Router.PoolStatus);
+
+        // 3. Published object is the EXACT applied normalized snapshot instance
+        Assert.Same(coordinator.CurrentStatus, published);
+
+        // 4. Fresh independent telemetry remains intact
+        Assert.NotNull(published.Telemetry);
+        Assert.Equal("user@example.com", published.Telemetry!.CurrentAccount?.Email);
+    }
+
+    [Fact]
+    public async Task PublishStatus_WhenRouterBecomesExhaustedBeforeTryApplyStatus_PublishesExactAppliedExhaustedSnapshot()
+    {
+        // F1 regression for non-null transition:
+        // Publication begins with router PoolStatus READY.
+        // Before TryApplyStatus, router becomes ALL_EXHAUSTED.
+        // StatusUpdated MUST emit the updated ALL_EXHAUSTED snapshot.
+        var readyPool = new CandidatePoolStatusDto(true, CandidatePoolReasonCodes.Ready, "Ready", 2, 2, 2);
+        var exhaustedPool = new CandidatePoolStatusDto(false, CandidatePoolReasonCodes.AllExhausted, "All exhausted", 2, 0, 0);
+
+        var autoRouter = new MockAutoRouter();
+        autoRouter.Status = autoRouter.Status with { PoolStatus = readyPool };
+
+        var adapter = new MockAG2Adapter
+        {
+            GetStatusFunc = _ => Task.FromResult(new Ag2StatusDto(true, "HEALTHY", null, "Connected")),
+            GetAccountQuotaObservationFunc = _ => Task.FromResult(new AccountQuotaObservation(
+                new AccountIdentityDto("user@example.com"),
+                new QuotaSnapshotDto(DateTime.UtcNow.ToString("o"), new List<ModelQuotaDto>(), null, null)))
+        };
+
+        await using var coordinator = new TelemetryPollingCoordinator(adapter, autoRouter: autoRouter);
+
+        SystemStatusDto? published = null;
+        coordinator.StatusUpdated += s => published = s;
+
+        coordinator.OnBeforeApplyStatus = () =>
+        {
+            autoRouter.Status = autoRouter.Status with { PoolStatus = exhaustedPool };
+        };
+
+        await coordinator.PollAsync();
+
+        Assert.NotNull(published);
+        Assert.Equal(CandidatePoolReasonCodes.AllExhausted, published!.Router.PoolStatus?.ReasonCode);
+        Assert.Same(coordinator.CurrentStatus, published);
+    }
+
+    [Fact]
+    public void TryApplyStatus_WhenSequenceIsStale_DoesNotPublishAndReturnsNullAppliedStatus()
+    {
+        var adapter = new MockAG2Adapter();
+        var coordinator = new TelemetryPollingCoordinator(adapter);
+
+        var status1 = new SystemStatusDto("ok", new Ag2StatusDto(true, "HEALTHY", null, "ok"),
+            new RouterStatusDto("HEALTHY", false, null, null, null, null, "Active", new RouterConfigDto()), null);
+        var status2 = new SystemStatusDto("ok", new Ag2StatusDto(true, "HEALTHY", null, "ok"),
+            new RouterStatusDto("HEALTHY", false, null, null, null, null, "Newer", new RouterConfigDto()), null);
+
+        // Sequence 2 applies first
+        Assert.True(coordinator.TryApplyStatus(2, status2, out var applied2));
+        Assert.Same(status2, applied2);
+
+        // Sequence 1 is stale: rejected, appliedStatus is null
+        Assert.False(coordinator.TryApplyStatus(1, status1, out var applied1));
+        Assert.Null(applied1);
+    }
 }

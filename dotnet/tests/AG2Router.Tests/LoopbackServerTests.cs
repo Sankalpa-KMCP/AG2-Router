@@ -52,16 +52,19 @@ public class LoopbackServerTests
             // 1. Static asset: index.html
             var htmlRes = await httpClient.GetAsync($"{server.BoundUrl}/index.html");
             Assert.Equal(HttpStatusCode.OK, htmlRes.StatusCode);
+            Assert.Equal(LoopbackServer.DefaultContentSecurityPolicy, htmlRes.Headers.GetValues("Content-Security-Policy").FirstOrDefault());
             var htmlContent = await htmlRes.Content.ReadAsStringAsync();
             Assert.Contains("AG2 Router", htmlContent);
 
             // 2. Static asset: styles.css
             var cssRes = await httpClient.GetAsync($"{server.BoundUrl}/styles.css");
             Assert.Equal(HttpStatusCode.OK, cssRes.StatusCode);
+            Assert.Equal(LoopbackServer.DefaultContentSecurityPolicy, cssRes.Headers.GetValues("Content-Security-Policy").FirstOrDefault());
 
             // 3. Static asset: app.js
             var jsRes = await httpClient.GetAsync($"{server.BoundUrl}/app.js");
             Assert.Equal(HttpStatusCode.OK, jsRes.StatusCode);
+            Assert.Equal(LoopbackServer.DefaultContentSecurityPolicy, jsRes.Headers.GetValues("Content-Security-Policy").FirstOrDefault());
         }
         finally
         {
@@ -84,6 +87,7 @@ public class LoopbackServerTests
             Assert.Equal(HttpStatusCode.OK, statusRes.StatusCode);
             Assert.Equal("nosniff", statusRes.Headers.GetValues("X-Content-Type-Options").FirstOrDefault());
             Assert.Equal("DENY", statusRes.Headers.GetValues("X-Frame-Options").FirstOrDefault());
+            Assert.Equal(LoopbackServer.DefaultContentSecurityPolicy, statusRes.Headers.GetValues("Content-Security-Policy").FirstOrDefault());
 
             var statusJson = await statusRes.Content.ReadAsStringAsync();
             var statusDoc = JsonDocument.Parse(statusJson);
@@ -95,6 +99,7 @@ public class LoopbackServerTests
             // 2. GET /api/accounts
             var accRes = await httpClient.GetAsync($"{server.BoundUrl}/api/accounts");
             Assert.Equal(HttpStatusCode.OK, accRes.StatusCode);
+            Assert.Equal(LoopbackServer.DefaultContentSecurityPolicy, accRes.Headers.GetValues("Content-Security-Policy").FirstOrDefault());
             var accJson = await accRes.Content.ReadAsStringAsync();
             var accDoc = JsonDocument.Parse(accJson);
             Assert.Empty(accDoc.RootElement.GetProperty("accounts").EnumerateArray());
@@ -102,6 +107,7 @@ public class LoopbackServerTests
             // 3. GET /api/config
             var cfgRes = await httpClient.GetAsync($"{server.BoundUrl}/api/config");
             Assert.Equal(HttpStatusCode.OK, cfgRes.StatusCode);
+            Assert.Equal(LoopbackServer.DefaultContentSecurityPolicy, cfgRes.Headers.GetValues("Content-Security-Policy").FirstOrDefault());
             var cfgJson = await cfgRes.Content.ReadAsStringAsync();
             var cfgDoc = JsonDocument.Parse(cfgJson);
             Assert.False(cfgDoc.RootElement.GetProperty("config").GetProperty("autoSwitchEnabled").GetBoolean());
@@ -109,6 +115,7 @@ public class LoopbackServerTests
             // 4. GET /api/switching/status
             var swRes = await httpClient.GetAsync($"{server.BoundUrl}/api/switching/status");
             Assert.Equal(HttpStatusCode.OK, swRes.StatusCode);
+            Assert.Equal(LoopbackServer.DefaultContentSecurityPolicy, swRes.Headers.GetValues("Content-Security-Policy").FirstOrDefault());
             var swJson = await swRes.Content.ReadAsStringAsync();
             var swDoc = JsonDocument.Parse(swJson);
             Assert.Equal("IDLE", swDoc.RootElement.GetProperty("status").GetProperty("currentState").GetString());
@@ -148,6 +155,47 @@ public class LoopbackServerTests
             // POST /api/config -> 501 Not Implemented
             var updateCfgRes = await httpClient.PostAsync($"{server.BoundUrl}/api/config", null);
             Assert.Equal(HttpStatusCode.NotImplemented, updateCfgRes.StatusCode);
+        }
+        finally
+        {
+            await server.StopAsync();
+            await server.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task StatusEndpoint_WhenStatusProviderHasStaleReadyPoolStatus_OverridesWithAuthoritativeNullPoolStatus()
+    {
+        var server = new LoopbackServer();
+        var autoRouter = new MockAutoRouter();
+        // Authoritative router has null PoolStatus (invalidated)
+        autoRouter.Status = autoRouter.Status with { PoolStatus = null };
+
+        // Stale status provider supplies a snapshot with READY PoolStatus
+        var staleReadyPool = new CandidatePoolStatusDto(true, CandidatePoolReasonCodes.Ready, "Stale ready pool", 2, 2, 2);
+        var staleStatus = new SystemStatusDto(
+            "ok",
+            new Ag2StatusDto(true, "HEALTHY", null, "Connected"),
+            new RouterStatusDto("HEALTHY", true, "user@example.com", "user@example.com", null, null, "Active",
+                new RouterConfigDto(AutoSwitchEnabled: true),
+                PoolStatus: staleReadyPool),
+            new TelemetryDto(null, null, null, null, null)
+        );
+
+        try
+        {
+            await server.StartAsync(0,
+                statusProvider: () => staleStatus,
+                autoRouter: autoRouter);
+
+            using var httpClient = new HttpClient();
+            using var response = await httpClient.GetAsync($"{server.BoundUrl}/api/status");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var routerProp = json.RootElement.GetProperty("router");
+            var poolStatusProp = routerProp.GetProperty("poolStatus");
+            Assert.Equal(JsonValueKind.Null, poolStatusProp.ValueKind);
         }
         finally
         {

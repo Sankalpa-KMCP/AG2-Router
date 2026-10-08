@@ -61,7 +61,7 @@ UI changes: edit frontend/, run `npm run build:ui`, never patch src/ui directly.
 ## Persistence
 
 - Contracts and primitives: dotnet/src/AG2Router.AG2/Persistence/DurableFileWriter.cs (atomic writes, PathLockRegistry, CrossProcessFileLease); Core/Contracts/ISecurityStorage.cs, IQuotaObservationStore.cs.
-- Stores: Accounts/LocalMetadataAccountStore.cs (accounts.json), Vault/SessionVault.cs (vault/sessions.dat), Routing + Switching share Persistence/DurableQuotaObservationStore.cs, Switching/SwitchJournalStore.cs, Persistence/UsageCallLedger.cs, Persistence/UsageCollectorStateStore.cs.
+- Stores: Accounts/LocalMetadataAccountStore.cs (accounts.json), Vault/SessionVault.cs (vault/sessions.dat), Routing + Switching share Persistence/DurableQuotaObservationStore.cs, Switching/SwitchJournalStore.cs and SwitchTransitionMarker.cs (canonical journal plus transition sidecar), Persistence/UsageCallLedger.cs, Persistence/UsageCollectorStateStore.cs.
 - Durable layout and lock order: [persistence-and-concurrency.md](persistence-and-concurrency.md).
 - Tests: AccountStoreTests, SessionVaultTests, DurableQuotaObservationStoreTests, SwitchJournalStoreTests, and related suites.
 

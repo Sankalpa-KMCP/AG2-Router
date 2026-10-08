@@ -27,6 +27,8 @@ namespace AG2Router.App.Server;
 /// </summary>
 public class LoopbackServer : IAsyncDisposable
 {
+    public const string DefaultContentSecurityPolicy = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'";
+
     private WebApplication? _app;
     private int _boundPort;
     private string _boundUrl = string.Empty;
@@ -42,6 +44,7 @@ public class LoopbackServer : IAsyncDisposable
         AccountEnrollmentService? enrollmentService = null,
         INativeAccountSwitchCoordinator? switchCoordinator = null,
         INativeAutoRouter? autoRouter = null,
+        ISwitchPlanner? switchPlanner = null,
         IAutostartService? autostartService = null,
         AG2Router.AG2.Usage.UsageAggregationService? usageAggregation = null,
         Func<UsageCollectorDiagnostics?>? usageCollectorStatusProvider = null,
@@ -105,6 +108,7 @@ public class LoopbackServer : IAsyncDisposable
             context.Response.Headers.Append("X-Content-Type-Options", "nosniff");
             context.Response.Headers.Append("X-Frame-Options", "DENY");
             context.Response.Headers.Append("Cache-Control", "no-store");
+            context.Response.Headers.Append("Content-Security-Policy", DefaultContentSecurityPolicy);
             await next();
         });
 
@@ -123,7 +127,17 @@ public class LoopbackServer : IAsyncDisposable
         {
             if (statusProvider != null)
             {
-                return Results.Ok(SanitizeStatusQuota(statusProvider()));
+                var providedStatus = statusProvider();
+                if (autoRouter != null)
+                {
+                    var authoritativeRouter = autoRouter.GetStatus();
+                    if (providedStatus.Router.PoolStatus != authoritativeRouter.PoolStatus ||
+                        providedStatus.Router != authoritativeRouter)
+                    {
+                        providedStatus = providedStatus with { Router = authoritativeRouter };
+                    }
+                }
+                return Results.Ok(SanitizeStatusQuota(providedStatus));
             }
 
             var status = new SystemStatusDto(
@@ -417,8 +431,53 @@ public class LoopbackServer : IAsyncDisposable
         });
 
         // POST /api/accounts/{id}/switch-plan - Dry-run evaluation
-        _app.MapPost("/api/accounts/{id}/switch-plan", (string id) =>
-            Results.Json(new { error = "Switch planner service is not configured" }, statusCode: StatusCodes.Status501NotImplemented));
+        _app.MapPost("/api/accounts/{id}/switch-plan", async (string id, HttpContext context) =>
+        {
+            if (switchPlanner == null)
+            {
+                return Results.Json(new { error = "Switch planner service is not configured." },
+                    statusCode: StatusCodes.Status501NotImplemented);
+            }
+            if (string.IsNullOrWhiteSpace(id) || id.Contains('/') || id.Contains('\\'))
+            {
+                return Results.Json(new { error = "Account ID required" },
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+            if (!IsAllowedMutationOrigin(context))
+            {
+                return Results.Json(new { error = "Unauthorized origin." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (string.Equals(context.Request.Headers["Sec-Fetch-Site"], "cross-site", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.Json(new { error = "Cross-site requests forbidden." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            try
+            {
+                var plan = await switchPlanner.PlanSwitchAsync(id, context.RequestAborted);
+                plan = plan with
+                {
+                    Message = AG2Security.RedactSensitiveText(plan.Message),
+                    IneligibilityReason = plan.IneligibilityReason != null ? AG2Security.RedactSensitiveText(plan.IneligibilityReason) : null
+                };
+                if (!plan.TargetExists)
+                {
+                    return Results.Json(plan, statusCode: StatusCodes.Status404NotFound);
+                }
+                return Results.Ok(plan);
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { error = AG2Security.RedactSensitiveText(ex.Message) },
+                    statusCode: StatusCodes.Status500InternalServerError);
+            }
+        });
 
         // POST /api/accounts/{id}/switch - Explicit user-requested native switch only.
         _app.MapPost("/api/accounts/{id}/switch", async (string id, HttpContext context) =>
@@ -663,7 +722,7 @@ public class LoopbackServer : IAsyncDisposable
                     return Results.Json(new { error = "Invalid configuration payload." }, statusCode: StatusCodes.Status400BadRequest);
                 }
                 RouterConfigValidator.Validate(body);
-                var (updated, generation) = autoRouter.UpdateConfigWithGeneration(body);
+                var (updated, generation) = await autoRouter.UpdateConfigWithGenerationAsync(body, context.RequestAborted).ConfigureAwait(false);
                 if (body.PollingIntervalMs > 0)
                 {
                     var interval = TimeSpan.FromMilliseconds(body.PollingIntervalMs);

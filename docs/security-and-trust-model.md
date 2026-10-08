@@ -30,7 +30,8 @@ The application does not claim to defend secrets from a fully compromised same-u
 - API requests reject foreign Origin and Sec-Fetch-Site: cross-site. A missing Origin remains accepted for same-user native callers. Both the shipped .NET host and the Node reference server enforce these browser mutation checks centrally across all API mutation endpoints before reading or parsing request bodies or executing state changes.
 - Ordinary status and health responses do not issue the switching token. The dedicated POST /api/switching/intent path requires a custom intent-request header and the browser-origin checks before issuing it.
 - Explicit switching requires the per-process token plus confirm: true.
-- WebView2 loads the server URL created by the application.
+- Loopback responses emit a restrictive Content-Security-Policy (`default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'`) across native and reference UI and API endpoints.
+- WebView2 is locked to the trusted local application origin: `NavigationStarting` blocks and cancels top-level navigation to foreign origins, external ports, or untrusted schemes (`javascript:`, `data:`, `file:`, etc.); `NewWindowRequested` is handled and blocked; and deliberately cancelled navigations do not trigger connection failure recovery.
 
 INTENDED SECURITY PROPERTY:
 
@@ -71,13 +72,27 @@ Primary evidence: AG2ProcessDetector, ProcessProvenanceValidator, WindowsProcess
 
 ## Secret handling
 
-- AG2Security sanitizes known sensitive flags, headers, and key/value patterns before messages cross diagnostics or API boundaries.
+- AG2Security sanitizes known sensitive flags, headers (including multi-parameter Digest and line-bounded Authorization headers containing internal brackets, braces, or punctuation, terminating strictly at line boundaries or EOF), and JSON/diagnostic key/value patterns across structural separator whitespace (spaces, tabs, newlines) before messages cross diagnostics or API boundaries.
 - RPC calls keep discovered tokens inside the adapter boundary and redact error snippets.
 - Credential buffers are copied narrowly and zeroed where practical. Managed-runtime zeroing is best-effort, not guaranteed erasure of all transient strings or copies.
 - Public account/status DTOs must contain metadata and telemetry only, never credential material.
 - Release packaging scans selected text assets for known secret markers, but that scan is not a complete secret detector.
 
 Primary evidence: AG2Security.cs, AG2RpcClient.cs, Windows DPAPI/WinCred implementations, packaging script, and security/RPC tests.
+
+## Daemon RPC transport security
+
+INTENDED SECURITY PROPERTY:
+
+- The sensitive daemon authentication token (`x-codeium-csrf-token`) must be transmitted strictly to the verified local loopback endpoint (`127.0.0.1`) discovered via process provenance.
+- Production RPC HTTP handlers (`SocketsHttpHandler`) explicitly disable automatic redirect following (`AllowAutoRedirect = false`) and explicitly bypass all system/environment HTTP proxies (`UseProxy = false`). Loopback communication does not rely on ambient proxy bypass rules or platform-dependent loopback exemption heuristics.
+- All request dispatches employ header-first completion semantics (`HttpCompletionOption.ResponseHeadersRead`). All redirect-class responses (HTTP 300, 301, 302, 303, 307, 308) are treated as transport failures and rejected immediately from headers before response bodies are buffered or consumed, preventing memory exhaustion, hangs on delayed bodies, or credential forwarding, and never following `Location` targets or logging secrets.
+- A single bounded cancellation deadline (defaulting to 5 seconds for standard RPCs, 3 seconds for port probes) spans request dispatch, response headers, redirect validation, and all permitted nonredirect response-body reads. When headers complete via `HttpCompletionOption.ResponseHeadersRead`, subsequent response-body reads execute under the exact same linked cancellation token budget. Stalled or withheld response bodies cannot delay completion past the configured 5-second RPC deadline, while immediate header-first redirect rejection is preserved.
+- Requests attach `x-codeium-csrf-token` per-request; tokens are never placed on global or shared `DefaultRequestHeaders`.
+- Destination URIs are validated before request construction: non-loopback hosts, out-of-range ports, and unexpected schemes are rejected fail-closed.
+- Daemon port probing during process discovery refuses 3xx responses, preventing false daemon detection or token leakage during scans.
+
+Primary evidence: AG2RpcClient.cs, AG2RpcTransportSecurityTests.cs, AG2ProcessDetector.cs, UsageInstanceDiscovery.cs, and AG2RpcClientTests.
 
 ## Fail-closed behavior
 

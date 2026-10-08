@@ -100,3 +100,14 @@ public record QuotaObservationsDocument
         Observations = observations ?? throw new ArgumentNullException(nameof(observations), "An observations array is required.");
     }
 }
+
+/// <summary>
+/// One atomic read of the durable quota observation store: the consolidated observation rows
+/// and the durable evidence revision they were read at. The revision changes whenever a
+/// durable observation mutation lands (record, complete snapshot, or account-wide
+/// invalidation), so a reader can prove its rows still describe current evidence. The rows
+/// and revision always describe the same durable state because they come from one read.
+/// </summary>
+public sealed record QuotaObservationSnapshot(
+    IReadOnlyList<AccountModelQuotaObservation> Observations,
+    long Revision);

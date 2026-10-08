@@ -17,6 +17,43 @@ public static class SwitchResultCodes
     public const string SwitchFailedRollbackFailed = "SWITCH_FAILED_ROLLBACK_FAILED";
 }
 
+public static class SwitchPlanReasonCodes
+{
+    public const string Success = "SUCCESS";
+    public const string TargetNotFound = "TARGET_NOT_FOUND";
+    public const string TargetNotVaulted = "TARGET_NOT_VAULTED";
+    public const string TargetIneligible = "TARGET_INELIGIBLE";
+    public const string AlreadyActive = "ALREADY_ACTIVE";
+    public const string Ag2Busy = "AG2_BUSY";
+    public const string TelemetryUnavailable = "TELEMETRY_UNAVAILABLE";
+    public const string SwitchInProgress = "SWITCH_IN_PROGRESS";
+    public const string SafetyBlocked = "SAFETY_BLOCKED";
+    public const string CooldownActive = "COOLDOWN_ACTIVE";
+    public const string TargetExhausted = "TARGET_EXHAUSTED";
+    public const string TargetBelowMinimum = "TARGET_BELOW_MINIMUM";
+}
+
+public record SwitchPlanResultDto(
+    [property: JsonPropertyName("targetAccountId")] string TargetAccountId,
+    [property: JsonPropertyName("targetEmail")] string? TargetEmail,
+    [property: JsonPropertyName("targetExists")] bool TargetExists,
+    [property: JsonPropertyName("isEligible")] bool IsEligible,
+    [property: JsonPropertyName("hasVaultedSession")] bool HasVaultedSession,
+    [property: JsonPropertyName("isAlreadyActive")] bool IsAlreadyActive,
+    [property: JsonPropertyName("isReserve")] bool IsReserve,
+    [property: JsonPropertyName("systemState")] string SystemState,
+    [property: JsonPropertyName("safetyState")] string SafetyState,
+    [property: JsonPropertyName("workloadModelKey")] string? WorkloadModelKey,
+    [property: JsonPropertyName("targetQuotaPercent")] double? TargetQuotaPercent,
+    [property: JsonPropertyName("quotaStatus")] string QuotaStatus,
+    [property: JsonPropertyName("observationAgeSeconds")] double? ObservationAgeSeconds,
+    [property: JsonPropertyName("inCooldown")] bool InCooldown,
+    [property: JsonPropertyName("ineligibilityReason")] string? IneligibilityReason,
+    [property: JsonPropertyName("admissible")] bool Admissible,
+    [property: JsonPropertyName("reasonCode")] string ReasonCode,
+    [property: JsonPropertyName("message")] string Message
+);
+
 public static class NativeSwitchStates
 {
     public const string Idle = "IDLE";
@@ -118,6 +155,20 @@ public interface INativeAccountSwitchCoordinator
         Func<CancellationToken, Task<IDisposable>> acquireInterruptionAdmissionAsync,
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("This coordinator does not support owned automatic interruption admission.");
+
+    /// <summary>
+    /// Asynchronously acquires configuration ownership at the final currentness proof and retains it
+    /// until source interruption is issued, or disposes it if admission/stop fails.
+    /// </summary>
+    Task<NativeSwitchResult> SwitchAutomaticallyAsync(
+        string targetAccountId, string? expectedActiveAccountId, Func<Task<bool>> planIsCurrentAsync,
+        string? requiredWorkloadModelKey, double? minimumCandidateQuotaPercent,
+        Func<CancellationToken, Task<IDisposable>> acquireInterruptionAdmissionAsync,
+        CancellationToken cancellationToken = default) =>
+        SwitchAutomaticallyAsync(targetAccountId, expectedActiveAccountId,
+            () => planIsCurrentAsync().GetAwaiter().GetResult(),
+            requiredWorkloadModelKey, minimumCandidateQuotaPercent,
+            acquireInterruptionAdmissionAsync, cancellationToken);
     NativeSwitchStatus GetStatus();
     Task CoordinateShutdownAsync(TimeSpan timeout, CancellationToken cancellationToken = default);
     bool CanAdmitSwitch(out string? blockingReason)

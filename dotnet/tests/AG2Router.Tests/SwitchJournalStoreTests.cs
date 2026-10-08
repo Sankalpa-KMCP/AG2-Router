@@ -133,7 +133,8 @@ public sealed class SwitchJournalStoreTests : IDisposable
             "updatedAt",
             "sourceAccountId",
             "targetAccountId",
-            "quarantineReasonCode"
+            "quarantineReasonCode",
+            "targetActivationProvenance"
         };
 
         var actualProperties = new List<string>();
@@ -970,5 +971,201 @@ public sealed class SwitchJournalStoreTests : IDisposable
             WrittenContent = content;
             return Task.CompletedTask;
         }
+    }
+
+    // =========================================================================
+    // Ownership-conditional write primitives (PROMPT #029 write-side ownership)
+    // =========================================================================
+
+    [Fact]
+    public async Task OwnershipWrite_A_CreateIfAbsent_WhenAbsent_SucceedsAndPersistsEntry()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        var next = CreateSampleEntry(SwitchJournalState.RECORDED);
+
+        var result = await store.CreateIfAbsentAsync(next);
+
+        Assert.Equal(SwitchJournalWriteStatus.Created, result.Status);
+        Assert.NotNull(result.Entry);
+        var read = await store.ReadAsync();
+        Assert.Equal(SwitchJournalReadStatus.Valid, read.Status);
+        Assert.Equal(next.TransactionId, read.Entry!.TransactionId);
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_B_CreateIfAbsent_WhenValidJournalExists_PreservesIt()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        var existing = CreateSampleEntry(SwitchJournalState.QUARANTINED, quarantineReason: "ROLLBACK_FAILED");
+        await store.WriteEntryAsync(existing);
+        string originalJson = await File.ReadAllTextAsync(path);
+
+        var result = await store.CreateIfAbsentAsync(CreateSampleEntry(SwitchJournalState.RECORDED));
+
+        Assert.Equal(SwitchJournalWriteStatus.AlreadyExists, result.Status);
+        Assert.Equal(originalJson, await File.ReadAllTextAsync(path));
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_C_CreateIfAbsent_WhenCorruptBytesExist_PreservesThem()
+    {
+        string path = CreateJournalPath();
+        const string corrupt = "{ not a journal";
+        await File.WriteAllTextAsync(path, corrupt);
+        var store = new SwitchJournalStore(path);
+
+        var result = await store.CreateIfAbsentAsync(CreateSampleEntry(SwitchJournalState.RECORDED));
+
+        Assert.Equal(SwitchJournalWriteStatus.AlreadyExists, result.Status);
+        Assert.Equal(corrupt, await File.ReadAllTextAsync(path));
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_D_ReplaceIfUnchanged_ExactExpected_Succeeds()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        var expected = CreateSampleEntry(SwitchJournalState.RECORDED);
+        await store.WriteEntryAsync(expected);
+        var read = await store.ReadAsync();
+        var next = CreateSampleEntry(SwitchJournalState.CREDENTIAL_APPLYING, transactionId: expected.TransactionId);
+
+        var result = await store.ReplaceIfUnchangedAsync(read.Entry!, next);
+
+        Assert.Equal(SwitchJournalWriteStatus.Replaced, result.Status);
+        var current = await store.ReadAsync();
+        Assert.Equal(SwitchJournalState.CREDENTIAL_APPLYING, current.Entry!.State);
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_E_ReplaceIfUnchanged_DifferentEntry_PreservesCanonical()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        var canonical = CreateSampleEntry(SwitchJournalState.QUARANTINED, quarantineReason: "ROLLBACK_FAILED");
+        await store.WriteEntryAsync(canonical);
+        string originalJson = await File.ReadAllTextAsync(path);
+        var staleExpected = CreateSampleEntry(SwitchJournalState.RECORDED);
+
+        var result = await store.ReplaceIfUnchangedAsync(staleExpected, CreateSampleEntry(SwitchJournalState.CREDENTIAL_APPLYING));
+
+        Assert.Equal(SwitchJournalWriteStatus.NotMatched, result.Status);
+        Assert.Equal(originalJson, await File.ReadAllTextAsync(path));
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_F_ReplaceIfUnchanged_SameStateDifferentTransaction_PreservesCanonical()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        var canonical = CreateSampleEntry(SwitchJournalState.RECORDED, transactionId: Guid.NewGuid().ToString("D"));
+        await store.WriteEntryAsync(canonical);
+        var expectedButForeign = CreateSampleEntry(SwitchJournalState.RECORDED, transactionId: Guid.NewGuid().ToString("D"));
+
+        var result = await store.ReplaceIfUnchangedAsync(expectedButForeign, CreateSampleEntry(SwitchJournalState.CREDENTIAL_APPLYING));
+
+        Assert.Equal(SwitchJournalWriteStatus.NotMatched, result.Status);
+        var current = await store.ReadAsync();
+        Assert.Equal(canonical.TransactionId, current.Entry!.TransactionId);
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_G_ReplaceIfUnchanged_ProvenanceOnlyDifference_PreservesCanonical()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        var canonical = CreateSampleEntry(SwitchJournalState.RECORDED);
+        canonical = canonical with { TargetActivationProvenance = SwitchTargetActivationProvenance.NOT_ATTEMPTED };
+        await store.WriteEntryAsync(canonical);
+        var expectedDifferentProvenance = CreateSampleEntry(SwitchJournalState.RECORDED, transactionId: canonical.TransactionId);
+
+        var result = await store.ReplaceIfUnchangedAsync(expectedDifferentProvenance, CreateSampleEntry(SwitchJournalState.CREDENTIAL_APPLYING));
+
+        Assert.Equal(SwitchJournalWriteStatus.NotMatched, result.Status);
+        var current = await store.ReadAsync();
+        Assert.Equal(SwitchTargetActivationProvenance.NOT_ATTEMPTED, current.Entry!.TargetActivationProvenance);
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_H_ReplacementAppearingDuringTransitionRace_SurvivesAndFailsClosed()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        var expected = CreateSampleEntry(SwitchJournalState.RECORDED);
+        await store.WriteEntryAsync(expected);
+        var next = CreateSampleEntry(SwitchJournalState.CREDENTIAL_APPLYING, transactionId: expected.TransactionId);
+        var foreign = CreateSampleEntry(SwitchJournalState.QUARANTINED, transactionId: Guid.NewGuid().ToString("D"), quarantineReason: "ROLLBACK_FAILED");
+        var foreignStore = new SwitchJournalStore(path);
+
+        // Seize the canonical name in the inter-primitive gap (after the owned entry was
+        // removed, before the atomic publish): the publish must fail closed and the
+        // foreign journal must survive untouched.
+        store.AfterOwnedDeleteHookAsync = () => foreignStore.WriteEntryAsync(foreign);
+
+        var result = await store.ReplaceIfUnchangedAsync(expected, next);
+
+        Assert.Equal(SwitchJournalWriteStatus.NotMatched, result.Status);
+        var current = await foreignStore.ReadAsync();
+        Assert.Equal(foreign.TransactionId, current.Entry!.TransactionId);
+        Assert.Equal(SwitchJournalState.QUARANTINED, current.Entry.State);
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_I_ReplaceIfUnchanged_ExpectedEntryAbsent_FailsClosed()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+        var expected = CreateSampleEntry(SwitchJournalState.RECORDED);
+
+        var result = await store.ReplaceIfUnchangedAsync(expected, CreateSampleEntry(SwitchJournalState.CREDENTIAL_APPLYING, transactionId: expected.TransactionId));
+
+        Assert.Equal(SwitchJournalWriteStatus.Absent, result.Status);
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_J_AmbiguousPublish_ClassifiesByReadback()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path);
+
+        // Publish lands, then the outcome is reported as a failure: the readback proves the
+        // next entry is durable, so ownership is recovered rather than guessed.
+        store.AfterPublishHookAsync = () => Task.FromException(new IOException("Ambiguous publish outcome"));
+        var next = CreateSampleEntry(SwitchJournalState.RECORDED);
+        var created = await store.CreateIfAbsentAsync(next);
+        Assert.Equal(SwitchJournalWriteStatus.Created, created.Status);
+
+        // Publish is reported ambiguous AND the canonical path cannot be proven to hold
+        // the next entry (hook moves it away and reports the failure): the outcome fails
+        // closed as a persistence failure with the moved evidence preserved.
+        var expected = created.Entry!;
+        var transition = CreateSampleEntry(SwitchJournalState.CREDENTIAL_APPLYING, transactionId: expected.TransactionId);
+        store.AfterPublishHookAsync = async () =>
+        {
+            await Task.Yield();
+            File.Move(path, path + ".unproven");
+            throw new IOException("Ambiguous transition publish: unprovable outcome");
+        };
+        var replaced = await store.ReplaceIfUnchangedAsync(expected, transition);
+        Assert.Equal(SwitchJournalWriteStatus.PersistenceFailure, replaced.Status);
+        Assert.True(File.Exists(path + ".unproven"));
+    }
+
+    [Fact]
+    public async Task OwnershipWrite_K_ReplaceIfUnchanged_NonWindows_FailsClosedWithoutTouchingPath()
+    {
+        string path = CreateJournalPath();
+        var store = new SwitchJournalStore(path) { IsWindowsPlatform = () => false };
+        var expected = CreateSampleEntry(SwitchJournalState.RECORDED);
+        await store.WriteEntryAsync(expected);
+        string originalJson = await File.ReadAllTextAsync(path);
+
+        var result = await store.ReplaceIfUnchangedAsync(expected, CreateSampleEntry(SwitchJournalState.CREDENTIAL_APPLYING, transactionId: expected.TransactionId));
+
+        Assert.Equal(SwitchJournalWriteStatus.UnsupportedPlatform, result.Status);
+        Assert.Equal(originalJson, await File.ReadAllTextAsync(path));
     }
 }
