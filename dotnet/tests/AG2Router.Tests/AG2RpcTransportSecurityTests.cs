@@ -2,10 +2,16 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using AG2Router.AG2.Discovery;
 using AG2Router.AG2.Rpc;
+using AG2Router.AG2.Usage;
 using Xunit;
 
 namespace AG2Router.Tests;
@@ -441,6 +447,209 @@ public sealed class AG2RpcTransportSecurityTests : IClassFixture<RpcChildProcess
 
         server.ResponseFactory = _ => (500, null, "application/json", "{}");
         Assert.False(await client.ProbePortAsync(server.Port, "http", SyntheticCsrfToken));
+    }
+
+    [Fact]
+    public async Task ProbePortAsync_HttpOnHttpsMismatch_ReturnsFalse()
+    {
+        await using var server = new TestHttpServer();
+        using var client = new AG2RpcClient();
+
+        server.ResponseFactory = _ => (400, null, "text/plain", "Client sent an HTTP request to an HTTPS server.\n");
+        Assert.False(await client.ProbePortAsync(server.Port, "http", SyntheticCsrfToken));
+    }
+
+    [Fact]
+    public async Task ProbePortAsync_ValidHttpsServerWithSelfSignedCert_Succeeds()
+    {
+        using var cert = TestHttpServer.GenerateSelfSignedCertificate();
+        await using var server = new TestHttpServer(cert);
+        using var client = new AG2RpcClient();
+
+        server.ResponseFactory = _ => (200, null, "application/json", "{}");
+        Assert.True(await client.ProbePortAsync(server.Port, "https", SyntheticCsrfToken));
+    }
+
+    [Fact]
+    public async Task ProbePortAsync_Oversized400Response_ReadsOnlyBoundedSnippetAndDoesNotHang()
+    {
+        await using var server = new TestHttpServer();
+        using var client = new AG2RpcClient();
+
+        // 100 KB payload of generic 400 text
+        string largeBody = new string('A', 100_000);
+        server.ResponseFactory = _ => (400, null, "text/plain", largeBody);
+
+        var sw = Stopwatch.StartNew();
+        bool result = await client.ProbePortAsync(server.Port, "http", SyntheticCsrfToken);
+        sw.Stop();
+
+        Assert.True(result, "Generic 400 without protocol mismatch should still indicate active server");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2), "Probe must complete promptly without reading large bodies");
+    }
+
+    [Fact]
+    public async Task ProbePortAsync_Oversized400_StallsAfter512Bytes_CompletesPromptlyWithoutHanging()
+    {
+        await using var server = new TestHttpServer();
+        using var client = new AG2RpcClient();
+
+        // Server writes HTTP 400 headers with Content-Length 100,000, writes exactly 512 bytes, flushes,
+        // and then intentionally stalls for 5 seconds without completing the body.
+        server.CustomResponseWriter = async (req, stream, ct) =>
+        {
+            var header = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n\r\n";
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(header), ct);
+            var first512 = new byte[512];
+            Array.Fill(first512, (byte)'A');
+            await stream.WriteAsync(first512, ct);
+            await stream.FlushAsync(ct);
+            // Stall server response stream: client must NOT wait for remainder of stalled body
+            await Task.Delay(5000, ct);
+        };
+
+        var sw = Stopwatch.StartNew();
+        bool result = await client.ProbePortAsync(server.Port, "http", SyntheticCsrfToken);
+        sw.Stop();
+
+        Assert.True(result, "Generic 400 without protocol mismatch should indicate active server");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2), $"Probe must complete promptly within bounded snippet read, elapsed: {sw.ElapsedMilliseconds}ms");
+    }
+
+    [Fact]
+    public async Task ProbePortAsync_Stalled400Body_TimesOutAndReturnsFalse()
+    {
+        await using var server = new TestHttpServer();
+        using var client = new AG2RpcClient();
+
+        // Server writes 400 headers with Content-Length 200, sends only 50 bytes, and stalls indefinitely
+        server.CustomResponseWriter = async (req, stream, ct) =>
+        {
+            var header = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 200\r\n\r\n";
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(header), ct);
+            var partialBytes = Encoding.ASCII.GetBytes("Client sent ");
+            await stream.WriteAsync(partialBytes, ct);
+            await stream.FlushAsync(ct);
+            await Task.Delay(10000, ct);
+        };
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+        var sw = Stopwatch.StartNew();
+        bool result = await client.ProbePortAsync(server.Port, "http", SyntheticCsrfToken, cts.Token);
+        sw.Stop();
+
+        Assert.False(result, "Stalled 400 response body must fail-closed and return false");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2), $"Must fail promptly on timeout/cancellation, elapsed: {sw.ElapsedMilliseconds}ms");
+    }
+
+    [Fact]
+    public async Task ProbePortAsync_TruncatedFramingOrAbortedResponse_ReturnsFalse()
+    {
+        await using var server = new TestHttpServer();
+        using var client = new AG2RpcClient();
+
+        // Server declares Content-Length 200, writes 50 bytes, then abruptly aborts/closes stream
+        server.CustomResponseWriter = async (req, stream, ct) =>
+        {
+            var header = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 200\r\n\r\n";
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(header), ct);
+            var partialBytes = Encoding.ASCII.GetBytes("Client sent ");
+            await stream.WriteAsync(partialBytes, ct);
+            await stream.FlushAsync(ct);
+            // Closing stream prematurely violates framing
+            stream.Close();
+        };
+
+        bool result = await client.ProbePortAsync(server.Port, "http", SyntheticCsrfToken);
+
+        Assert.False(result, "Premature EOF/truncated body framing on 400 must fail-closed and return false");
+    }
+
+    [Fact]
+    public async Task ProbePortAsync_SegmentedMismatchAcrossMultipleReads_DetectedAndReturnsFalse()
+    {
+        await using var server = new TestHttpServer();
+        using var client = new AG2RpcClient();
+
+        // Server sends the mismatch text in two separate TCP packets
+        server.CustomResponseWriter = async (req, stream, ct) =>
+        {
+            var bodyPart1 = "Client sent an HTTP request to ";
+            var bodyPart2 = "an HTTPS server.\n";
+            var header = $"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {bodyPart1.Length + bodyPart2.Length}\r\n\r\n";
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(header), ct);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(bodyPart1), ct);
+            await stream.FlushAsync(ct);
+            await Task.Delay(50, ct);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(bodyPart2), ct);
+            await stream.FlushAsync(ct);
+        };
+
+        bool result = await client.ProbePortAsync(server.Port, "http", SyntheticCsrfToken);
+
+        Assert.False(result, "Mismatch split across multiple TCP reads must be accumulated and detected, returning false");
+    }
+
+    [Fact]
+    public async Task ProbePortAsync_WhenCancelled_ReturnsFalsePromptly()
+    {
+        await using var server = new TestHttpServer();
+        using var client = new AG2RpcClient();
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var sw = Stopwatch.StartNew();
+        bool result = await client.ProbePortAsync(server.Port, "http", SyntheticCsrfToken, cts.Token);
+        sw.Stop();
+
+        Assert.False(result);
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500));
+    }
+
+    [Fact]
+    public async Task UsageDiscovery_WhenServerReturnsHttpOnHttpsMismatch_DoesNotSelectHttpEndpoint()
+    {
+        await using var server = new TestHttpServer();
+        server.ResponseFactory = _ => (400, null, "text/plain", "Client sent an HTTP request to an HTTPS server.\n");
+
+        var proc = new DiscoveredProcessRaw(1234, "language_server.exe", "--csrf_token test_token --standalone", @"C:\antigravity\resources\bin\language_server.exe", DateTime.UtcNow);
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>(new[] { proc }),
+            GetListeningPortsFunc = _ => Task.FromResult<IReadOnlyList<int>>(new[] { server.Port })
+        };
+
+        using var rpcClient = new AG2RpcClient();
+        var discovery = new UsageInstanceDiscovery(inspector, rpcClient);
+        var endpoints = await discovery.DiscoverAsync();
+
+        Assert.NotEmpty(server.RecordedRequests);
+        Assert.Empty(endpoints);
+    }
+
+    [Fact]
+    public async Task AG2ProcessDetector_WhenServerReturnsHttpOnHttpsMismatch_DoesNotSelectHttpEndpoint()
+    {
+        await using var server = new TestHttpServer();
+        server.ResponseFactory = _ => (400, null, "text/plain", "Client sent an HTTP request to an HTTPS server.\n");
+
+        var proc = new DiscoveredProcessRaw(1234, "language_server.exe", "--csrf_token test_token --standalone", @"C:\antigravity\resources\bin\language_server.exe", DateTime.UtcNow);
+        var inspector = new MockProcessInspector
+        {
+            FindProcessesFunc = () => Task.FromResult<IReadOnlyList<DiscoveredProcessRaw>>(new[] { proc }),
+            GetListeningPortsFunc = _ => Task.FromResult<IReadOnlyList<int>>(new[] { server.Port })
+        };
+
+        using var rpcClient = new AG2RpcClient();
+        var detector = new AG2ProcessDetector(inspector, rpcClient);
+        var result = await detector.DiscoverAsync();
+
+        Assert.NotEmpty(server.RecordedRequests);
+        Assert.True(result.IsRunning, "Process is running");
+        Assert.Equal("DEGRADED", result.Status);
+        Assert.Null(result.ProcessInfo);
+        Assert.Contains("did not respond to Connect-RPC probe", result.Message);
     }
 
     [Fact]
@@ -1228,12 +1437,13 @@ public sealed class RpcChildProcessFixture : IDisposable
 public sealed class TestHttpServer : IAsyncDisposable
 {
     private readonly TcpListener _listener;
+    private readonly X509Certificate2? _serverCertificate;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _listenTask;
     private readonly object _lock = new();
 
     public int Port { get; }
-    public string BaseUrl => $"http://127.0.0.1:{Port}";
+    public string BaseUrl => $"{(_serverCertificate != null ? "https" : "http")}://127.0.0.1:{Port}";
 
     public List<RecordedRequest> RecordedRequests { get; } = new();
 
@@ -1251,12 +1461,26 @@ public sealed class TestHttpServer : IAsyncDisposable
     public int AcceptedConnectionsCount => _acceptedConnections;
     private int _acceptedConnections;
 
-    public TestHttpServer()
+    public TestHttpServer(X509Certificate2? serverCertificate = null)
     {
+        _serverCertificate = serverCertificate;
         _listener = new TcpListener(IPAddress.Loopback, 0);
         _listener.Start();
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
         _listenTask = Task.Run(ListenLoopAsync);
+    }
+
+    public static X509Certificate2 GenerateSelfSignedCertificate(string hostName = "localhost")
+    {
+        using var rsa = RSA.Create(2048);
+        var certReq = new CertificateRequest($"CN={hostName}", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddDnsName("localhost");
+        san.AddIpAddress(IPAddress.Loopback);
+        san.AddIpAddress(IPAddress.IPv6Loopback);
+        certReq.CertificateExtensions.Add(san.Build());
+        using var ephemeralCert = certReq.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-10), DateTimeOffset.UtcNow.AddHours(2));
+        return X509CertificateLoader.LoadPkcs12(ephemeralCert.Export(X509ContentType.Pfx), null, X509KeyStorageFlags.Exportable);
     }
 
     private async Task ListenLoopAsync()
@@ -1299,9 +1523,16 @@ public sealed class TestHttpServer : IAsyncDisposable
         {
             try
             {
-                using var stream = client.GetStream();
+                Stream stream = client.GetStream();
                 stream.ReadTimeout = 3000;
                 stream.WriteTimeout = 3000;
+
+                if (_serverCertificate != null)
+                {
+                    var sslStream = new SslStream(stream, false);
+                    await sslStream.AuthenticateAsServerAsync(_serverCertificate, false, SslProtocols.Tls12 | SslProtocols.Tls13, false).ConfigureAwait(false);
+                    stream = sslStream;
+                }
 
                 var buffer = new byte[8192];
                 var ms = new MemoryStream();

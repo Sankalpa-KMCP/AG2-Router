@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Net.Security;
+using System.Security.Authentication;
 using System.Text;
 using System.Globalization;
 using System.Text.Json;
@@ -30,12 +31,28 @@ public class AG2RpcClient : IAG2RpcClient, IUsageRpcClient, IDisposable
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly TimeSpan _rpcTimeout;
+    private readonly TimeSpan _probeTimeout;
 
     public TimeSpan RpcTimeout => _rpcTimeout;
+    public TimeSpan ProbeTimeout => _probeTimeout;
 
-    public AG2RpcClient(HttpMessageHandler? customHandler = null, TimeSpan? rpcTimeout = null)
+    public AG2RpcClient(HttpMessageHandler? customHandler = null, TimeSpan? rpcTimeout = null, TimeSpan? probeTimeout = null)
     {
+        if (probeTimeout.HasValue)
+        {
+            if (probeTimeout.Value <= TimeSpan.Zero ||
+                probeTimeout.Value == Timeout.InfiniteTimeSpan ||
+                probeTimeout.Value > DefaultProbeTimeout)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(probeTimeout),
+                    probeTimeout.Value,
+                    $"Probe timeout must be a positive finite duration not exceeding {DefaultProbeTimeout.TotalSeconds.ToString("G", CultureInfo.InvariantCulture)} seconds.");
+            }
+        }
+
         _rpcTimeout = rpcTimeout ?? DefaultRpcTimeout;
+        _probeTimeout = probeTimeout ?? DefaultProbeTimeout;
 
         if (customHandler != null)
         {
@@ -79,8 +96,14 @@ public class AG2RpcClient : IAG2RpcClient, IUsageRpcClient, IDisposable
         }
     };
 
-    public async Task<bool> ProbePortAsync(int port, string protocol, string csrfToken, CancellationToken cancellationToken = default)
+    public async Task<ProbeResult> ProbePortDetailedAsync(
+        int port, string protocol, string csrfToken, CancellationToken cancellationToken = default)
     {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return new ProbeResult(false, ProbeFailureReason.Cancelled);
+        }
+
         string url;
         try
         {
@@ -88,11 +111,11 @@ public class AG2RpcClient : IAG2RpcClient, IUsageRpcClient, IDisposable
         }
         catch (ArgumentException)
         {
-            return false;
+            return new ProbeResult(false, ProbeFailureReason.InvalidEndpoint);
         }
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(DefaultProbeTimeout);
+        cts.CancelAfter(_probeTimeout);
 
         try
         {
@@ -102,16 +125,122 @@ public class AG2RpcClient : IAG2RpcClient, IUsageRpcClient, IDisposable
             // Redirect responses (3xx) are rejected as invalid daemon responses to prevent credential forwarding
             if (IsRedirectStatusCode(response.StatusCode))
             {
-                return false;
+                return new ProbeResult(false, ProbeFailureReason.RejectedRedirect, (int)response.StatusCode);
             }
 
-            // Active server responds with HTTP status < 500 (even 4xx indicates an active Connect-RPC endpoint)
-            return (int)response.StatusCode < 500;
+            // 5xx internal server errors indicate an unhealthy or dying daemon
+            if ((int)response.StatusCode >= 500)
+            {
+                return new ProbeResult(false, ProbeFailureReason.ServerError, (int)response.StatusCode);
+            }
+
+            // Client errors (4xx) can indicate either an active Connect-RPC endpoint (e.g. invalid CSRF token)
+            // or a transport protocol mismatch (e.g. plain HTTP sent to an HTTPS-only listener).
+            if (response.StatusCode == HttpStatusCode.BadRequest || (int)response.StatusCode is >= 400 and < 500)
+            {
+                var (readSuccess, snippet, failureReason) = await ReadBoundedProbeSnippetAsync(response.Content, cts.Token, cancellationToken).ConfigureAwait(false);
+                if (!readSuccess)
+                {
+                    // Failed or incomplete body inspection must NEVER authorize a successful probe (F1)
+                    return new ProbeResult(false, failureReason, (int)response.StatusCode);
+                }
+
+                if (IsProtocolMismatchResponse(snippet))
+                {
+                    return new ProbeResult(false, ProbeFailureReason.ProtocolMismatch, (int)response.StatusCode);
+                }
+            }
+
+            return new ProbeResult(true, ProbeFailureReason.None, (int)response.StatusCode);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return new ProbeResult(false, ProbeFailureReason.Cancelled);
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            return new ProbeResult(false, ProbeFailureReason.ProbeTimeout);
+        }
+        catch (OperationCanceledException)
+        {
+            return new ProbeResult(false, ProbeFailureReason.Unknown);
+        }
+        catch (AuthenticationException)
+        {
+            return new ProbeResult(false, ProbeFailureReason.TlsHandshakeFailure);
+        }
+        catch (Exception ex)
+        {
+            if (ex.InnerException is AuthenticationException)
+            {
+                return new ProbeResult(false, ProbeFailureReason.TlsHandshakeFailure);
+            }
+            return new ProbeResult(false, ProbeFailureReason.TransportError);
+        }
+    }
+
+    public async Task<bool> ProbePortAsync(int port, string protocol, string csrfToken, CancellationToken cancellationToken = default)
+    {
+        var result = await ProbePortDetailedAsync(port, protocol, csrfToken, cancellationToken).ConfigureAwait(false);
+        return result.Success;
+    }
+
+    private const int MaxProbeSnippetBytes = 512;
+
+    private static async Task<(bool Success, string Snippet, ProbeFailureReason FailureReason)> ReadBoundedProbeSnippetAsync(
+        HttpContent? content, CancellationToken probeToken, CancellationToken callerToken)
+    {
+        if (content is null)
+        {
+            return (true, string.Empty, ProbeFailureReason.None);
+        }
+
+        try
+        {
+            await using var stream = await content.ReadAsStreamAsync(probeToken).ConfigureAwait(false);
+            var buffer = new byte[MaxProbeSnippetBytes];
+            int totalRead = 0;
+            while (totalRead < MaxProbeSnippetBytes)
+            {
+                int read = await stream.ReadAsync(buffer.AsMemory(totalRead, MaxProbeSnippetBytes - totalRead), probeToken).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    break;
+                }
+                totalRead += read;
+            }
+
+            var snippet = Encoding.UTF8.GetString(buffer, 0, totalRead);
+            return (true, snippet, ProbeFailureReason.None);
+        }
+        catch (OperationCanceledException) when (callerToken.IsCancellationRequested)
+        {
+            return (false, string.Empty, ProbeFailureReason.Cancelled);
+        }
+        catch (OperationCanceledException) when (probeToken.IsCancellationRequested)
+        {
+            return (false, string.Empty, ProbeFailureReason.ProbeTimeout);
+        }
+        catch (OperationCanceledException)
+        {
+            return (false, string.Empty, ProbeFailureReason.Unknown);
         }
         catch (Exception)
         {
+            return (false, string.Empty, ProbeFailureReason.IncompleteResponseBody);
+        }
+    }
+
+    private static bool IsProtocolMismatchResponse(string bodySnippet)
+    {
+        if (string.IsNullOrEmpty(bodySnippet))
+        {
             return false;
         }
+
+        return bodySnippet.Contains("Client sent an HTTP request to an HTTPS server", StringComparison.OrdinalIgnoreCase)
+            || bodySnippet.Contains("plain HTTP request was sent to HTTPS port", StringComparison.OrdinalIgnoreCase)
+            || bodySnippet.Contains("HTTP request to an HTTPS server", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<RawUserStatusResponse?> GetUserStatusAsync(int port, string protocol, string csrfToken, CancellationToken cancellationToken = default)
