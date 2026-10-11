@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using AG2Router.AG2.Rpc;
 using AG2Router.AG2.Security;
+using AG2Router.Core.Diagnostics;
 
 namespace AG2Router.AG2.Discovery;
 
@@ -13,6 +14,7 @@ public class AG2ProcessDetector
 {
     private readonly IProcessInspector _inspector;
     private readonly IAG2RpcClient _rpcClient;
+    private readonly IDiagnosticSink _diagnosticSink;
     private readonly TimeSpan _offlineCooldown;
     private readonly int _failureThreshold;
 
@@ -22,17 +24,21 @@ public class AG2ProcessDetector
     private int _consecutiveFailures;
     private long _sessionGeneration;
     private CancellationTokenSource? _sessionCts;
+    private bool _discoveryDegraded;
+    private string? _degradedCorrelationId;
 
     public AG2ProcessDetector(
         IProcessInspector? inspector = null,
         IAG2RpcClient? rpcClient = null,
         TimeSpan? offlineCooldown = null,
-        int failureThreshold = 3)
+        int failureThreshold = 3,
+        IDiagnosticSink? diagnosticSink = null)
     {
         _inspector = inspector ?? new WindowsProcessInspector();
         _rpcClient = rpcClient ?? new AG2RpcClient();
         _offlineCooldown = offlineCooldown ?? TimeSpan.FromSeconds(15);
         _failureThreshold = failureThreshold;
+        _diagnosticSink = diagnosticSink ?? NullDiagnosticSink.Instance;
     }
 
     public long CurrentGeneration
@@ -234,32 +240,77 @@ public class AG2ProcessDetector
         // 6. Probe candidate ports (HTTPS first, then HTTP)
         int workingPort = -1;
         string workingProtocol = "https";
+        string passCorrelationId = DiagnosticRunContext.CreateCorrelationId();
 
         foreach (var port in listeningPorts)
         {
-            if (await _rpcClient.ProbePortAsync(port, "https", csrfToken, cancellationToken).ConfigureAwait(false))
+            var httpsResult = await _rpcClient.ProbePortDetailedAsync(port, "https", csrfToken, cancellationToken).ConfigureAwait(false);
+            if (httpsResult.Success)
             {
                 workingPort = port;
                 workingProtocol = "https";
                 break;
             }
+            else
+            {
+                EmitProbeDiagnostic(httpsResult.FailureReason, "https", httpsResult.StatusCode, passCorrelationId);
+            }
 
-            if (await _rpcClient.ProbePortAsync(port, "http", csrfToken, cancellationToken).ConfigureAwait(false))
+            var httpResult = await _rpcClient.ProbePortDetailedAsync(port, "http", csrfToken, cancellationToken).ConfigureAwait(false);
+            if (httpResult.Success)
             {
                 workingPort = port;
                 workingProtocol = "http";
                 break;
             }
+            else
+            {
+                EmitProbeDiagnostic(httpResult.FailureReason, "http", httpResult.StatusCode, passCorrelationId);
+            }
         }
 
         if (workingPort == -1)
         {
+            _discoveryDegraded = true;
+            _degradedCorrelationId = passCorrelationId;
+            _diagnosticSink.Emit(DiagnosticEventFactory.Create(
+                eventId: DiagnosticEventCatalog.DiscoveryFailed,
+                component: DiagnosticComponents.Discovery,
+                operation: DiagnosticOperations.DiscoverProcess,
+                outcome: DiagnosticOutcome.Failure,
+                failureCategory: DiagnosticFailureCategory.DiscoveryError,
+                correlationId: passCorrelationId,
+                safeMessage: "Candidate ports failed Connect-RPC probe.",
+                severity: DiagnosticSeverity.Warning,
+                affectedFeature: AffectedFeature.Discovery
+            ));
+
             return new AG2DiscoveryResult(
                 IsRunning: true,
                 Status: "DEGRADED",
                 ProcessInfo: null,
                 Message: $"Antigravity 2 (PID {targetProc.ProcessId}) ports [{string.Join(", ", listeningPorts)}] did not respond to Connect-RPC probe"
             );
+        }
+
+        if (_discoveryDegraded)
+        {
+            _discoveryDegraded = false;
+            string recoveryCorrelationId = _degradedCorrelationId ?? passCorrelationId;
+            _degradedCorrelationId = null;
+            _diagnosticSink.Emit(DiagnosticEventFactory.Create(
+                eventId: DiagnosticEventCatalog.DiscoveryRecovered,
+                component: DiagnosticComponents.Discovery,
+                operation: DiagnosticOperations.DiscoverProcess,
+                outcome: DiagnosticOutcome.Success,
+                failureCategory: DiagnosticFailureCategory.None,
+                correlationId: recoveryCorrelationId,
+                safeMessage: $"Antigravity 2 discovery recovered via {workingProtocol.ToUpperInvariant()}.",
+                recoveryStatus: RecoveryStatus.Succeeded,
+                protocol: workingProtocol,
+                severity: DiagnosticSeverity.Info,
+                affectedFeature: AffectedFeature.Discovery
+            ));
         }
 
         // 7. Establish new cached session
@@ -303,5 +354,52 @@ public class AG2ProcessDetector
             ProcessInfo: publicProcessInfo,
             Message: $"Discovered Antigravity 2 (PID {targetProc.ProcessId}, port {workingPort} via {workingProtocol.ToUpperInvariant()})"
         );
+    }
+
+    private void EmitProbeDiagnostic(ProbeFailureReason reason, string protocol, int statusCode, string? correlationId = null)
+    {
+        if (reason == ProbeFailureReason.None) return;
+
+        int eventId = reason switch
+        {
+            ProbeFailureReason.ProtocolMismatch => DiagnosticEventCatalog.RpcProtocolMismatch,
+            ProbeFailureReason.TlsHandshakeFailure => DiagnosticEventCatalog.TlsHandshakeFailed,
+            ProbeFailureReason.ProbeTimeout => DiagnosticEventCatalog.RpcDeadlineExceeded,
+            ProbeFailureReason.Cancelled => DiagnosticEventCatalog.RpcCallerCancelled,
+            ProbeFailureReason.IncompleteResponseBody => DiagnosticEventCatalog.RpcBodyIncomplete,
+            ProbeFailureReason.RejectedRedirect => DiagnosticEventCatalog.RpcRejectedRedirect,
+            ProbeFailureReason.ServerError => DiagnosticEventCatalog.RpcServerError,
+            ProbeFailureReason.TransportError => DiagnosticEventCatalog.RpcTransportFailed,
+            _ => DiagnosticEventCatalog.RpcUnknownFailure
+        };
+
+        DiagnosticFailureCategory category = reason switch
+        {
+            ProbeFailureReason.ProtocolMismatch => DiagnosticFailureCategory.ProtocolMismatch,
+            ProbeFailureReason.TlsHandshakeFailure => DiagnosticFailureCategory.TlsHandshakeFailure,
+            ProbeFailureReason.ProbeTimeout => DiagnosticFailureCategory.ProbeTimeout,
+            ProbeFailureReason.Cancelled => DiagnosticFailureCategory.Cancelled,
+            ProbeFailureReason.IncompleteResponseBody => DiagnosticFailureCategory.IncompleteResponseBody,
+            ProbeFailureReason.RejectedRedirect => DiagnosticFailureCategory.RejectedRedirect,
+            ProbeFailureReason.ServerError => DiagnosticFailureCategory.ServerError,
+            ProbeFailureReason.TransportError => DiagnosticFailureCategory.TransportError,
+            _ => DiagnosticFailureCategory.Unknown
+        };
+
+        var evt = DiagnosticEventFactory.Create(
+            eventId: eventId,
+            component: DiagnosticComponents.Discovery,
+            operation: DiagnosticOperations.ProbeConnectRpcPort,
+            outcome: reason == ProbeFailureReason.Cancelled ? DiagnosticOutcome.Cancelled : DiagnosticOutcome.Failure,
+            failureCategory: category,
+            correlationId: correlationId,
+            safeMessage: $"Port probe failed for {protocol.ToUpperInvariant()} with reason {reason}.",
+            protocol: protocol,
+            httpStatus: statusCode > 0 ? statusCode : null,
+            severity: reason == ProbeFailureReason.Cancelled ? DiagnosticSeverity.Info : DiagnosticSeverity.Warning,
+            affectedFeature: AffectedFeature.RpcTransport
+        );
+
+        _diagnosticSink.Emit(evt);
     }
 }

@@ -110,7 +110,7 @@ public class TelemetryPollingCoordinatorTests
     // converts a stalled run into a diagnosable failure, so it must comfortably exceed
     // worst-case scheduler delay under parallel-suite load instead of measuring
     // normal completion time.
-    private static readonly TimeSpan DisposalSignalGuard = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan DisposalSignalGuard = TimeSpan.FromSeconds(20);
 
     [Theory]
     [InlineData("IDLE")]

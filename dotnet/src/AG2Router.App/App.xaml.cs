@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using System.Windows;
+using AG2Router.Core.Diagnostics;
 using AG2Router.Core.Models;
 using AG2Router.AG2.Accounts;
 using AG2Router.AG2.Adapter;
@@ -60,6 +61,7 @@ public partial class App : System.Windows.Application
     private UsageCollectionService? _usageCollector;
     private UsageAggregationService? _usageAggregation;
     private IAutostartService? _autostartService;
+    private BoundedJsonlDiagnosticSink? _diagnosticSink;
     private bool _isShuttingDown;
 
     private static void Log(string msg)
@@ -90,13 +92,53 @@ public partial class App : System.Windows.Application
     {
         base.OnStartup(e);
 
+        DiagnosticSession.InitializePreAdmission();
+
+        var startupStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        DiagnosticSession.Emit(
+            eventId: DiagnosticEventCatalog.StartupStarted,
+            component: "Bootstrap",
+            operation: "AppStartup",
+            outcome: DiagnosticOutcome.Success,
+            failureCategory: DiagnosticFailureCategory.None,
+            safeMessage: "AG2 Router bootstrap sequence initiated.",
+            severity: DiagnosticSeverity.Info
+        );
+
         AppDomain.CurrentDomain.UnhandledException += (s, ev) =>
         {
             Log($"UnhandledException: {ev.ExceptionObject}");
+            if (ev.ExceptionObject is Exception ex)
+            {
+                var (exType, hresult, _) = DiagnosticSanitizer.SanitizeException(ex);
+                DiagnosticSession.Emit(
+                    eventId: DiagnosticEventCatalog.UnhandledFailure,
+                    component: "Bootstrap",
+                    operation: "AppDomainUnhandledException",
+                    outcome: DiagnosticOutcome.Failure,
+                    failureCategory: DiagnosticFailureCategory.UncaughtException,
+                    safeMessage: "Unhandled exception in application domain.",
+                    exceptionType: exType,
+                    hresult: hresult,
+                    severity: DiagnosticSeverity.Critical
+                );
+            }
         };
         DispatcherUnhandledException += (s, ev) =>
         {
             Log($"DispatcherUnhandledException: {ev.Exception}");
+            var (exType, hresult, _) = DiagnosticSanitizer.SanitizeException(ev.Exception);
+            DiagnosticSession.Emit(
+                eventId: DiagnosticEventCatalog.UnhandledFailure,
+                component: "Bootstrap",
+                operation: "DispatcherUnhandledException",
+                outcome: DiagnosticOutcome.Failure,
+                failureCategory: DiagnosticFailureCategory.UncaughtException,
+                safeMessage: "Unhandled exception on WPF dispatcher.",
+                exceptionType: exType,
+                hresult: hresult,
+                severity: DiagnosticSeverity.Critical
+            );
         };
 
         // 1. Handle explicit command-line controls for secondary instances
@@ -143,13 +185,23 @@ public partial class App : System.Windows.Application
 
         Log("Primary instance acquired single-instance guard.");
 
+        string diagnosticsDir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AG2-Router",
+            "diagnostics",
+            "owned-segments-v1"
+        );
+        _diagnosticSink = new BoundedJsonlDiagnosticSink(diagnosticsDir);
+        DiagnosticSession.PromoteToPersistent(_diagnosticSink);
+        JsRuntimeDiagnostics.InitializeProductionStore();
+
         // 3. Prevent WPF from shutting down when windows are hidden to tray
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
         try
         {
             Log("Initializing native vault and account services...");
-            var processDetector = new AG2ProcessDetector();
+            var processDetector = new AG2ProcessDetector(diagnosticSink: _diagnosticSink);
             _ag2Adapter = new AG2LiveAdapter(processDetector, configuredModelProvider: () => _autoRouter?.GetConfig().WorkloadModelKey);
             _dpapiProvider = new WindowsDpapiProvider();
             _sessionVault = new SessionVault(dpapiProvider: _dpapiProvider);
@@ -170,10 +222,11 @@ public partial class App : System.Windows.Application
             _usageCollector = new UsageCollectionService(
                 _usageLedger,
                 _usageCollectorState,
-                new UsageInstanceDiscovery(new WindowsProcessInspector()),
+                new UsageInstanceDiscovery(new WindowsProcessInspector(), diagnosticSink: _diagnosticSink),
                 new AG2RpcClient(),
                 _accountStore,
-                log: Log);
+                log: Log,
+                diagnosticSink: _diagnosticSink);
             _switchCoordinator = new NativeAccountSwitchCoordinator(
                 _accountStore,
                 _sessionVault,
@@ -199,7 +252,8 @@ public partial class App : System.Windows.Application
                 _ag2Adapter,
                 interval: TimeSpan.FromMilliseconds(_autoRouter.GetConfig().PollingIntervalMs),
                 autoRouter: _autoRouter,
-                log: Log);
+                log: Log,
+                diagnosticSink: _diagnosticSink);
             _telemetryCoordinator.Start();
 
             Log("Starting loopback server...");
@@ -255,6 +309,16 @@ public partial class App : System.Windows.Application
             _usageCollector.Start();
 
             Log("Tray-first startup completed. Application active in system tray.");
+            DiagnosticSession.Emit(
+                eventId: DiagnosticEventCatalog.StartupCompleted,
+                component: "Bootstrap",
+                operation: "AppStartup",
+                outcome: DiagnosticOutcome.Success,
+                failureCategory: DiagnosticFailureCategory.None,
+                safeMessage: "Tray-first startup completed. Application active in system tray.",
+                durationMs: startupStopwatch.ElapsedMilliseconds,
+                severity: DiagnosticSeverity.Info
+            );
 
             if (e.Args.Contains("--open"))
             {
@@ -263,6 +327,20 @@ public partial class App : System.Windows.Application
         }
         catch (Exception ex)
         {
+            var (exType, hresult, _) = DiagnosticSanitizer.SanitizeException(ex);
+            DiagnosticSession.Emit(
+                eventId: DiagnosticEventCatalog.StartupFailed,
+                component: "Bootstrap",
+                operation: "AppStartup",
+                outcome: DiagnosticOutcome.Failure,
+                failureCategory: DiagnosticFailureCategory.InitializationError,
+                safeMessage: "Application startup failed.",
+                exceptionType: exType,
+                hresult: hresult,
+                durationMs: startupStopwatch.ElapsedMilliseconds,
+                severity: DiagnosticSeverity.Critical
+            );
+
             Log($"Startup failed with exception: {ex}");
             System.Windows.MessageBox.Show(
                 FormatStartupErrorMessage(ex),
@@ -321,6 +399,16 @@ public partial class App : System.Windows.Application
         Log("ExitApplication requested.");
         if (_isShuttingDown) return;
         _isShuttingDown = true;
+
+        DiagnosticSession.Emit(
+            eventId: DiagnosticEventCatalog.ShutdownStarted,
+            component: "Bootstrap",
+            operation: "AppShutdown",
+            outcome: DiagnosticOutcome.Success,
+            failureCategory: DiagnosticFailureCategory.None,
+            safeMessage: "ExitApplication requested.",
+            severity: DiagnosticSeverity.Info
+        );
 
         if (_switchCoordinator != null)
         {
@@ -394,15 +482,38 @@ public partial class App : System.Windows.Application
             _loopbackServer = null;
         }
 
-        // Release mutex and pipe
+        // Give queued JavaScript diagnostics a short, best-effort drain window.
+        await JsRuntimeDiagnostics.DrainForShutdownAsync(TimeSpan.FromSeconds(1));
+
+        DiagnosticSession.Emit(
+            eventId: DiagnosticEventCatalog.ShutdownCompleted,
+            component: "Bootstrap",
+            operation: "AppShutdown",
+            outcome: DiagnosticOutcome.Success,
+            failureCategory: DiagnosticFailureCategory.None,
+            safeMessage: "Application shutdown completed.",
+            severity: DiagnosticSeverity.Info
+        );
+
+        // Relinquish diagnostic writer lease before releasing single-instance guard (N7).
+        // This guarantees that an admitted new primary never finds .active_writer.lock still held.
+        if (_diagnosticSink != null)
+        {
+            try
+            {
+                await _diagnosticSink.FlushAsync(BoundedJsonlDiagnosticSink.DefaultShutdownFlushTimeout);
+                await _diagnosticSink.DisposeAsync();
+            }
+            catch { }
+            _diagnosticSink = null;
+        }
+
+        // Release mutex and pipe after all writer leases are relinquished (N7)
         if (_singleInstanceGuard != null)
         {
             await _singleInstanceGuard.DisposeAsync();
             _singleInstanceGuard = null;
         }
-
-        // Give queued JavaScript diagnostics a short, best-effort drain window.
-        await JsRuntimeDiagnostics.DrainForShutdownAsync(TimeSpan.FromSeconds(1));
 
         Shutdown();
     }

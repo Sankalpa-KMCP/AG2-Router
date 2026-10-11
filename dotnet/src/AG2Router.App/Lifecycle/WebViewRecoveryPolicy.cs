@@ -45,6 +45,7 @@ public sealed class WebViewRecoveryPolicy
     }
 
     public long CurrentGeneration { get { lock (_lock) return _generation; } }
+    public int FailureCount { get { lock (_lock) return _consecutiveFailures; } }
 
     public long AdvanceGeneration()
     {

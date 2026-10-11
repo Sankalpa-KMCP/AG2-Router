@@ -7,6 +7,7 @@ using System.Windows.Interop;
 using AG2Router.App.Diagnostics;
 using AG2Router.App.Lifecycle;
 using AG2Router.App.Services;
+using AG2Router.Core.Diagnostics;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 
@@ -31,6 +32,8 @@ public partial class MainWindow : Window, IDashboardWindow
     private bool _recoveryInProgress;
     private (WebViewFailureKind Kind, long Generation)? _pendingRecovery;
     private WebViewFailureKind? _exhaustedFailureKind;
+    private string _recoveryCorrelationId = Guid.NewGuid().ToString("N");
+    private string? _activeRecoveryCorrelationId;
 
     public uint? BrowserProcessId { get; private set; }
 
@@ -114,11 +117,44 @@ public partial class MainWindow : Window, IDashboardWindow
                 () => IsCurrentWebView(webView, generation),
                 () =>
                 {
+                    if (_activeRecoveryCorrelationId != null)
+                    {
+                        string corrId = _activeRecoveryCorrelationId;
+                        _activeRecoveryCorrelationId = null;
+                        DiagnosticSession.Emit(
+                            eventId: DiagnosticEventCatalog.WebViewRecoverySucceeded,
+                            component: "Dashboard",
+                            operation: "RecoverWebView",
+                            outcome: DiagnosticOutcome.Success,
+                            failureCategory: DiagnosticFailureCategory.None,
+                            safeMessage: "WebView2 navigation recovered successfully.",
+                            recoveryStatus: RecoveryStatus.Succeeded,
+                            correlationId: corrId,
+                            severity: DiagnosticSeverity.Info
+                        );
+                        _recoveryCorrelationId = Guid.NewGuid().ToString("N");
+                    }
                     _exhaustedFailureKind = null;
                     ErrorOverlay.Visibility = Visibility.Collapsed;
                 },
                 async (kind, detail, capturedGeneration) =>
                 {
+                    int eventId = kind == WebViewFailureKind.Process
+                        ? DiagnosticEventCatalog.WebViewProcessFailed
+                        : DiagnosticEventCatalog.NavigationFailed;
+                    DiagnosticFailureCategory category = kind == WebViewFailureKind.Process
+                        ? DiagnosticFailureCategory.ProcessCrash
+                        : DiagnosticFailureCategory.NavigationError;
+                    DiagnosticSession.Emit(
+                        eventId: eventId,
+                        component: "Dashboard",
+                        operation: kind == WebViewFailureKind.Process ? "WebViewProcessExited" : "WebViewNavigation",
+                        outcome: DiagnosticOutcome.Failure,
+                        failureCategory: category,
+                        safeMessage: detail,
+                        correlationId: _recoveryCorrelationId,
+                        severity: kind == WebViewFailureKind.Process ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning
+                    );
                     JsRuntimeDiagnostics.RecordError(
                         kind == WebViewFailureKind.Process ? "ProcessFailed" : "NavigationFailure", detail);
                     await RecoverWebViewAsync(kind, detail, capturedGeneration);
@@ -138,6 +174,18 @@ public partial class MainWindow : Window, IDashboardWindow
         catch (Exception ex)
         {
             if (!IsCurrentWebView(webView, generation)) return;
+            DiagnosticSession.Emit(
+                eventId: DiagnosticEventCatalog.WebViewInitializationFailed,
+                component: "Dashboard",
+                operation: "InitializeWebView",
+                outcome: DiagnosticOutcome.Failure,
+                failureCategory: DiagnosticFailureCategory.InitializationError,
+                safeMessage: "WebView initialization failed.",
+                correlationId: _recoveryCorrelationId,
+                exceptionType: ex.GetType().Name,
+                hresult: ex.HResult,
+                severity: DiagnosticSeverity.Warning
+            );
             JsRuntimeDiagnostics.RecordError("InitializationError", ex.Message, ex.StackTrace);
             if (_recoveryInProgress) throw;
             await RecoverWebViewAsync(WebViewFailureKind.Initialization, ex.Message, generation);
@@ -157,6 +205,7 @@ public partial class MainWindow : Window, IDashboardWindow
             return;
         }
         _recoveryInProgress = true;
+        _activeRecoveryCorrelationId ??= _recoveryCorrelationId;
         try
         {
             while (!_isDisposed && _recoveryPolicy.IsCurrent(generation))
@@ -165,11 +214,35 @@ public partial class MainWindow : Window, IDashboardWindow
                 if (action == null) return;
                 if (action == WebViewRecoveryAction.ManualRetry)
                 {
+                    _activeRecoveryCorrelationId = null;
                     _exhaustedFailureKind = kind;
+                    DiagnosticSession.Emit(
+                        eventId: DiagnosticEventCatalog.WebViewRecoveryExhausted,
+                        component: "Dashboard",
+                        operation: "RecoverWebView",
+                        outcome: DiagnosticOutcome.Failure,
+                        failureCategory: DiagnosticFailureCategory.InitializationError,
+                        safeMessage: $"Dashboard recovery stopped after repeated {kind.ToString().ToLowerInvariant()} failures ({detail}).",
+                        recoveryStatus: RecoveryStatus.Exhausted,
+                        correlationId: _recoveryCorrelationId,
+                        severity: DiagnosticSeverity.Error
+                    );
                     ErrorOverlayMessage.Text = $"Dashboard recovery stopped after repeated {kind.ToString().ToLowerInvariant()} failures ({detail}). Retry manually when the problem is resolved.";
                     ErrorOverlay.Visibility = Visibility.Visible;
                     return;
                 }
+
+                DiagnosticSession.Emit(
+                    eventId: DiagnosticEventCatalog.WebViewRecoveryAttempted,
+                    component: "Dashboard",
+                    operation: "RecoverWebView",
+                    outcome: DiagnosticOutcome.Degraded,
+                    failureCategory: DiagnosticFailureCategory.InitializationError,
+                    safeMessage: $"Attempting WebView recovery action '{action}' for {kind} failure.",
+                    recoveryStatus: RecoveryStatus.Attempted,
+                    correlationId: _recoveryCorrelationId,
+                    severity: DiagnosticSeverity.Info
+                );
 
                 await Task.Delay(500);
                 if (_isDisposed || !_recoveryPolicy.IsCurrent(generation)) return;
@@ -285,37 +358,66 @@ public partial class MainWindow : Window, IDashboardWindow
 
     private void OnExceptionThrown(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
     {
+        string rawJson = e.ParameterObjectAsJson;
+        if (string.IsNullOrWhiteSpace(rawJson) || rawJson.Length > 8192)
+        {
+            JsRuntimeDiagnostics.RecordError("ExceptionThrown", "DevTools Protocol exception payload omitted or exceeded size limit.");
+            return;
+        }
+
         try
         {
-            using var doc = JsonDocument.Parse(e.ParameterObjectAsJson);
+            using var doc = JsonDocument.Parse(rawJson);
             var details = doc.RootElement.GetProperty("exceptionDetails");
             var text = details.GetProperty("text").GetString() ?? "Uncaught JS Exception";
             var message = details.TryGetProperty("exception", out var ex) && ex.TryGetProperty("description", out var desc)
                 ? desc.GetString() ?? text
                 : text;
 
-            string? stack = details.TryGetProperty("stackTrace", out var st) ? st.ToString() : null;
+            string? stack = null;
+            if (details.TryGetProperty("stackTrace", out var st) &&
+                st.TryGetProperty("callFrames", out var frames) &&
+                frames.ValueKind == JsonValueKind.Array)
+            {
+                var topFrames = frames.EnumerateArray().Take(3).Select(f =>
+                {
+                    string fn = f.TryGetProperty("functionName", out var fnProp) ? fnProp.GetString() ?? "anonymous" : "anonymous";
+                    int line = f.TryGetProperty("lineNumber", out var lineProp) ? lineProp.GetInt32() : 0;
+                    return $"{fn}:{line}";
+                });
+                stack = string.Join(" <- ", topFrames);
+            }
+
             JsRuntimeDiagnostics.RecordError("ExceptionThrown", message, stack);
         }
         catch
         {
-            JsRuntimeDiagnostics.RecordError("ExceptionThrown", e.ParameterObjectAsJson);
+            JsRuntimeDiagnostics.RecordError("ExceptionThrown", "Failed to parse DevTools Protocol exception payload.");
         }
     }
 
     private void OnConsoleAPICalled(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
     {
+        string rawJson = e.ParameterObjectAsJson;
+        if (string.IsNullOrWhiteSpace(rawJson) || rawJson.Length > 8192)
+        {
+            return;
+        }
+
         try
         {
-            using var doc = JsonDocument.Parse(e.ParameterObjectAsJson);
+            using var doc = JsonDocument.Parse(rawJson);
             var type = doc.RootElement.GetProperty("type").GetString();
 
             if (type is "error" or "assert")
             {
                 var args = doc.RootElement.GetProperty("args");
-                var message = string.Join(" ", args.EnumerateArray().Select(a =>
-                    a.TryGetProperty("value", out var v) ? v.ToString() :
-                    a.TryGetProperty("description", out var d) ? d.ToString() : a.ToString()));
+                var message = string.Join(" ", args.EnumerateArray().Take(5).Select(a =>
+                {
+                    string val = a.TryGetProperty("value", out var v) ? v.ToString() :
+                                 a.TryGetProperty("description", out var d) ? d.ToString() : a.ToString();
+                    return val.Length > 64 ? val[..64] : val;
+                }));
 
                 JsRuntimeDiagnostics.RecordError($"Console.{type}", message);
             }
@@ -405,6 +507,23 @@ public partial class MainWindow : Window, IDashboardWindow
         _recoveryPolicy.ResetForManualRetry();
         ErrorOverlay.Visibility = Visibility.Collapsed;
         if (_isDisposed) return;
+
+        // Establish a distinct correlated recovery cycle when manual retry begins (R10)
+        _recoveryCorrelationId = Guid.NewGuid().ToString("N");
+        _activeRecoveryCorrelationId = _recoveryCorrelationId;
+
+        DiagnosticSession.Emit(
+            eventId: DiagnosticEventCatalog.WebViewRecoveryAttempted,
+            component: "Dashboard",
+            operation: "ManualRetry",
+            outcome: DiagnosticOutcome.Degraded,
+            failureCategory: DiagnosticFailureCategory.None,
+            safeMessage: "Manual recovery initiated by user.",
+            recoveryStatus: RecoveryStatus.Attempted,
+            correlationId: _activeRecoveryCorrelationId,
+            severity: DiagnosticSeverity.Info
+        );
+
         if (_exhaustedFailureKind == WebViewFailureKind.Navigation && DashboardWebView.CoreWebView2 != null)
         {
             try

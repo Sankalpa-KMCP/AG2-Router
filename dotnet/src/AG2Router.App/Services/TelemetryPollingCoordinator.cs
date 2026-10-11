@@ -1,4 +1,5 @@
 using AG2Router.Core.Contracts;
+using AG2Router.Core.Diagnostics;
 using AG2Router.Core.Models;
 using AG2Router.AG2.Security;
 
@@ -35,17 +36,22 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
     private long _lastAppliedSequence;
     private long _lastAppliedConfigGeneration;
     private SystemStatusDto _currentStatus;
+    private bool _hasObservedFirstStatus;
+    private bool _wasDegraded;
+    private string? _telemetryDegradedCorrelationId;
 
     public event Action<SystemStatusDto>? StatusUpdated;
 
     private readonly INativeAutoRouter? _autoRouter;
     private readonly Action<string>? _log;
+    private readonly IDiagnosticSink _diagnosticSink;
 
     public TelemetryPollingCoordinator(
         IAG2Adapter adapter,
         TimeSpan? interval = null,
         INativeAutoRouter? autoRouter = null,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        IDiagnosticSink? diagnosticSink = null)
     {
         _adapter = adapter;
         if (interval.HasValue && interval.Value <= TimeSpan.Zero)
@@ -55,6 +61,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
         _interval = interval ?? TimeSpan.FromSeconds(10);
         _autoRouter = autoRouter;
         _log = log;
+        _diagnosticSink = diagnosticSink ?? NullDiagnosticSink.Instance;
         if (_autoRouter != null)
         {
             _lastAppliedConfigGeneration = _autoRouter.ConfigGeneration;
@@ -436,6 +443,9 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
 
     internal bool TryApplyStatus(long sequence, SystemStatusDto incoming, out SystemStatusDto? appliedStatus)
     {
+        DiagnosticEvent? eventToEmit = null;
+        bool applied = false;
+
         lock (_stateLock)
         {
             if (!_stopping && !_disposeRequested && sequence >= _lastAppliedSequence)
@@ -449,18 +459,144 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                         incoming = incoming with { Router = authoritativeRouter };
                     }
                 }
+
+                bool isUsableTelemetry = incoming.Ag2.Connected &&
+                                         incoming.Telemetry != null &&
+                                         HasUsableQuotaEvidence(incoming.Telemetry.Quota);
+
+                if (!_hasObservedFirstStatus)
+                {
+                    _hasObservedFirstStatus = true;
+                    if (!isUsableTelemetry)
+                    {
+                        _wasDegraded = true;
+                        _telemetryDegradedCorrelationId = DiagnosticRunContext.CreateCorrelationId();
+                        var category = !incoming.Ag2.Connected
+                            ? DiagnosticFailureCategory.TransportError
+                            : DiagnosticFailureCategory.Unknown;
+
+                        eventToEmit = DiagnosticEventFactory.Create(
+                            eventId: DiagnosticEventCatalog.TelemetryUnavailable,
+                            component: DiagnosticComponents.Telemetry,
+                            operation: DiagnosticOperations.PollTelemetry,
+                            outcome: DiagnosticOutcome.Degraded,
+                            failureCategory: category,
+                            correlationId: _telemetryDegradedCorrelationId,
+                            severity: DiagnosticSeverity.Warning,
+                            affectedFeature: AffectedFeature.Telemetry
+                        );
+                    }
+                    else
+                    {
+                        _wasDegraded = false;
+                    }
+                }
+                else
+                {
+                    if (!isUsableTelemetry && !_wasDegraded)
+                    {
+                        _wasDegraded = true;
+                        _telemetryDegradedCorrelationId = DiagnosticRunContext.CreateCorrelationId();
+                        var category = !incoming.Ag2.Connected
+                            ? DiagnosticFailureCategory.TransportError
+                            : DiagnosticFailureCategory.Unknown;
+
+                        eventToEmit = DiagnosticEventFactory.Create(
+                            eventId: DiagnosticEventCatalog.TelemetryUnavailable,
+                            component: DiagnosticComponents.Telemetry,
+                            operation: DiagnosticOperations.PollTelemetry,
+                            outcome: DiagnosticOutcome.Degraded,
+                            failureCategory: category,
+                            correlationId: _telemetryDegradedCorrelationId,
+                            severity: DiagnosticSeverity.Warning,
+                            affectedFeature: AffectedFeature.Telemetry
+                        );
+                    }
+                    else if (isUsableTelemetry && _wasDegraded)
+                    {
+                        _wasDegraded = false;
+                        string recoveryCorrelationId = _telemetryDegradedCorrelationId ?? DiagnosticRunContext.CreateCorrelationId();
+                        _telemetryDegradedCorrelationId = null;
+                        eventToEmit = DiagnosticEventFactory.Create(
+                            eventId: DiagnosticEventCatalog.TelemetryRecovered,
+                            component: DiagnosticComponents.Telemetry,
+                            operation: DiagnosticOperations.PollTelemetry,
+                            outcome: DiagnosticOutcome.Success,
+                            failureCategory: DiagnosticFailureCategory.None,
+                            correlationId: recoveryCorrelationId,
+                            recoveryStatus: RecoveryStatus.Succeeded,
+                            severity: DiagnosticSeverity.Info,
+                            affectedFeature: AffectedFeature.Telemetry
+                        );
+                    }
+                }
+
                 _lastAppliedSequence = sequence;
                 Volatile.Write(ref _currentStatus, incoming);
                 appliedStatus = incoming;
-                return true;
+                applied = true;
             }
-            appliedStatus = null;
-            return false; // Discard superseded status
+            else
+            {
+                appliedStatus = null;
+                applied = false;
+            }
         }
+
+        if (eventToEmit is not null)
+        {
+            try
+            {
+                _diagnosticSink.Emit(eventToEmit);
+            }
+            catch { }
+        }
+
+        return applied;
     }
 
     internal bool TryApplyStatus(long sequence, SystemStatusDto incoming) =>
         TryApplyStatus(sequence, incoming, out _);
+
+    internal static bool HasUsableQuotaEvidence(QuotaSnapshotDto? quota)
+    {
+        if (quota is null) return false;
+
+        // Check models: at least one model with an observed fraction or explicitly marked exhausted
+        // Note: RemainingFraction == 0.0 is valid observed zero quota evidence (N6)
+        if (quota.Models != null && quota.Models.Count > 0)
+        {
+            foreach (var m in quota.Models)
+            {
+                if (m.RemainingFraction.HasValue || m.IsExhausted)
+                {
+                    return true;
+                }
+            }
+        }
+
+        if (quota.CanonicalModels != null && quota.CanonicalModels.Count > 0)
+        {
+            foreach (var m in quota.CanonicalModels)
+            {
+                if (m.RemainingFraction.HasValue || m.IsExhausted)
+                {
+                    return true;
+                }
+            }
+        }
+
+        // Check credit pools: at least one pool reporting numerical credit evidence
+        if (quota.PromptCredits?.AvailableCredits.HasValue == true ||
+            quota.PromptCredits?.UsedCredits.HasValue == true ||
+            quota.FlowCredits?.AvailableCredits.HasValue == true ||
+            quota.FlowCredits?.UsedCredits.HasValue == true)
+        {
+            return true;
+        }
+
+        return false;
+    }
 
     /// <summary>Requests stop and drains admitted work within the caller's wait budget.
     /// A canceled wait retains task/CTS ownership; a late poll cannot publish after stop.</summary>
@@ -506,6 +642,7 @@ public class TelemetryPollingCoordinator : IAsyncDisposable
                 _stopping = true;
                 _lifetimeCts.Cancel();
                 _cts?.Cancel();
+                _activePollCts?.Cancel();
                 _timer?.Dispose();
                 var background = _pollTask ?? Task.CompletedTask;
                 var active = _activePollCompletion?.Task ?? Task.CompletedTask;

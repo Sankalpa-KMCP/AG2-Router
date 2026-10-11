@@ -3,6 +3,7 @@ using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Rpc;
 using AG2Router.AG2.Security;
 using AG2Router.Core.Contracts;
+using AG2Router.Core.Diagnostics;
 using AG2Router.Core.Models;
 
 namespace AG2Router.AG2.Usage;
@@ -44,6 +45,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
     private readonly IAccountStore _accountStore;
     private readonly TimeProvider _timeProvider;
     private readonly Action<string>? _log;
+    private readonly IDiagnosticSink _diagnosticSink;
 
     private readonly SemaphoreSlim _cycleSemaphore = new(1, 1);
     private readonly object _stateLock = new();
@@ -57,6 +59,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
     private bool _disposeRequested;
     private bool _resourcesDisposed;
     private UsageCollectorDiagnostics _currentDiagnostics = new();
+    private string? _usageDegradedCorrelationId;
 
     /// <summary>
     /// Per-observation-source continuity (F-04/C2 hardening). Continuity is scoped to one
@@ -81,7 +84,8 @@ public sealed class UsageCollectionService : IAsyncDisposable
         IUsageRpcClient rpcClient,
         IAccountStore accountStore,
         TimeProvider? timeProvider = null,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        IDiagnosticSink? diagnosticSink = null)
     {
         _ledger = ledger ?? throw new ArgumentNullException(nameof(ledger));
         _stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
@@ -90,6 +94,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
         _accountStore = accountStore ?? throw new ArgumentNullException(nameof(accountStore));
         _timeProvider = timeProvider ?? TimeProvider.System;
         _log = log;
+        _diagnosticSink = diagnosticSink ?? NullDiagnosticSink.Instance;
     }
 
     private sealed record TrajectoryChangeSignature(string? Status, int? StepCount, string? LastModifiedTime);
@@ -362,6 +367,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
         int unattributedCalls = 0;
         int malformedEntries = 0;
         string? lastError = null;
+        DiagnosticFailureCategory failureCategory = DiagnosticFailureCategory.None;
         bool integrityAvailable = true;
 
         // The checkpoint is a durable diagnostics record. Continuity itself is tracked per
@@ -374,6 +380,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
         catch (UsageCollectorStateException ex)
         {
             lastError = "Collector continuity checkpoint is unreadable; runbook recovery is required.";
+            failureCategory = DiagnosticFailureCategory.StorageError;
             _log?.Invoke($"Usage collector checkpoint unavailable: {Sanitize(ex)}");
         }
 
@@ -392,7 +399,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
             _log?.Invoke($"Usage instance discovery failed: {Sanitize(ex)}");
             return Diagnostics(attemptedAtUtc, success: false,
                 lastError: "Antigravity instance discovery failed.", integrityAvailable: true,
-                discovered: 0, healthy: 0);
+                discovered: 0, healthy: 0, failureCategory: DiagnosticFailureCategory.DiscoveryError);
         }
         instancesDiscovered = endpoints.Count;
         discoverySucceeded = true;
@@ -459,6 +466,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
                     {
                         // One broken cascade or instance must not erase other results.
                         lastError = "One or more conversations could not be inspected.";
+                        failureCategory = DiagnosticFailureCategory.TransportError;
                         _log?.Invoke($"Usage metadata fetch failed for a conversation: {Sanitize(ex)}");
                         // The cursor must not retain a signature whose metadata was never
                         // fetched: reverting it makes the next cycle re-detect the change and
@@ -481,6 +489,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
             catch (Exception ex)
             {
                 lastError = "One Antigravity instance could not be queried.";
+                failureCategory = DiagnosticFailureCategory.TransportError;
                 _log?.Invoke($"Usage trajectory enumeration failed for one instance: {Sanitize(ex)}");
             }
         }
@@ -561,6 +570,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
             // Accounting integrity wins: conflicts are surfaced, never overwritten or retried.
             cycleSucceeded = false;
             integrityAvailable = false;
+            failureCategory = DiagnosticFailureCategory.StorageError;
             lastError = "A usage accounting conflict was detected; the ledger was left intact.";
             _log?.Invoke($"Usage ledger conflict for a call: {Sanitize(ex)}");
         }
@@ -568,6 +578,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
         {
             cycleSucceeded = false;
             integrityAvailable = false;
+            failureCategory = DiagnosticFailureCategory.StorageError;
             lastError = "Usage history storage is unreadable; collection is paused.";
             _log?.Invoke($"Usage ledger corruption: {Sanitize(ex)}");
         }
@@ -588,6 +599,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 lastError = "Collector continuity checkpoint could not be saved; continuity itself is tracked per observation source.";
+                failureCategory = DiagnosticFailureCategory.StorageError;
                 _log?.Invoke($"Usage checkpoint save failed: {Sanitize(ex)}");
             }
 
@@ -630,9 +642,10 @@ public sealed class UsageCollectionService : IAsyncDisposable
             InstancesDiscovered = instancesDiscovered,
             InstancesHealthy = instancesHealthy,
             IntegrityAvailable = integrityAvailable,
+            FailureCategory = failureCategory,
         };
 
-        UsageCollectorDiagnostics Diagnostics(DateTimeOffset at, bool success, string? lastError, bool integrityAvailable, int discovered, int healthy) =>
+        UsageCollectorDiagnostics Diagnostics(DateTimeOffset at, bool success, string? lastError, bool integrityAvailable, int discovered, int healthy, DiagnosticFailureCategory failureCategory = DiagnosticFailureCategory.None) =>
             new()
             {
                 BaselineEstablished = BaselineEstablished,
@@ -642,6 +655,7 @@ public sealed class UsageCollectionService : IAsyncDisposable
                 InstancesDiscovered = discovered,
                 InstancesHealthy = healthy,
                 IntegrityAvailable = integrityAvailable,
+                FailureCategory = failureCategory,
             };
     }
 
@@ -801,6 +815,56 @@ public sealed class UsageCollectionService : IAsyncDisposable
             if (_disposeRequested)
                 return;
         }
+
+        var prev = Volatile.Read(ref _currentDiagnostics);
         Volatile.Write(ref _currentDiagnostics, diagnostics);
+
+        // Affirmative success requires healthy instances, intact integrity, and no errors.
+        bool isSuccess = diagnostics.LastError == null && diagnostics.IntegrityAvailable && diagnostics.InstancesHealthy > 0;
+        bool prevSuccess = prev.LastCollectionAttemptAtUtc != null && prev.LastError == null && prev.IntegrityAvailable && prev.InstancesHealthy > 0;
+
+        try
+        {
+            if (!isSuccess && (prevSuccess || prev.LastCollectionAttemptAtUtc == null))
+            {
+                _usageDegradedCorrelationId = DiagnosticRunContext.CreateCorrelationId();
+                var category = diagnostics.FailureCategory != DiagnosticFailureCategory.None
+                    ? diagnostics.FailureCategory
+                    : DiagnosticFailureCategory.Unknown;
+
+                _diagnosticSink.Emit(DiagnosticEventFactory.Create(
+                    eventId: DiagnosticEventCatalog.UsagePartialCollection,
+                    component: DiagnosticComponents.UsageAccounting,
+                    operation: DiagnosticOperations.CollectUsageCycle,
+                    outcome: DiagnosticOutcome.Degraded,
+                    failureCategory: category,
+                    correlationId: _usageDegradedCorrelationId,
+                    safeMessage: diagnostics.LastError ?? "Usage collection cycle degraded.",
+                    severity: DiagnosticSeverity.Warning,
+                    affectedFeature: AffectedFeature.UsageAccounting
+                ));
+            }
+            else if (isSuccess && !prevSuccess && prev.LastCollectionAttemptAtUtc != null)
+            {
+                string recoveryCorrelationId = _usageDegradedCorrelationId ?? DiagnosticRunContext.CreateCorrelationId();
+                _usageDegradedCorrelationId = null;
+                _diagnosticSink.Emit(DiagnosticEventFactory.Create(
+                    eventId: DiagnosticEventCatalog.UsageRecovered,
+                    component: DiagnosticComponents.UsageAccounting,
+                    operation: DiagnosticOperations.CollectUsageCycle,
+                    outcome: DiagnosticOutcome.Success,
+                    failureCategory: DiagnosticFailureCategory.None,
+                    correlationId: recoveryCorrelationId,
+                    safeMessage: "Usage collection cycle recovered successfully.",
+                    recoveryStatus: RecoveryStatus.Succeeded,
+                    severity: DiagnosticSeverity.Info,
+                    affectedFeature: AffectedFeature.UsageAccounting
+                ));
+            }
+        }
+        catch
+        {
+            // Diagnostics emission must never fault caller or background collection loop
+        }
     }
 }

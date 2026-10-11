@@ -1,6 +1,7 @@
 using System.IO;
 using System.Runtime.InteropServices;
 using AG2Router.App.Diagnostics;
+using AG2Router.Core.Diagnostics;
 using Microsoft.Web.WebView2.Core;
 
 namespace AG2Router.App.Services;
@@ -113,6 +114,8 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
             // 4. Creation with exponential backoff on lock contention
             TEnv? createdEnv = null;
             Exception? lastException = null;
+            int successfulAttempt = 0;
+            string recoveryCycleCorrelationId = DiagnosticRunContext.CreateCorrelationId();
 
             for (int attempt = 1; attempt <= _maxRetries; attempt++)
             {
@@ -124,6 +127,7 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
                     try
                     {
                         createdEnv = await creation.WaitAsync(_creationTimeout, ct).ConfigureAwait(false);
+                        successfulAttempt = attempt;
                     }
                     catch (TimeoutException)
                     {
@@ -138,16 +142,67 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
                 {
                     lastException = ex;
                     _logger?.Invoke($"WebView2 environment creation timed out on attempt {attempt}/{_maxRetries}.", ex);
+                    DiagnosticSession.Emit(
+                        eventId: DiagnosticEventCatalog.WebViewInitializationFailed,
+                        component: "Dashboard",
+                        operation: "CreateWebView2Environment",
+                        outcome: DiagnosticOutcome.Failure,
+                        failureCategory: DiagnosticFailureCategory.InitializationError,
+                        correlationId: recoveryCycleCorrelationId,
+                        safeMessage: $"WebView2 environment creation timed out on attempt {attempt}/{_maxRetries}.",
+                        attempt: attempt,
+                        exceptionType: nameof(TimeoutException),
+                        severity: DiagnosticSeverity.Warning
+                    );
                     if (attempt < _maxRetries)
+                    {
+                        DiagnosticSession.Emit(
+                            eventId: DiagnosticEventCatalog.WebViewRecoveryAttempted,
+                            component: "Dashboard",
+                            operation: "RecoverWebView2Environment",
+                            outcome: DiagnosticOutcome.Degraded,
+                            failureCategory: DiagnosticFailureCategory.InitializationError,
+                            correlationId: recoveryCycleCorrelationId,
+                            safeMessage: $"Retrying WebView2 environment creation after timeout (attempt {attempt + 1}/{_maxRetries}).",
+                            attempt: attempt + 1,
+                            recoveryStatus: RecoveryStatus.Attempted,
+                            severity: DiagnosticSeverity.Info
+                        );
                         await _delayFunc(_initialRetryDelay, ct).ConfigureAwait(false);
+                    }
                 }
                 catch (Exception ex) when (_isLockContentionException(ex))
                 {
                     lastException = ex;
+                    DiagnosticSession.Emit(
+                        eventId: DiagnosticEventCatalog.WebViewInitializationFailed,
+                        component: "Dashboard",
+                        operation: "CreateWebView2Environment",
+                        outcome: DiagnosticOutcome.Failure,
+                        failureCategory: DiagnosticFailureCategory.InitializationError,
+                        correlationId: recoveryCycleCorrelationId,
+                        safeMessage: $"Lock contention on WebView2 creation attempt {attempt}/{_maxRetries}.",
+                        attempt: attempt,
+                        exceptionType: ex.GetType().Name,
+                        hresult: ex.HResult,
+                        severity: DiagnosticSeverity.Warning
+                    );
                     if (attempt < _maxRetries)
                     {
                         var delayMs = (int)(_initialRetryDelay.TotalMilliseconds * Math.Pow(2, attempt - 1));
                         _logger?.Invoke($"Lockfile contention on attempt {attempt}/{_maxRetries}. Retrying in {delayMs}ms...", ex);
+                        DiagnosticSession.Emit(
+                            eventId: DiagnosticEventCatalog.WebViewRecoveryAttempted,
+                            component: "Dashboard",
+                            operation: "RecoverWebView2Environment",
+                            outcome: DiagnosticOutcome.Degraded,
+                            failureCategory: DiagnosticFailureCategory.InitializationError,
+                            correlationId: recoveryCycleCorrelationId,
+                            safeMessage: $"Retrying WebView2 environment creation after lock contention (attempt {attempt + 1}/{_maxRetries}).",
+                            attempt: attempt + 1,
+                            recoveryStatus: RecoveryStatus.Attempted,
+                            severity: DiagnosticSeverity.Info
+                        );
                         await _delayFunc(TimeSpan.FromMilliseconds(delayMs), ct).ConfigureAwait(false);
                     }
                 }
@@ -155,9 +210,39 @@ public class WebView2EnvironmentCoordinatorCore<TEnv> where TEnv : class
 
             if (createdEnv == null)
             {
+                DiagnosticSession.Emit(
+                    eventId: DiagnosticEventCatalog.WebViewRecoveryExhausted,
+                    component: "Dashboard",
+                    operation: "RecoverWebView2Environment",
+                    outcome: DiagnosticOutcome.Failure,
+                    failureCategory: DiagnosticFailureCategory.InitializationError,
+                    correlationId: recoveryCycleCorrelationId,
+                    safeMessage: $"Failed to initialize WebView2 environment after {_maxRetries} retry attempts.",
+                    attempt: _maxRetries,
+                    recoveryStatus: RecoveryStatus.Exhausted,
+                    exceptionType: lastException?.GetType().Name,
+                    hresult: lastException?.HResult,
+                    severity: DiagnosticSeverity.Error
+                );
                 throw new InvalidOperationException(
                     $"Failed to initialize WebView2 environment after {_maxRetries} retry attempts.",
                     lastException
+                );
+            }
+
+            if (successfulAttempt > 1)
+            {
+                DiagnosticSession.Emit(
+                    eventId: DiagnosticEventCatalog.WebViewRecoverySucceeded,
+                    component: "Dashboard",
+                    operation: "RecoverWebView2Environment",
+                    outcome: DiagnosticOutcome.Success,
+                    failureCategory: DiagnosticFailureCategory.None,
+                    correlationId: recoveryCycleCorrelationId,
+                    safeMessage: $"WebView2 environment creation succeeded on retry attempt {successfulAttempt}/{_maxRetries}.",
+                    attempt: successfulAttempt,
+                    recoveryStatus: RecoveryStatus.Succeeded,
+                    severity: DiagnosticSeverity.Info
                 );
             }
 

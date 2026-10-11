@@ -13,7 +13,7 @@ namespace AG2Router.Tests;
 /// </summary>
 public class UsageAggregationServiceTests
 {
-    private static readonly DateTimeOffset October = new(2026, 10, 4, 12, 0, 0, TimeSpan.Zero);
+    private static readonly DateTimeOffset October = DateTimeOffset.UtcNow.AddDays(-1);
 
     private sealed class TestTempDirectory : IDisposable
     {

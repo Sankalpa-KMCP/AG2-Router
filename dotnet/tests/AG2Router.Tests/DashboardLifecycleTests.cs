@@ -643,4 +643,60 @@ public sealed class WebViewRecoveryEventBindingTests
         public void RaiseProcessFailure() =>
             ProcessFailed?.Invoke(this, new WebViewProcessFailureEventArgs("Current process failed"));
     }
+
+    [Fact]
+    public async Task JsRuntimeDiagnosticsStore_CoalescesPendingWriteOperations_UnderDelayedPersistence()
+    {
+        // R3 & N10: Under delayed persistence (e.g. slow disk or thread contention), consecutive
+        // WriteOperations must coalesce in O(1) time rather than growing an unbounded queue.
+        var workerArrivedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delayTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writeCount = 0;
+
+        var store = new JsRuntimeDiagnosticsStore(
+            ":memory:",
+            async (dest, snapshot) =>
+            {
+                Interlocked.Increment(ref writeCount);
+                workerArrivedTcs.TrySetResult(true);
+                await delayTcs.Task.ConfigureAwait(false);
+            },
+            allowProductionPath: true
+        );
+
+        // Record first error to start worker
+        store.RecordError("Error1", "First error message");
+
+        // Definitively await worker arrival at the blocked write with independent timeout (N10)
+        await workerArrivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, writeCount);
+
+        try
+        {
+            // While worker is definitively paused awaiting delayTcs, rapidly enqueue 50 more errors
+            for (int i = 2; i <= 50; i++)
+            {
+                store.RecordError($"Error{i}", $"Message {i}");
+            }
+
+            // Pending operations count must be coalesced to 1 (the single pending latest write)
+            Assert.Equal(1, store.PendingOperationsCount);
+        }
+        finally
+        {
+            // Release the worker in finally block (N10)
+            delayTcs.TrySetResult(true);
+        }
+
+        await store.FlushAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        // After flushing, write count must be exactly 2 (initial write + single coalesced second write)
+        Assert.Equal(2, writeCount);
+        Assert.Equal(0, store.PendingOperationsCount);
+
+        // Total errors in snapshot is bounded and contains latest error
+        var errors = store.Errors;
+        Assert.NotEmpty(errors);
+        Assert.Equal("Message 50", errors.Last().Message);
+    }
 }

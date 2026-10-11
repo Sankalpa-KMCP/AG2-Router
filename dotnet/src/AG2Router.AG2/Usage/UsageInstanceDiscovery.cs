@@ -1,6 +1,7 @@
 using AG2Router.AG2.Discovery;
 using AG2Router.AG2.Rpc;
 using AG2Router.AG2.Security;
+using AG2Router.Core.Diagnostics;
 
 namespace AG2Router.AG2.Usage;
 
@@ -23,11 +24,16 @@ public sealed class UsageInstanceDiscovery
 {
     private readonly IProcessInspector _inspector;
     private readonly IAG2RpcClient _probeClient;
+    private readonly IDiagnosticSink _diagnosticSink;
 
-    public UsageInstanceDiscovery(IProcessInspector inspector, IAG2RpcClient? probeClient = null)
+    public UsageInstanceDiscovery(
+        IProcessInspector inspector,
+        IAG2RpcClient? probeClient = null,
+        IDiagnosticSink? diagnosticSink = null)
     {
         _inspector = inspector ?? throw new ArgumentNullException(nameof(inspector));
         _probeClient = probeClient ?? new AG2RpcClient();
+        _diagnosticSink = diagnosticSink ?? NullDiagnosticSink.Instance;
     }
 
     /// <summary>All currently validated instances; empty when Antigravity is not running.</summary>
@@ -39,6 +45,7 @@ public sealed class UsageInstanceDiscovery
             return [];
 
         var endpoints = new List<UsageInstanceEndpoint>();
+        string discoveryCorrelationId = DiagnosticRunContext.CreateCorrelationId();
         foreach (var candidate in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -61,15 +68,26 @@ public sealed class UsageInstanceDiscovery
 
             foreach (var port in ports)
             {
-                if (await _probeClient.ProbePortAsync(port, "https", csrfToken, cancellationToken).ConfigureAwait(false))
+                var httpsResult = await _probeClient.ProbePortDetailedAsync(port, "https", csrfToken, cancellationToken).ConfigureAwait(false);
+                if (httpsResult.Success)
                 {
                     endpoints.Add(new UsageInstanceEndpoint(candidate.ProcessId, port, "https", csrfToken));
                     break;
                 }
-                if (await _probeClient.ProbePortAsync(port, "http", csrfToken, cancellationToken).ConfigureAwait(false))
+                else
+                {
+                    EmitProbeDiagnostic(httpsResult.FailureReason, "https", httpsResult.StatusCode, discoveryCorrelationId);
+                }
+
+                var httpResult = await _probeClient.ProbePortDetailedAsync(port, "http", csrfToken, cancellationToken).ConfigureAwait(false);
+                if (httpResult.Success)
                 {
                     endpoints.Add(new UsageInstanceEndpoint(candidate.ProcessId, port, "http", csrfToken));
                     break;
+                }
+                else
+                {
+                    EmitProbeDiagnostic(httpResult.FailureReason, "http", httpResult.StatusCode, discoveryCorrelationId);
                 }
             }
         }
@@ -80,5 +98,52 @@ public sealed class UsageInstanceDiscovery
             .OrderBy(static endpoint => endpoint.ProcessId)
             .ThenBy(static endpoint => endpoint.Port)
             .ToList();
+    }
+
+    private void EmitProbeDiagnostic(ProbeFailureReason reason, string protocol, int statusCode, string? correlationId = null)
+    {
+        if (reason == ProbeFailureReason.None) return;
+
+        int eventId = reason switch
+        {
+            ProbeFailureReason.ProtocolMismatch => DiagnosticEventCatalog.RpcProtocolMismatch,
+            ProbeFailureReason.TlsHandshakeFailure => DiagnosticEventCatalog.TlsHandshakeFailed,
+            ProbeFailureReason.ProbeTimeout => DiagnosticEventCatalog.RpcDeadlineExceeded,
+            ProbeFailureReason.Cancelled => DiagnosticEventCatalog.RpcCallerCancelled,
+            ProbeFailureReason.IncompleteResponseBody => DiagnosticEventCatalog.RpcBodyIncomplete,
+            ProbeFailureReason.RejectedRedirect => DiagnosticEventCatalog.RpcRejectedRedirect,
+            ProbeFailureReason.ServerError => DiagnosticEventCatalog.RpcServerError,
+            ProbeFailureReason.TransportError => DiagnosticEventCatalog.RpcTransportFailed,
+            _ => DiagnosticEventCatalog.RpcUnknownFailure
+        };
+
+        DiagnosticFailureCategory category = reason switch
+        {
+            ProbeFailureReason.ProtocolMismatch => DiagnosticFailureCategory.ProtocolMismatch,
+            ProbeFailureReason.TlsHandshakeFailure => DiagnosticFailureCategory.TlsHandshakeFailure,
+            ProbeFailureReason.ProbeTimeout => DiagnosticFailureCategory.ProbeTimeout,
+            ProbeFailureReason.Cancelled => DiagnosticFailureCategory.Cancelled,
+            ProbeFailureReason.IncompleteResponseBody => DiagnosticFailureCategory.IncompleteResponseBody,
+            ProbeFailureReason.RejectedRedirect => DiagnosticFailureCategory.RejectedRedirect,
+            ProbeFailureReason.ServerError => DiagnosticFailureCategory.ServerError,
+            ProbeFailureReason.TransportError => DiagnosticFailureCategory.TransportError,
+            _ => DiagnosticFailureCategory.Unknown
+        };
+
+        var evt = DiagnosticEventFactory.Create(
+            eventId: eventId,
+            component: DiagnosticComponents.UsageDiscovery,
+            operation: DiagnosticOperations.ProbeConnectRpcPort,
+            outcome: reason == ProbeFailureReason.Cancelled ? DiagnosticOutcome.Cancelled : DiagnosticOutcome.Failure,
+            failureCategory: category,
+            correlationId: correlationId,
+            safeMessage: $"Usage instance port probe failed for {protocol.ToUpperInvariant()} with reason {reason}.",
+            protocol: protocol,
+            httpStatus: statusCode > 0 ? statusCode : null,
+            severity: reason == ProbeFailureReason.Cancelled ? DiagnosticSeverity.Info : DiagnosticSeverity.Warning,
+            affectedFeature: AffectedFeature.RpcTransport
+        );
+
+        _diagnosticSink.Emit(evt);
     }
 }

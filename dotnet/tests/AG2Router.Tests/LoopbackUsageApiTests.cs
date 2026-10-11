@@ -6,6 +6,7 @@ using AG2Router.AG2.Persistence;
 using AG2Router.AG2.Usage;
 using AG2Router.App.Server;
 using AG2Router.Core.Contracts;
+using AG2Router.Core.Diagnostics;
 using AG2Router.Core.Models;
 using Xunit;
 
@@ -17,7 +18,7 @@ namespace AG2Router.Tests;
 /// </summary>
 public class LoopbackUsageApiTests
 {
-    private static readonly DateTimeOffset October = new(2026, 10, 4, 12, 0, 0, TimeSpan.Zero);
+    private static readonly DateTimeOffset October = DateTimeOffset.UtcNow.AddDays(-1);
 
     private sealed class TestTempDirectory : IDisposable
     {
@@ -284,6 +285,40 @@ public class LoopbackUsageApiTests
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
             Assert.Equal(1, json.RootElement.GetProperty("summary").GetProperty("totals").GetProperty("calls").GetInt32());
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Summary_SerializesFailureCategoryAsStringEnum_WhenDegraded()
+    {
+        // F11: Verify GET /api/usage/summary serializes FailureCategory as agreed string representation
+        using var temp = new TestTempDirectory();
+        var ledger = new DurableUsageCallLedger(Path.Combine(temp.Path, "usage"));
+        var aggregation = new UsageAggregationService(ledger);
+        var server = new LoopbackServer();
+        try
+        {
+            await server.StartAsync(0, usageAggregation: aggregation,
+                usageCollectorStatusProvider: () => new UsageCollectorDiagnostics
+                {
+                    BaselineEstablished = false,
+                    InstancesDiscovered = 1,
+                    InstancesHealthy = 0,
+                    FailureCategory = DiagnosticFailureCategory.TransportError,
+                    LastError = "Connection refused"
+                });
+            using var client = new HttpClient();
+            var response = await client.GetAsync($"{server.BoundUrl}/api/usage/summary?scope=all");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var collector = json.RootElement.GetProperty("collector");
+            Assert.Equal("TransportError", collector.GetProperty("failureCategory").GetString());
+            Assert.False(collector.GetProperty("baselineEstablished").GetBoolean());
+            Assert.Equal("Connection refused", collector.GetProperty("lastError").GetString());
         }
         finally
         {
