@@ -39,6 +39,7 @@ Current records:
 | [ADR-005](ADR-005-target-activation-provenance.md) | Persist target-activation provenance in the switch journal | Accepted (implemented) |
 | [ADR-006](ADR-006-recorded-source-runtime-coherence-recovery.md) | RECORDED journal cleanup requires source-runtime coherence | Accepted (implemented) |
 | [ADR-007](ADR-007-evidence-revision-and-pool-status-authority.md) | Durable evidence revision and authoritative pool-status publication | Accepted (implemented) |
+| [ADR-008](ADR-008-structured-diagnostic-logging.md) | Structured Privacy-Safe Diagnostic Logging Architecture | Accepted (implemented) |
 
 When adding an ADR, add its row to this table in the same change.
 

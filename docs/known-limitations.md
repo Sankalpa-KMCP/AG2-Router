@@ -39,7 +39,10 @@ Loopback binding reduces exposure but is not user authentication. See [security-
 
 ## Diagnostics persistence
 
-- If diagnostic file persistence is blocked for an extended period while JavaScript errors continue arriving, queued complete snapshots can accumulate in memory and cause redundant writes once unblocked; retained in-memory and displayed JS errors remain strictly bounded to 100.
+- The structured diagnostic logging foundation (P0) and subsystem wiring across bootstrap, WebView2 recovery, RPC discovery/probing, and telemetry/usage accounting (P1a) are implemented and verified with valid JSONL records (header records on line 1, no `#` comment lines), pre-admission in-memory buffering, strict queue bounds (512 items, 4 MiB memory bound), segment rotation (4 MiB / 8 segments / 32 MiB total / 14 days), truthful retention accounting (`RetentionFailureCount`), and hard pre-ingestion privacy sanitization with regex pre-bounding and safe symbol enforcement.
+- Persistence employs a single active writer lease (`.active_writer.lock`). Early startup and secondary instances run in memory-only mode via `MemoryDiagnosticSink`. Primary promotion occurs strictly after `SingleInstanceGuard` acquisition. If multiple AG2 Router instances execute simultaneously under the same user profile, only the primary instance acquires disk persistence rights; secondary instances degrade to memory-only ring-buffer diagnostics and do not create lock files or append to disk logs.
+- Diagnostic viewing in the dashboard UI (P2) and installer-level log collection/export (P3) remain planned for subsequent phases; diagnostic events currently persist to JSONL files in `%LOCALAPPDATA%\AG2-Router\diagnostics\` and can be queried via `IDiagnosticSink.GetRecentEvents()`.
+- Legacy `js_runtime_errors.json` writes remain active alongside the structured sink; retained in-memory and displayed JS errors in the legacy viewer remain bounded to 100 items / 64 KiB with O(1) coalescing of pending writes under delayed persistence.
 
 Durable state and lifecycle sequencing: [persistence-and-concurrency.md](persistence-and-concurrency.md).
 

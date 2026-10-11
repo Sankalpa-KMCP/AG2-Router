@@ -74,11 +74,16 @@ Primary evidence: AG2ProcessDetector, ProcessProvenanceValidator, WindowsProcess
 
 - AG2Security sanitizes known sensitive flags, headers (including multi-parameter Digest and line-bounded Authorization headers containing internal brackets, braces, or punctuation, terminating strictly at line boundaries or EOF), and JSON/diagnostic key/value patterns across structural separator whitespace (spaces, tabs, newlines) before messages cross diagnostics or API boundaries.
 - RPC calls keep discovered tokens inside the adapter boundary and redact error snippets.
+- Diagnostic logging enforces hard pre-ingestion privacy sanitization via `DiagnosticSanitizer` before events enter in-memory buffers or persistent queues. CSRF tokens, bearer JWT tokens, passwords, cookies, email addresses, DPAPI ciphertext, raw query strings, non-profile absolute file paths, and private user directory paths (`C:\Users\[USER]\...`) are permanently redacted. All raw string inputs are bounded to <= 8,192 characters prior to regex evaluation to guarantee ReDoS defense; all regular expression evaluations enforce strict 200 ms timeouts (`RegexTimeout = TimeSpan.FromMilliseconds(200)`), returning `[REDACTED_TIMEOUT]` upon timeout.
+- Field-specific validation: Symbolic fields (`Component`, `Operation`, `OriginSymbol`) enforce strict symbol allowlisting (`SafeSymbolRegex`), replacing invalid symbols with `[REDACTED_SYMBOL]`. Text fields redact JSON-quoted secrets (`JsonQuotedSecretRegex`), query parameter secrets (`QueryParamSecretRegex`), assignment secrets, and raw conversation/prompt content (`ConversationContentRegex`).
+- Identifier preservation: Valid identifiers (run IDs, correlation IDs, operation IDs) matching `IdentifierRegex` (`^[a-zA-Z0-9_\-\.]{1,64}$`) are preserved intact and never masked with `[REDACTED_TOKEN]`, maintaining diagnostic causal links across cycles in a single sequence domain.
+- Direct constructor callers cannot bypass sanitization: `DiagnosticEvent.Sanitize()` enforces pre-ingestion scrubbing across all event entry paths prior to queue admission or serialization.
+- Diagnostic exception serialization is strictly restricted to allowlisted type names, inner exception chains bounded to depth <= 3, and numeric HRESULT codes. Raw exception messages, stack traces, and `Exception.Data` are never serialized into diagnostic events. DevTools Protocol (CDP) JSON payloads are rejected from diagnostic emission and error capture: inputs are bounded to <= 8,192 characters prior to JSON parsing and stack traces extract top 3 call frames `fn:line` without raw CDP JSON leakage.
 - Credential buffers are copied narrowly and zeroed where practical. Managed-runtime zeroing is best-effort, not guaranteed erasure of all transient strings or copies.
 - Public account/status DTOs must contain metadata and telemetry only, never credential material.
 - Release packaging scans selected text assets for known secret markers, but that scan is not a complete secret detector.
 
-Primary evidence: AG2Security.cs, AG2RpcClient.cs, Windows DPAPI/WinCred implementations, packaging script, and security/RPC tests.
+Primary evidence: AG2Security.cs, DiagnosticSanitizer.cs, DiagnosticEvent.cs, AG2RpcClient.cs, Windows DPAPI/WinCred implementations, packaging script, and security/RPC/diagnostic tests.
 
 ## Daemon RPC transport security
 
@@ -102,4 +107,4 @@ Do not weaken a fail-closed branch merely to keep routing available. Changes req
 
 ## Repository and test guardrail
 
-Default development and tests must use fakes and task-owned temporary directories. Live Antigravity, real WinCred, production DPAPI data, user vault/account files, registry state, and installed application state are protected resources. The opt-in boundary is documented in [testing.md](testing.md).
+Default development and tests must use fakes and task-owned temporary directories. Live Antigravity, real WinCred, production DPAPI data, user vault/account files, registry state, and installed application state are protected resources. The opt-in boundary is documented in [testing.md](testing.md). Diagnostic stores enforce programmatic assertions (`AssertNotProductionAppData`) that fail closed and abort execution if any test attempts to target or write into `%LOCALAPPDATA%\AG2-Router`.
