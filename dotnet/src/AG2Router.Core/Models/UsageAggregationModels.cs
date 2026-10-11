@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using AG2Router.Core.Diagnostics;
 
 namespace AG2Router.Core.Models;
 
@@ -240,6 +241,10 @@ public sealed record UsageCollectorDiagnostics
 
     [JsonPropertyName("integrityAvailable")]
     public bool IntegrityAvailable { get; init; } = true;
+
+    [JsonPropertyName("failureCategory")]
+    [JsonConverter(typeof(JsonStringEnumConverter<DiagnosticFailureCategory>))]
+    public DiagnosticFailureCategory FailureCategory { get; init; } = DiagnosticFailureCategory.None;
 
     public static UsageCollectorDiagnostics Unavailable(string reason) => new()
     {

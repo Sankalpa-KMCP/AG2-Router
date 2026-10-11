@@ -228,6 +228,7 @@ export interface UsageCollectorStatus {
   instancesDiscovered: number;
   instancesHealthy: number;
   integrityAvailable: boolean;
+  failureCategory?: string;
 }
 
 export interface UsageAccountBreakdownItem {
