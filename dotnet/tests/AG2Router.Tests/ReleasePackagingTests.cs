@@ -1535,6 +1535,46 @@ public class ReleasePackagingTests
         Assert.DoesNotContain(result.Operations, x => x.StartsWith("StartExitProcess"));
     }
 
+    [Fact]
+    public async Task SyntheticInstallationTestEnvironment_Dispose_RetriesAndSucceeds_WhenHandleContentionClearsWithinBudget()
+    {
+        var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot());
+        string testFilePath = Path.Combine(environment.Root, "locked_file.tmp");
+        File.WriteAllText(testFilePath, "lock-content");
+
+        var lockStream = new FileStream(testFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(150);
+            lockStream.Dispose();
+        });
+
+        environment.Dispose();
+
+        Assert.False(Directory.Exists(environment.Root));
+    }
+
+    [Fact]
+    public void SyntheticInstallationTestEnvironment_Dispose_PreservesIOException_WhenContentionPersistsBeyondBudget()
+    {
+        var environment = new SyntheticInstallationTestEnvironment(FindRepositoryRoot())
+        {
+            CleanupTimeout = TimeSpan.FromMilliseconds(150)
+        };
+        string testFilePath = Path.Combine(environment.Root, "locked_file.tmp");
+        File.WriteAllText(testFilePath, "lock-content");
+
+        using var lockStream = new FileStream(testFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+
+        Assert.Throws<IOException>(() => environment.Dispose());
+
+        lockStream.Dispose();
+        environment.CleanupTimeout = TimeSpan.FromSeconds(5);
+        environment.Dispose();
+        Assert.False(Directory.Exists(environment.Root));
+    }
+
     private static void AssertSyntheticBoundary(SyntheticInstallationTestEnvironment environment, SyntheticInstallationTestEnvironment.Result result)
     {
         Assert.Empty(result.BoundaryErrors);

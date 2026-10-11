@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace AG2Router.Tests;
 
@@ -123,6 +124,8 @@ internal sealed class SyntheticInstallationTestEnvironment : IDisposable
 
     private static string Quote(string text) => text.Replace("'", "''");
 
+    public TimeSpan CleanupTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
     public void Dispose()
     {
         string parent = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
@@ -130,7 +133,29 @@ internal sealed class SyntheticInstallationTestEnvironment : IDisposable
         if (!string.Equals(Path.GetDirectoryName(resolved), parent, StringComparison.OrdinalIgnoreCase) ||
             !Path.GetFileName(resolved).StartsWith("AG2_SyntheticInstall_", StringComparison.Ordinal))
             throw new InvalidOperationException("Refusing cleanup outside the task-owned fixture.");
-        if (Directory.Exists(resolved)) Directory.Delete(resolved, recursive: true);
+
+        if (!Directory.Exists(resolved)) return;
+
+        var deadline = DateTime.UtcNow + CleanupTimeout;
+        while (true)
+        {
+            try
+            {
+                if (Directory.Exists(resolved))
+                {
+                    Directory.Delete(resolved, recursive: true);
+                }
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    throw;
+                }
+                Thread.Sleep(50);
+            }
+        }
     }
 
     internal sealed record Result(int ExitCode, string Output, JsonDocument Snapshot) : IDisposable
