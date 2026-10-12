@@ -199,9 +199,17 @@ public class TelemetryPollingCoordinatorTests
         {
             GetStatusFunc = async token =>
             {
-                using var registration = token.Register(() => cancellationObserved.TrySetResult());
+                token.Register(() => cancellationObserved.TrySetResult());
                 entered.TrySetResult();
-                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                }
+                catch (OperationCanceledException)
+                {
+                    cancellationObserved.TrySetResult();
+                    throw;
+                }
                 return new Ag2StatusDto(true, "HEALTHY", null, "OK");
             }
         };

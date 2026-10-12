@@ -192,16 +192,18 @@ public class UsageAggregationServiceTests
     public async Task L10_ObservationTime_BucketsAtUtcBoundaries()
     {
         using var fixture = new Fixture();
+        var day1 = new DateTimeOffset(DateTime.UtcNow.Date.AddDays(-2), TimeSpan.Zero);
+        var day2 = day1.AddDays(1);
         await fixture.Ledger.IngestBatchAsync([
-            Call("h1", 1, 1, observed: new DateTimeOffset(2026, 10, 4, 23, 59, 0, TimeSpan.Zero)),
-            Call("h2", 2, 2, observed: new DateTimeOffset(2026, 10, 5, 0, 1, 0, TimeSpan.Zero)),
+            Call("h1", 1, 1, observed: day1.AddHours(23).AddMinutes(59)),
+            Call("h2", 2, 2, observed: day2.AddMinutes(1)),
         ]);
 
         var timeseries = await fixture.Aggregation.GetTimeSeriesAsync(UsageScope.All, "7d");
 
         Assert.Equal(2, timeseries.Buckets.Count);
-        Assert.Equal(new DateTimeOffset(2026, 10, 4, 0, 0, 0, TimeSpan.Zero), timeseries.Buckets[0].BucketStartUtc);
-        Assert.Equal(new DateTimeOffset(2026, 10, 5, 0, 0, 0, TimeSpan.Zero), timeseries.Buckets[1].BucketStartUtc);
+        Assert.Equal(day1, timeseries.Buckets[0].BucketStartUtc);
+        Assert.Equal(day2, timeseries.Buckets[1].BucketStartUtc);
     }
 
     [Fact]
